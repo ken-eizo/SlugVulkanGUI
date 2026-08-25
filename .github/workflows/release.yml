@@ -115,9 +115,9 @@ jobs:
           linked_loader="$(otool -L "$executable" | awk '/libvulkan/{print $1; exit}')"
           install_name_tool -change "$linked_loader" '@executable_path/../Frameworks/libvulkan.1.dylib' "$executable"
           install_name_tool -id '@rpath/libvulkan.1.dylib' "$frameworks/libvulkan.1.dylib"
-          lipo -verify_arch arm64 x86_64 "$executable"
-          lipo -verify_arch arm64 x86_64 "$frameworks/libvulkan.1.dylib"
-          lipo -verify_arch arm64 x86_64 "$frameworks/libMoltenVK.dylib"
+          lipo "$executable" -verify_arch arm64 x86_64
+          lipo "$frameworks/libvulkan.1.dylib" -verify_arch arm64 x86_64
+          lipo "$frameworks/libMoltenVK.dylib" -verify_arch arm64 x86_64
           codesign --force --deep --sign - "$app"
           ditto -c -k --sequesterRsrc --keepParent "$app" "SlugVulkanGUI-macOS-Universal.zip"
 
