@@ -20,6 +20,8 @@ with reproducible cross-library benchmarks; this repository does not make that u
   0–100% continuous-corner control; resizing the rectangle never stretches its corner radius.
 - Multiple independently painted stroke shapes, width, butt/round/square caps,
   miter/round/bevel joins, dash arrays, gap lengths, dash offset, and start/end width taper.
+  The Example exposes live dash-length, gap, and offset sliders; its straight-line preview emits
+  only the visible analytic dash instances and does not rebuild the immutable Slug atlas.
 - FreeType outlines loaded into the same Slug atlas. Multiple fonts are namespaced by font family
   or filename. Size, simulated bold/italic, underline, strikethrough, horizontal alignment,
   line-height, letter-spacing, indent, bullet and numbered-list state are represented by `TextStyle`.
@@ -43,10 +45,11 @@ with reproducible cross-library benchmarks; this repository does not make that u
   lets persistent long-form text avoid a per-frame string copy while keeping ordinary owned text safe.
 - Analytic Slug antialiasing is performed in the fragment shader from the pixel footprint and exact
   quadratic intersections. MSAA or a bitmap/SDF glyph cache is not required.
-- Live framebuffer-size detection recreates only swapchain image resources. The render pass and
-  graphics pipeline are reused unless the surface format actually changes.
-- Optional Vulkan timestamp queries expose CPU mesh-build time, GPU render time, upload bytes, and
-  FPS in the Example so a 240 Hz target can be checked against its 4.17 ms frame budget.
+- GLFW framebuffer-size/refresh callbacks redraw declarative content inside the Windows modal
+  resize loop. Swapchain resize recreates only image resources; the render pass and graphics
+  pipeline are reused unless the surface format actually changes.
+- Vulkan timestamp queries and CPU timers expose layout/build time, mapped-buffer upload time, GPU
+  render time, upload bytes, and FPS so 240 Hz can be checked against its 4.17 ms frame budget.
 - Resize/minimize-safe swapchain recreation; frame fences; acquire semaphores per frame; present
   semaphores per swapchain image; device-loss errors are surfaced as exceptions.
 - MoltenVK portability enumeration and portability-subset device-extension handling.
@@ -94,6 +97,12 @@ The CPU cannot be removed: Vulkan requires host-side resource and command submis
 layout, and outline-to-atlas conversion are not jobs performed by the Slug shaders. It is possible
 to cache retained text/layout in a future layer, but making that mandatory here would add state and
 invalidation machinery to the minimal immediate/declarative path.
+
+Per-frame instances are copied once into persistently mapped host-visible/coherent Vulkan memory;
+there is no second staging-buffer submission and no GPU-to-CPU readback in the interactive path.
+Moving hit testing or layout to compute shaders would require synchronization/readback before the
+application can update widget state, usually increasing input latency. Work that is naturally
+one-way—coverage, paint, transforms, clipping, and blending—remains on the GPU.
 
 ### What “minimal” means here
 

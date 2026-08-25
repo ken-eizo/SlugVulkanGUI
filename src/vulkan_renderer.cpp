@@ -1112,10 +1112,11 @@ struct VulkanRenderer::Impl {
     const auto cpuBuildStart = std::chrono::steady_clock::now();
     stagingInstances.clear();
     buildMesh(list, stagingInstances);
+    const auto cpuBuildEnd = std::chrono::steady_clock::now();
     ensureCapacity(frame.instances, stagingInstances.size() * sizeof(Instance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     if (!stagingInstances.empty())
       std::memcpy(frame.instances.mapped, stagingInstances.data(), stagingInstances.size() * sizeof(Instance));
-    const auto cpuBuildEnd = std::chrono::steady_clock::now();
+    const auto cpuUploadEnd = std::chrono::steady_clock::now();
 
     check(vkResetFences(device, 1, &frame.fence), "vkResetFences");
     check(vkResetCommandBuffer(commandBuffers[currentFrame], 0), "vkResetCommandBuffer");
@@ -1148,6 +1149,8 @@ struct VulkanRenderer::Impl {
     statistics.uploadedBytes = stagingInstances.size() * sizeof(Instance);
     statistics.cpuBuildMilliseconds =
       std::chrono::duration<float, std::milli>(cpuBuildEnd - cpuBuildStart).count();
+    statistics.cpuUploadMilliseconds =
+      std::chrono::duration<float, std::milli>(cpuUploadEnd - cpuBuildEnd).count();
     framePrepared = false;
     currentFrame = (currentFrame + 1) % framesInFlight;
     if (needsRecreate) recreateSwapchain();

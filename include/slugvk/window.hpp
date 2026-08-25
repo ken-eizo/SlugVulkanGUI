@@ -2,6 +2,8 @@
 
 #include "slugvk/input.hpp"
 
+#include <exception>
+#include <functional>
 #include <string>
 
 struct GLFWwindow;
@@ -26,6 +28,8 @@ public:
   [[nodiscard]] bool shouldClose() const;
   void requestClose();
   void setSize(int width, int height);
+  // Invoked from the platform refresh event, including the Windows modal resize loop.
+  void setRefreshCallback(std::function<void()> callback);
   void pollEvents();
   void waitForVisibleFramebuffer();
   void setRawMouseMotion(bool enabled);
@@ -37,8 +41,11 @@ public:
   [[nodiscard]] GLFWwindow* native() const { return window_; }
 
 private:
+  void invokeRefreshCallback() noexcept;
   GLFWwindow* window_ = nullptr;
   InputState input_{};
+  std::function<void()> refreshCallback_{};
+  std::exception_ptr callbackException_{};
 };
 
 } // namespace slugvk

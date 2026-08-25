@@ -19,7 +19,6 @@ struct Shapes {
   ShapeId polygon = 0;
   ShapeId star = 0;
   ShapeId solidStroke = 0;
-  ShapeId dashedStroke = 0;
   ShapeId taperStroke = 0;
 };
 
@@ -43,11 +42,6 @@ Shapes buildAtlas(VectorAtlas& atlas) {
   solid.cap = LineCap::Round;
   solid.join = LineJoin::Round;
   shapes.solidStroke = atlas.addStroke(wave, solid);
-  StrokeStyle dashed = solid;
-  dashed.width = 5;
-  dashed.dashLengths = {13, 8, 3, 8};
-  dashed.dashOffset = 4;
-  shapes.dashedStroke = atlas.addStroke(wave, dashed);
   StrokeStyle tapered = solid;
   tapered.startTaper = 0.05f;
   tapered.endTaper = 1.35f;
@@ -65,6 +59,22 @@ TextStyle textStyle(float size = 14.0f) {
   style.size = size;
   style.paint = Paint::solid(Color::fromRgb8(0xe9efff));
   return style;
+}
+
+void dynamicDashedLine(DrawList& draw, Rect bounds, float dashLength, float gapLength,
+                       float offset, const Paint& paint) {
+  dashLength = std::max(dashLength, 0.5f);
+  gapLength = std::max(gapLength, 0.5f);
+  const float period = dashLength + gapLength;
+  float phase = std::fmod(offset, period);
+  if (phase < 0.0f) phase += period;
+  const float right = bounds.x + bounds.width;
+  for (float x = bounds.x - phase; x < right; x += period) {
+    const float start = std::max(x, bounds.x);
+    const float end = std::min(x + dashLength, right);
+    if (end > start)
+      draw.roundedRect({start, bounds.y, end - start, bounds.height}, bounds.height * 0.5f, paint);
+  }
 }
 
 enum class DemoPage { Components, TextZoom };
@@ -133,6 +143,9 @@ int main(int argc, char** argv) try {
   int spinValue = 12;
   float sliderValue = 0.42f;
   float continuousCorners = 50.0f;
+  float dashLength = 13.0f;
+  float dashGap = 8.0f;
+  float dashOffset = 4.0f;
   ListBoxModel list{{"Alpha", "Beta", "Gamma", "Delta"}, 1};
   bool checked = true;
   ComboBoxModel combo{{"Vulkan", "Metal via MoltenVK", "DirectX (future)"}, 0, false};
@@ -155,10 +168,11 @@ int main(int argc, char** argv) try {
   int smokeFrames = 0;
   auto previous = std::chrono::steady_clock::now();
   float smoothedFrameMs = 1000.0f / 60.0f;
+  bool refreshRendered = false;
+  Vec2 lastRefreshSize = {};
+  std::uint32_t liveRefreshCount = 0;
 
-  while (!window.shouldClose()) {
-    renderer.prepareFrame();
-    window.pollEvents();
+  const auto drawFrame = [&] {
     const auto now = std::chrono::steady_clock::now();
     const float deltaMs = std::chrono::duration<float, std::milli>(now - previous).count();
     previous = now;
@@ -215,13 +229,19 @@ int main(int argc, char** argv) try {
     Paint shaderPaint = Paint::shader(Color::fromRgb8(0x15e0b8), Color::fromRgb8(0x853cff), animated);
     draw.fill(shapes.star, {222 + animated * 28.0f, 204, 72, 72}, shaderPaint);
     draw.stroke(shapes.solidStroke, {310, 200, 105, 26}, shaderPaint);
-    draw.stroke(shapes.dashedStroke, {310, 238, 105, 26},
+    ui.slider(hashId("dash-length"), "Dash " + std::to_string(static_cast<int>(dashLength + 0.5f)),
+              {35, 312, 120, 18}, dashLength, 2.0f, 32.0f);
+    ui.slider(hashId("dash-gap"), "Gap " + std::to_string(static_cast<int>(dashGap + 0.5f)),
+              {165, 312, 120, 18}, dashGap, 1.0f, 24.0f);
+    ui.slider(hashId("dash-offset"), "Off " + std::to_string(static_cast<int>(dashOffset + 0.5f)),
+              {295, 312, 120, 18}, dashOffset, 0.0f, 64.0f);
+    dynamicDashedLine(draw, {310, 247, 105, 7}, dashLength, dashGap, dashOffset,
       Paint::gradient(GradientKind::Linear, Color::fromRgb8(0xff5e9c), Color::fromRgb8(0xffd66b)));
     draw.stroke(shapes.taperStroke, {310, 276, 105, 25}, Paint::solid(Color::fromRgb8(0x8cff81)));
     draw.text("solid / opacity", {42, 155, 165, 20}, textStyle(12));
     draw.text("Continuous Corners " + std::to_string(static_cast<int>(continuousCorners + 0.5f)) + "%",
               {242, 155, 165, 20}, textStyle(12));
-    draw.text("shader fill + line", {220, 294, 190, 18}, textStyle(11));
+    draw.text("DASH: length / gap / offset", {220, 294, 190, 18}, textStyle(11));
 
     // Typography gallery.
     draw.roundedRect({18, 348, 420, 238}, 14.0f, skin.panel, 100.0f);
@@ -361,26 +381,56 @@ int main(int argc, char** argv) try {
     std::ostringstream footer;
     footer << std::fixed << std::setprecision(1)
            << 1000.0f / std::max(smoothedFrameMs, 0.001f) << " fps | "
-           << previousStats.cpuBuildMilliseconds << " ms CPU / "
+           << previousStats.cpuBuildMilliseconds << " ms build + "
+           << previousStats.cpuUploadMilliseconds << " ms upload / "
            << previousStats.gpuMilliseconds << " ms GPU | "
            << previousStats.uploadedBytes / 1024.0f << " KiB upload | "
            << previousStats.drawCalls << " draw | " << previousStats.quads << " quads";
     draw.text(footer.str(), {24, framebuffer.y - 42, framebuffer.x - 48, 25}, textStyle(12));
     renderer.draw(draw);
+  };
+
+  window.setRefreshCallback([&] {
+    if (window.shouldClose()) return;
+    const Vec2 size = window.framebufferSize();
+    if (refreshRendered && size.x == lastRefreshSize.x && size.y == lastRefreshSize.y) return;
+    const bool hadPreparedFrame = !refreshRendered;
+    renderer.prepareFrame();
+    drawFrame();
+    // The normal loop may have acquired the old-size image before entering the Win32 modal loop.
+    // Submit it once, then immediately render the first exact-size frame. Later WM_SIZE callbacks
+    // arrive with no pre-acquired image and need only one draw.
+    if (hadPreparedFrame) {
+      renderer.prepareFrame();
+      drawFrame();
+    }
+    lastRefreshSize = size;
+    refreshRendered = true;
+    ++liveRefreshCount;
+  });
+
+  while (!window.shouldClose()) {
+    refreshRendered = false;
+    renderer.prepareFrame();
+    window.pollEvents();
+    if (!refreshRendered) drawFrame();
     if (smokeTest) {
       ++smokeFrames;
       if (smokeFrames == 3) window.setSize(1320, 820);
       if (smokeFrames >= 12) window.requestClose();
     }
   }
+  window.setRefreshCallback({});
   renderer.waitIdle();
   if (smokeTest) {
     const auto finalStats = renderer.stats();
     std::cout << "Smoke batch: " << finalStats.drawCalls << " draw, " << finalStats.quads << " quads, "
               << std::fixed << std::setprecision(3) << finalStats.cpuBuildMilliseconds
-              << " ms CPU, " << finalStats.gpuMilliseconds << " ms GPU, "
-              << finalStats.uploadedBytes / 1024.0f << " KiB upload\n";
-    if (finalStats.drawCalls != 1 || finalStats.quads == 0)
+              << " ms build, " << finalStats.cpuUploadMilliseconds << " ms upload, "
+              << finalStats.gpuMilliseconds << " ms GPU, "
+              << finalStats.uploadedBytes / 1024.0f << " KiB upload, "
+              << liveRefreshCount << " live resize redraws\n";
+    if (finalStats.drawCalls != 1 || finalStats.quads == 0 || liveRefreshCount == 0)
       throw std::runtime_error("Smoke test produced an empty GPU batch");
   }
   return 0;

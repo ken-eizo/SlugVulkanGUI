@@ -27,6 +27,7 @@ struct RendererStats {
   std::uint32_t drawCalls = 0;
   std::size_t uploadedBytes = 0;
   float cpuBuildMilliseconds = 0.0f;
+  float cpuUploadMilliseconds = 0.0f;
   float gpuMilliseconds = 0.0f;
 };
 

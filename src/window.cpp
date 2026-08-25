@@ -5,12 +5,13 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace slugvk {
 
 namespace {
-InputState* inputStateFrom(GLFWwindow* window) {
-  return static_cast<InputState*>(glfwGetWindowUserPointer(window));
+Window* windowFrom(GLFWwindow* window) {
+  return static_cast<Window*>(glfwGetWindowUserPointer(window));
 }
 
 Vec2 cursorInFramebuffer(GLFWwindow* window, double x, double y) {
@@ -39,22 +40,28 @@ Window::Window(const WindowConfig& config) {
     throw std::runtime_error("glfwCreateWindow failed");
   }
 
-  glfwSetWindowUserPointer(window_, &input_);
+  glfwSetWindowUserPointer(window_, this);
   glfwSetCursorPosCallback(window_, [](GLFWwindow* w, double x, double y) {
     const Vec2 position = cursorInFramebuffer(w, x, y);
-    inputStateFrom(w)->onCursor(position.x, position.y);
+    windowFrom(w)->input_.onCursor(position.x, position.y);
   });
   glfwSetMouseButtonCallback(window_, [](GLFWwindow* w, int button, int action, int) {
-    inputStateFrom(w)->onMouseButton(button, action);
+    windowFrom(w)->input_.onMouseButton(button, action);
   });
   glfwSetKeyCallback(window_, [](GLFWwindow* w, int key, int, int action, int) {
-    inputStateFrom(w)->onKey(key, action);
+    windowFrom(w)->input_.onKey(key, action);
   });
   glfwSetScrollCallback(window_, [](GLFWwindow* w, double x, double y) {
-    inputStateFrom(w)->onScroll(x, y, glfwGetTime());
+    windowFrom(w)->input_.onScroll(x, y, glfwGetTime());
   });
   glfwSetCharCallback(window_, [](GLFWwindow* w, unsigned int codepoint) {
-    inputStateFrom(w)->onCodepoint(codepoint);
+    windowFrom(w)->input_.onCodepoint(codepoint);
+  });
+  glfwSetWindowRefreshCallback(window_, [](GLFWwindow* w) {
+    windowFrom(w)->invokeRefreshCallback();
+  });
+  glfwSetFramebufferSizeCallback(window_, [](GLFWwindow* w, int width, int height) {
+    if (width > 0 && height > 0) windowFrom(w)->invokeRefreshCallback();
   });
 
   double x = 0.0;
@@ -74,10 +81,26 @@ void Window::requestClose() { glfwSetWindowShouldClose(window_, GLFW_TRUE); }
 void Window::setSize(int width, int height) {
   glfwSetWindowSize(window_, std::max(width, 1), std::max(height, 1));
 }
+void Window::setRefreshCallback(std::function<void()> callback) {
+  refreshCallback_ = std::move(callback);
+}
+
+void Window::invokeRefreshCallback() noexcept {
+  if (!refreshCallback_ || callbackException_) return;
+  try {
+    refreshCallback_();
+  } catch (...) {
+    callbackException_ = std::current_exception();
+  }
+}
 
 void Window::pollEvents() {
   input_.beginFrame();
   glfwPollEvents();
+  if (callbackException_) {
+    auto error = std::exchange(callbackException_, {});
+    std::rethrow_exception(error);
+  }
   // Sample once more after dispatching callbacks so high-rate pointer motion cannot leave the
   // declarative frame on an older coalesced callback position.
   double cursorX = 0.0;
