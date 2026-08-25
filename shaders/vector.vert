@@ -11,7 +11,9 @@ layout(location = 7) in vec4 inGradient;
 layout(location = 8) in vec4 inClip;
 
 layout(push_constant) uniform PushConstants {
-  vec2 viewport;
+  vec4 viewportScale;
+  vec4 translationOverride;
+  vec4 overrideClip;
 } pushConstants;
 
 layout(location = 0) out vec2 emCoord;
@@ -31,9 +33,10 @@ void main() {
   vec2 corner = corners[gl_VertexIndex];
   vec2 positionPx = mix(inPositionRect.xy, inPositionRect.zw, corner);
   positionPx.x += inPaint.w * (1.0 - corner.y);
+  positionPx = positionPx * pushConstants.viewportScale.zw + pushConstants.translationOverride.xy;
   vec2 ndc = vec2(
-    positionPx.x * 2.0 / pushConstants.viewport.x - 1.0,
-    positionPx.y * 2.0 / pushConstants.viewport.y - 1.0
+    positionPx.x * 2.0 / pushConstants.viewportScale.x - 1.0,
+    positionPx.y * 2.0 / pushConstants.viewportScale.y - 1.0
   );
   gl_Position = vec4(ndc, 0.0, 1.0);
   emCoord = mix(inEmRect.xy, inEmRect.zw, corner);
@@ -44,5 +47,5 @@ void main() {
   color1 = inColor1;
   paintData = inPaint;
   gradientData = inGradient;
-  clipRect = inClip;
+  clipRect = pushConstants.translationOverride.z > 0.5 ? pushConstants.overrideClip : inClip;
 }

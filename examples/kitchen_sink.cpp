@@ -83,7 +83,7 @@ constexpr std::string_view longText =
   "SLUG VECTOR TEXT - CONTINUOUS SCALE DEMONSTRATION\n"
   "\n"
   "This page renders every glyph from immutable Slug curve and band textures.\n"
-  "One compact instance is uploaded per visible glyph; six quad vertices are generated on GPU.\n"
+  "The complete document is retained in device-local memory; six quad vertices are generated on GPU.\n"
   "Use the slider, the minus and plus buttons, or the mouse wheel over this page.\n"
   "\n"
   "A vector renderer should remain stable when typography changes every frame.\n"
@@ -91,8 +91,8 @@ constexpr std::string_view longText =
   "Large display letters must reveal smooth curves instead of bitmap pixels.\n"
   "The same GPU coverage solver handles both ends of that scale continuously.\n"
   "\n"
-  "Vulkan records this complete document together with the surrounding GUI.\n"
-  "The curve atlas is retained; positions, clips, colors, and scale are dynamic.\n"
+  "Vulkan records this retained document together with the surrounding dynamic GUI.\n"
+  "Zoom and pan update one GPU transform; glyph layout and instances remain immutable.\n"
   "Linear, diamond, radial, and procedural paints use the same fragment path.\n"
   "Filled paths, stroked paths, and glyph outlines all consume the same Paint.\n"
   "\n"
@@ -104,7 +104,7 @@ constexpr std::string_view longText =
   "This makes animated interfaces predictable and keeps their edges coherent.\n"
   "\n"
   "SlugVulkan is a declarative Windows and macOS vector GUI experiment.\n"
-  "Its target is low-latency interaction, stable exact curves, and one GPU batch.\n";
+  "Its target is low-latency interaction, stable exact curves, and minimal GPU batches.\n";
 
 #ifdef NDEBUG
 constexpr bool validationEnabled = false;
@@ -136,6 +136,14 @@ int main(int argc, char** argv) try {
   skin.text = textStyle(14);
   UiContext ui(skin);
   DrawList draw;
+  TextStyle retainedDocumentStyle = textStyle(16.0f);
+  retainedDocumentStyle.lineHeight = 1.42f;
+  retainedDocumentStyle.letterSpacing = 0.1f;
+  retainedDocumentStyle.paint = Paint::gradient(GradientKind::Linear,
+    Color::fromRgb8(0xf5f8ff), Color::fromRgb8(0x79d9ff), {0.0f, 0.0f}, {1.0f, 0.7f});
+  const RetainedTextId retainedDocument = renderer.createRetainedText(
+    longText, {0.0f, 0.0f, 1400.0f, 5000.0f}, retainedDocumentStyle);
+  if (retainedDocument == 0) throw std::runtime_error("Could not retain the long text document");
 
   DemoPage page = DemoPage::Components;
   float textZoom = 1.0f;
@@ -363,15 +371,9 @@ int main(int argc, char** argv) try {
 
       const Rect oldClip = draw.clip();
       draw.setClip({document.x + 2.0f, document.y + 2.0f, document.width - 4.0f, document.height - 4.0f});
-      TextStyle documentText = textStyle(16.0f * textZoom);
-      documentText.lineHeight = 1.42f;
-      documentText.letterSpacing = 0.1f * textZoom;
-      documentText.paint = Paint::gradient(GradientKind::Linear,
-        Color::fromRgb8(0xf5f8ff), Color::fromRgb8(0x79d9ff), {0.0f, 0.0f}, {1.0f, 0.7f});
-      draw.textStatic(longText,
-                      {document.x + 24.0f + textPan.x, document.y + 38.0f + textPan.y,
-                       document.width - 48.0f, document.height - 54.0f},
-                      documentText);
+      draw.retainedText(retainedDocument,
+                        {document.x + 24.0f + textPan.x, document.y + 38.0f + textPan.y},
+                        textZoom);
       draw.setClip(oldClip);
     }
 
@@ -385,7 +387,8 @@ int main(int argc, char** argv) try {
            << previousStats.cpuUploadMilliseconds << " ms upload / "
            << previousStats.gpuMilliseconds << " ms GPU | "
            << previousStats.uploadedBytes / 1024.0f << " KiB upload | "
-           << previousStats.drawCalls << " draw | " << previousStats.quads << " quads";
+           << previousStats.drawCalls << " draw | " << previousStats.quads << " quads ("
+           << previousStats.retainedQuads << " retained)";
     draw.text(footer.str(), {24, framebuffer.y - 42, framebuffer.x - 48, 25}, textStyle(12));
     renderer.draw(draw);
   };
@@ -430,7 +433,7 @@ int main(int argc, char** argv) try {
               << finalStats.gpuMilliseconds << " ms GPU, "
               << finalStats.uploadedBytes / 1024.0f << " KiB upload, "
               << liveRefreshCount << " live resize redraws\n";
-    if (finalStats.drawCalls != 1 || finalStats.quads == 0 || liveRefreshCount == 0)
+    if (finalStats.drawCalls == 0 || finalStats.quads == 0 || finalStats.retainedQuads == 0 || liveRefreshCount == 0)
       throw std::runtime_error("Smoke test produced an empty GPU batch");
   }
   return 0;

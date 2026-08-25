@@ -1,0 +1,145 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  VULKAN_SDK_VERSION: 1.4.357.0
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LunarG Vulkan SDK
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path $env:RUNNER_TEMP "VulkanSDK"
+          $installer = Join-Path $env:RUNNER_TEMP "vulkan-sdk.exe"
+          curl.exe -L --fail --retry 3 --output $installer "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/vulkan_sdk.exe"
+          $process = Start-Process -FilePath $installer -ArgumentList '--root', $sdkRoot, '--accept-licenses', '--default-answer', '--confirm-command', 'install', 'copy_only=1' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Vulkan SDK installer failed: $($process.ExitCode)" }
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -DVulkan_ROOT="$env:VULKAN_SDK" -DSLUGVK_BUILD_TESTS=ON -DSLUGVK_BUILD_EXAMPLE=ON
+          cmake --build build --config Release --parallel
+
+      - name: Test
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build\generated\shaders\vector.vert.spv"
+          & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build\generated\shaders\vector.frag.spv"
+
+      - name: Package single executable
+        shell: pwsh
+        run: |
+          Compress-Archive -LiteralPath "build\Release\slugvk_example.exe" -DestinationPath "SlugVulkanGUI-Windows-x64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SlugVulkanGUI-Windows-x64
+          path: SlugVulkanGUI-Windows-x64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS Universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LunarG Vulkan SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/vulkan-sdk.zip"
+          source_dir="$RUNNER_TEMP/vulkan-sdk-download"
+          install_root="$RUNNER_TEMP/VulkanSDK"
+          curl -L --fail --retry 3 -o "$archive" "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/mac/vulkan_sdk.zip"
+          mkdir -p "$source_dir"
+          ditto -x -k "$archive" "$source_dir"
+          sdk_app="$(find "$source_dir" -maxdepth 3 -type d -name 'vulkansdk-macOS-*.app' -print -quit)"
+          if [[ -z "$sdk_app" ]]; then echo "Vulkan SDK installer app was not found"; exit 1; fi
+          sdk_binary="$sdk_app/Contents/MacOS/$(basename "$sdk_app" .app)"
+          "$sdk_binary" --root "$install_root" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core
+          glslc_path="$(find "$install_root" -type f -name glslc -print -quit)"
+          if [[ -z "$glslc_path" ]]; then echo "glslc was not installed"; exit 1; fi
+          vulkan_root="$(cd "$(dirname "$glslc_path")/.." && pwd)"
+          echo "VULKAN_SDK=$vulkan_root" >> "$GITHUB_ENV"
+          echo "$vulkan_root/bin" >> "$GITHUB_PATH"
+
+      - name: Configure and build Universal app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" \
+            -DVulkan_ROOT="$VULKAN_SDK" -DSLUGVK_BUILD_TESTS=ON -DSLUGVK_BUILD_EXAMPLE=ON
+          cmake --build build --parallel
+
+      - name: Test and validate shaders
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure
+          "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build/generated/shaders/vector.vert.spv
+          "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build/generated/shaders/vector.frag.spv
+
+      - name: Bundle Vulkan Loader and MoltenVK
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="build/slugvk_example.app"
+          executable="$app/Contents/MacOS/slugvk_example"
+          frameworks="$app/Contents/Frameworks"
+          icd_dir="$app/Contents/Resources/vulkan/icd.d"
+          mkdir -p "$frameworks" "$icd_dir"
+          cp -L "$VULKAN_SDK/lib/libvulkan.1.dylib" "$frameworks/libvulkan.1.dylib"
+          cp -L "$VULKAN_SDK/lib/libMoltenVK.dylib" "$frameworks/libMoltenVK.dylib"
+          cp packaging/macos/MoltenVK_icd.json "$icd_dir/MoltenVK_icd.json"
+          linked_loader="$(otool -L "$executable" | awk '/libvulkan/{print $1; exit}')"
+          install_name_tool -change "$linked_loader" '@executable_path/../Frameworks/libvulkan.1.dylib' "$executable"
+          install_name_tool -id '@rpath/libvulkan.1.dylib' "$frameworks/libvulkan.1.dylib"
+          lipo -verify_arch arm64 x86_64 "$executable"
+          lipo -verify_arch arm64 x86_64 "$frameworks/libvulkan.1.dylib"
+          lipo -verify_arch arm64 x86_64 "$frameworks/libMoltenVK.dylib"
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "SlugVulkanGUI-macOS-Universal.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SlugVulkanGUI-macOS-Universal
+          path: SlugVulkanGUI-macOS-Universal.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/*.zip --verify-tag --generate-notes --title "SlugVulkanGUI $TAG"

@@ -9,6 +9,7 @@ option(SLUGVK_ENABLE_VALIDATION "Enable Vulkan validation in debug builds" ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 find_package(Vulkan REQUIRED)
 
@@ -67,7 +68,20 @@ endfunction()
 
 slugvk_compile_shader(shaders/vector.vert)
 slugvk_compile_shader(shaders/vector.frag)
-add_custom_target(slugvk_shaders DEPENDS ${SLUGVK_SHADER_OUTPUTS})
+set(SLUGVK_EMBEDDED_SHADER_HEADER "${SLUGVK_GENERATED_DIR}/slugvk_embedded_shaders.hpp")
+list(GET SLUGVK_SHADER_OUTPUTS 0 SLUGVK_VERTEX_SPV)
+list(GET SLUGVK_SHADER_OUTPUTS 1 SLUGVK_FRAGMENT_SPV)
+add_custom_command(
+  OUTPUT "${SLUGVK_EMBEDDED_SHADER_HEADER}"
+  COMMAND "${CMAKE_COMMAND}"
+    -DVERTEX_SPV=${SLUGVK_VERTEX_SPV}
+    -DFRAGMENT_SPV=${SLUGVK_FRAGMENT_SPV}
+    -DOUTPUT=${SLUGVK_EMBEDDED_SHADER_HEADER}
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake"
+  DEPENDS ${SLUGVK_SHADER_OUTPUTS} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake"
+  VERBATIM
+)
+add_custom_target(slugvk_shaders DEPENDS "${SLUGVK_EMBEDDED_SHADER_HEADER}")
 
 add_library(slugvk STATIC
   src/animation.cpp
@@ -77,12 +91,13 @@ add_library(slugvk STATIC
   src/vector_atlas.cpp
   src/window.cpp
   src/vulkan_renderer.cpp
+  "${SLUGVK_EMBEDDED_SHADER_HEADER}"
 )
 add_dependencies(slugvk slugvk_shaders)
-target_include_directories(slugvk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(slugvk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                                  PRIVATE "${SLUGVK_GENERATED_DIR}")
 target_link_libraries(slugvk PUBLIC slughorn PRIVATE Vulkan::Vulkan glfw)
 target_compile_definitions(slugvk PRIVATE
-  SLUGVK_SHADER_DIR="${SLUGVK_SHADER_DIR}"
   $<$<BOOL:${SLUGVK_ENABLE_VALIDATION}>:SLUGVK_ENABLE_VALIDATION=1>
 )
 
@@ -93,13 +108,14 @@ else()
 endif()
 
 if(SLUGVK_BUILD_EXAMPLE)
-  add_executable(slugvk_example examples/kitchen_sink.cpp)
+  add_executable(slugvk_example MACOSX_BUNDLE examples/kitchen_sink.cpp)
   target_link_libraries(slugvk_example PRIVATE slugvk)
   add_dependencies(slugvk_example slugvk_shaders)
-  add_custom_command(TARGET slugvk_example POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:slugvk_example>/shaders"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUGVK_SHADER_OUTPUTS} "$<TARGET_FILE_DIR:slugvk_example>/shaders"
-  )
+  set_target_properties(slugvk_example PROPERTIES
+    MACOSX_BUNDLE_BUNDLE_NAME "SlugVulkanGUI Example"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.slugvulkan.example"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}")
 endif()
 
 if(SLUGVK_BUILD_TESTS)
@@ -111,4 +127,3 @@ endif()
 
 install(TARGETS slugvk ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include)
-install(FILES ${SLUGVK_SHADER_OUTPUTS} DESTINATION bin/shaders)

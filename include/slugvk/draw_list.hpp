@@ -36,7 +36,14 @@ struct RoundedRectCommand {
   Paint paint = {};
 };
 
-using DisplayCommand = std::variant<DrawCommand, TextCommand, RoundedRectCommand>;
+struct RetainedTextCommand {
+  RetainedTextId text = 0;
+  Vec2 position = {};
+  float scale = 1.0f;
+  Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
+};
+
+using DisplayCommand = std::variant<DrawCommand, TextCommand, RoundedRectCommand, RetainedTextCommand>;
 
 class DrawList {
 public:
@@ -62,6 +69,9 @@ public:
   void text(std::string utf8, Rect bounds, TextStyle style);
   // The referenced bytes must remain alive until VulkanRenderer::draw() returns.
   void textStatic(std::string_view utf8, Rect bounds, TextStyle style);
+  // Draws text whose glyph instances were retained by VulkanRenderer. Only this transform and
+  // clip are dynamic, so zoom/pan does not relayout or upload the document.
+  void retainedText(RetainedTextId text, Vec2 position, float scale);
 
   [[nodiscard]] const std::vector<DisplayCommand>& commands() const { return commands_; }
   [[nodiscard]] const std::vector<DisplayCommand>& overlayCommands() const { return overlayCommands_; }

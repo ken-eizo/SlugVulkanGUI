@@ -2,6 +2,7 @@
 
 #include "slugvk/vector_atlas.hpp"
 #include "slugvk/window.hpp"
+#include "slugvk_embedded_shaders.hpp"
 #include "slughorn/slughorn.hpp"
 
 #define GLFW_INCLUDE_VULKAN
@@ -10,10 +11,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -135,21 +136,27 @@ struct Buffer {
   VkDeviceSize size = 0;
 };
 
+struct DrawBatch {
+  RetainedTextId retainedText = 0;
+  std::uint32_t firstInstance = 0;
+  std::uint32_t instanceCount = 0;
+  Vec2 translation = {};
+  float scale = 1.0f;
+  Rect clip = {};
+};
+
+struct alignas(16) PushConstants {
+  float viewportScale[4];
+  float translationOverride[4];
+  float overrideClip[4];
+};
+static_assert(sizeof(PushConstants) == 48);
+
 struct Texture {
   VkImage image = VK_NULL_HANDLE;
   VkDeviceMemory memory = VK_NULL_HANDLE;
   VkImageView view = VK_NULL_HANDLE;
 };
-
-std::vector<char> readBinary(const std::string& path) {
-  std::ifstream stream(path, std::ios::binary | std::ios::ate);
-  if (!stream) throw std::runtime_error("Could not open shader: " + path);
-  const auto size = stream.tellg();
-  std::vector<char> bytes(static_cast<std::size_t>(size));
-  stream.seekg(0);
-  stream.read(bytes.data(), size);
-  return bytes;
-}
 
 } // namespace
 
@@ -201,6 +208,12 @@ struct VulkanRenderer::Impl {
   std::array<Frame, framesInFlight> frames{};
   std::size_t currentFrame = 0;
   std::vector<Instance> stagingInstances{};
+  std::vector<DrawBatch> drawBatches{};
+  struct RetainedText {
+    Buffer instances{};
+    std::uint32_t instanceCount = 0;
+  };
+  std::vector<RetainedText> retainedTexts{};
   std::uint32_t timestampValidBits = 0;
   bool framePrepared = false;
   std::uint32_t preparedImageIndex = 0;
@@ -590,21 +603,21 @@ struct VulkanRenderer::Impl {
     check(vkCreateRenderPass(device, &info, nullptr, &renderPass), "vkCreateRenderPass");
   }
 
-  VkShaderModule createShaderModule(const std::vector<char>& bytes) {
-    if (bytes.size() % 4 != 0) throw std::runtime_error("Invalid SPIR-V byte length");
+  VkShaderModule createShaderModule(const unsigned char* bytes, std::size_t byteCount) {
+    if (byteCount % 4 != 0) throw std::runtime_error("Invalid SPIR-V byte length");
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    info.codeSize = bytes.size();
-    info.pCode = reinterpret_cast<const std::uint32_t*>(bytes.data());
+    info.codeSize = byteCount;
+    info.pCode = reinterpret_cast<const std::uint32_t*>(bytes);
     VkShaderModule module = VK_NULL_HANDLE;
     check(vkCreateShaderModule(device, &info, nullptr, &module), "vkCreateShaderModule");
     return module;
   }
 
   void createPipeline() {
-    const auto vertexBytes = readBinary(std::string(SLUGVK_SHADER_DIR) + "/vector.vert.spv");
-    const auto fragmentBytes = readBinary(std::string(SLUGVK_SHADER_DIR) + "/vector.frag.spv");
-    VkShaderModule vertexModule = createShaderModule(vertexBytes);
-    VkShaderModule fragmentModule = createShaderModule(fragmentBytes);
+    VkShaderModule vertexModule = createShaderModule(embedded::vectorVert,
+                                                      embedded::vectorVertSize);
+    VkShaderModule fragmentModule = createShaderModule(embedded::vectorFrag,
+                                                        embedded::vectorFragSize);
     VkPipelineShaderStageCreateInfo vertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     vertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     vertexStage.module = vertexModule;
@@ -663,7 +676,7 @@ struct VulkanRenderer::Impl {
     dynamic.pDynamicStates = dynamicStates.data();
     VkPushConstantRange push{};
     push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    push.size = sizeof(float) * 2;
+    push.size = sizeof(PushConstants);
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout.setLayoutCount = 1;
     layout.pSetLayouts = &descriptorSetLayout;
@@ -1005,17 +1018,77 @@ struct VulkanRenderer::Impl {
     }
   }
 
-  void buildMesh(const DrawList& list, std::vector<Instance>& instances) const {
+  RetainedTextId createRetainedText(std::string_view utf8, Rect layoutBounds, TextStyle style) {
+    if (utf8.empty() || style.size <= 0.0f || layoutBounds.width <= 0.0f) return 0;
+    std::vector<Instance> instances;
+    TextCommand command{{}, utf8, layoutBounds,
+                        {-10000000.0f, -10000000.0f, 20000000.0f, 20000000.0f},
+                        std::move(style)};
+    appendText(instances, command);
+    if (instances.empty()) return 0;
+
+    Buffer staging{};
+    const VkDeviceSize byteCount = instances.size() * sizeof(Instance);
+    createBuffer(byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 staging, true);
+    std::memcpy(staging.mapped, instances.data(), static_cast<std::size_t>(byteCount));
+
+    RetainedText retained;
+    createBuffer(byteCount, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, retained.instances, false);
+    VkCommandBuffer commandBuffer = beginSingleUse();
+    VkBufferCopy copy{0, 0, byteCount};
+    vkCmdCopyBuffer(commandBuffer, staging.buffer, retained.instances.buffer, 1, &copy);
+    VkBufferMemoryBarrier readyForVertexInput{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    readyForVertexInput.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    readyForVertexInput.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    readyForVertexInput.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    readyForVertexInput.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    readyForVertexInput.buffer = retained.instances.buffer;
+    readyForVertexInput.size = byteCount;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0,
+                         0, nullptr, 1, &readyForVertexInput, 0, nullptr);
+    endSingleUse(commandBuffer);
+    destroyBuffer(staging);
+    retained.instanceCount = static_cast<std::uint32_t>(instances.size());
+    retainedTexts.push_back(retained);
+    return static_cast<RetainedTextId>(retainedTexts.size());
+  }
+
+  void buildMesh(const DrawList& list, std::vector<Instance>& instances) {
     const std::size_t commandCount = list.commands().size() + list.overlayCommands().size();
     instances.reserve(commandCount);
+    drawBatches.clear();
+    drawBatches.reserve(commandCount);
     const auto appendCommands = [&](const auto& commands) {
       for (const auto& display : commands) {
+        if (const auto* retainedCommand = std::get_if<RetainedTextCommand>(&display)) {
+          if (retainedCommand->text == 0 || retainedCommand->text > retainedTexts.size()) continue;
+          const RetainedText& retained = retainedTexts[retainedCommand->text - 1U];
+          if (retained.instanceCount == 0) continue;
+          drawBatches.push_back({retainedCommand->text, 0, retained.instanceCount,
+                                 retainedCommand->position, retainedCommand->scale,
+                                 retainedCommand->clip});
+          continue;
+        }
+        const std::size_t first = instances.size();
         if (const auto* shapeCommand = std::get_if<DrawCommand>(&display))
           appendShape(instances, shapeCommand->shape, shapeCommand->destination, shapeCommand->paint,
                       shapeCommand->clip, shapeCommand->italicShear);
         else if (const auto* textCommand = std::get_if<TextCommand>(&display))
           appendText(instances, *textCommand);
-        else appendRoundedRect(instances, std::get<RoundedRectCommand>(display));
+        else if (const auto* roundedCommand = std::get_if<RoundedRectCommand>(&display))
+          appendRoundedRect(instances, *roundedCommand);
+        const std::uint32_t count = static_cast<std::uint32_t>(instances.size() - first);
+        if (count == 0) continue;
+        if (!drawBatches.empty() && drawBatches.back().retainedText == 0 &&
+            drawBatches.back().firstInstance + drawBatches.back().instanceCount == first) {
+          drawBatches.back().instanceCount += count;
+        } else {
+          drawBatches.push_back({0, static_cast<std::uint32_t>(first), count});
+        }
       }
     };
     appendCommands(list.commands());
@@ -1031,8 +1104,7 @@ struct VulkanRenderer::Impl {
                  buffer, true);
   }
 
-  void record(VkCommandBuffer command, std::uint32_t imageIndex, Frame& frame,
-              std::uint32_t instanceCount) {
+  void record(VkCommandBuffer command, std::uint32_t imageIndex, Frame& frame) {
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(frame)");
     if (frame.timestamps) {
@@ -1047,18 +1119,37 @@ struct VulkanRenderer::Impl {
     render.clearValueCount = 1;
     render.pClearValues = &clear;
     vkCmdBeginRenderPass(command, &render, VK_SUBPASS_CONTENTS_INLINE);
-    if (instanceCount) {
+    if (!drawBatches.empty()) {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
       VkViewport viewport{0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
-      VkRect2D scissor{{0, 0}, extent};
       vkCmdSetViewport(command, 0, 1, &viewport);
-      vkCmdSetScissor(command, 0, 1, &scissor);
       vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
       const VkDeviceSize offset = 0;
-      vkCmdBindVertexBuffers(command, 0, 1, &frame.instances.buffer, &offset);
-      const float viewportSize[]{static_cast<float>(extent.width), static_cast<float>(extent.height)};
-      vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(viewportSize), viewportSize);
-      vkCmdDraw(command, 6, instanceCount, 0, 0);
+      for (const DrawBatch& batch : drawBatches) {
+        const bool retained = batch.retainedText != 0;
+        const Buffer& buffer = retained ? retainedTexts[batch.retainedText - 1U].instances : frame.instances;
+        VkRect2D scissor{{0, 0}, extent};
+        if (retained) {
+          const float left = std::clamp(batch.clip.x, 0.0f, static_cast<float>(extent.width));
+          const float top = std::clamp(batch.clip.y, 0.0f, static_cast<float>(extent.height));
+          const float right = std::clamp(batch.clip.x + batch.clip.width, left, static_cast<float>(extent.width));
+          const float bottom = std::clamp(batch.clip.y + batch.clip.height, top, static_cast<float>(extent.height));
+          if (right <= left || bottom <= top) continue;
+          scissor.offset = {static_cast<std::int32_t>(std::floor(left)),
+                            static_cast<std::int32_t>(std::floor(top))};
+          scissor.extent = {static_cast<std::uint32_t>(std::ceil(right) - std::floor(left)),
+                            static_cast<std::uint32_t>(std::ceil(bottom) - std::floor(top))};
+        }
+        vkCmdSetScissor(command, 0, 1, &scissor);
+        vkCmdBindVertexBuffers(command, 0, 1, &buffer.buffer, &offset);
+        PushConstants push{{static_cast<float>(extent.width), static_cast<float>(extent.height),
+                            retained ? batch.scale : 1.0f, retained ? batch.scale : 1.0f},
+                           {retained ? batch.translation.x : 0.0f,
+                            retained ? batch.translation.y : 0.0f, retained ? 1.0f : 0.0f, 0.0f},
+                           {batch.clip.x, batch.clip.y, batch.clip.width, batch.clip.height}};
+        vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+        vkCmdDraw(command, 6, batch.instanceCount, 0, retained ? 0 : batch.firstInstance);
+      }
     }
     vkCmdEndRenderPass(command);
     if (frame.timestamps)
@@ -1120,7 +1211,7 @@ struct VulkanRenderer::Impl {
 
     check(vkResetFences(device, 1, &frame.fence), "vkResetFences");
     check(vkResetCommandBuffer(commandBuffers[currentFrame], 0), "vkResetCommandBuffer");
-    record(commandBuffers[currentFrame], imageIndex, frame, static_cast<std::uint32_t>(stagingInstances.size()));
+    record(commandBuffers[currentFrame], imageIndex, frame);
     const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = 1;
@@ -1144,8 +1235,12 @@ struct VulkanRenderer::Impl {
     if (presented != VK_SUCCESS && presented != VK_SUBOPTIMAL_KHR && !needsRecreate)
       check(presented, "vkQueuePresentKHR");
 
-    statistics.quads = static_cast<std::uint32_t>(stagingInstances.size());
-    statistics.drawCalls = stagingInstances.empty() ? 0U : 1U;
+    std::uint32_t retainedQuadCount = 0;
+    for (const DrawBatch& batch : drawBatches)
+      if (batch.retainedText != 0) retainedQuadCount += batch.instanceCount;
+    statistics.quads = static_cast<std::uint32_t>(stagingInstances.size()) + retainedQuadCount;
+    statistics.retainedQuads = retainedQuadCount;
+    statistics.drawCalls = static_cast<std::uint32_t>(drawBatches.size());
     statistics.uploadedBytes = stagingInstances.size() * sizeof(Instance);
     statistics.cpuBuildMilliseconds =
       std::chrono::duration<float, std::milli>(cpuBuildEnd - cpuBuildStart).count();
@@ -1159,6 +1254,8 @@ struct VulkanRenderer::Impl {
   void destroy() noexcept {
     if (device) vkDeviceWaitIdle(device);
     if (device) {
+      for (auto& retained : retainedTexts) destroyBuffer(retained.instances);
+      retainedTexts.clear();
       for (auto& frame : frames) {
         destroyBuffer(frame.instances);
         if (frame.timestamps) vkDestroyQueryPool(device, frame.timestamps, nullptr);
@@ -1193,6 +1290,10 @@ VulkanRenderer::VulkanRenderer(Window& window, const VectorAtlas& atlas, const R
   : impl_(std::make_unique<Impl>(window, atlas, config)) {}
 VulkanRenderer::~VulkanRenderer() = default;
 void VulkanRenderer::prepareFrame() { impl_->prepareFrame(); }
+RetainedTextId VulkanRenderer::createRetainedText(std::string_view utf8, Rect layoutBounds,
+                                                  TextStyle style) {
+  return impl_->createRetainedText(utf8, layoutBounds, std::move(style));
+}
 void VulkanRenderer::draw(const DrawList& list) { impl_->draw(list); }
 void VulkanRenderer::waitIdle() { if (impl_->device) vkDeviceWaitIdle(impl_->device); }
 RendererStats VulkanRenderer::stats() const { return impl_->statistics; }

@@ -24,6 +24,7 @@ struct RendererConfig {
 
 struct RendererStats {
   std::uint32_t quads = 0;
+  std::uint32_t retainedQuads = 0;
   std::uint32_t drawCalls = 0;
   std::size_t uploadedBytes = 0;
   float cpuBuildMilliseconds = 0.0f;
@@ -41,6 +42,9 @@ public:
   // Performs all potentially blocking fence/image acquisition work. Call this before polling
   // input, then build the DrawList and call draw() for the freshest possible interactive frame.
   void prepareFrame();
+  // Resolves and uploads an immutable document once. The returned resource remains valid for
+  // this renderer's lifetime and can be transformed cheaply with DrawList::retainedText().
+  RetainedTextId createRetainedText(std::string_view utf8, Rect layoutBounds, TextStyle style);
   void draw(const DrawList& list);
   void waitIdle();
   [[nodiscard]] RendererStats stats() const;

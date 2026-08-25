@@ -38,11 +38,14 @@ with reproducible cross-library benchmarks; this repository does not make that u
   staging memory, and `prepareFrame()` so waits happen before input sampling and DrawList creation.
   Set `RendererConfig::allowTearing` for the absolute-latency IMMEDIATE mode.
 - Generic `Tween<T>` with linear, ease-in/out, smooth-step, and spring easing.
-- One immutable GPU atlas and a dynamic host-visible instance ring. Quad vertices come from
-  `gl_VertexIndex`; paint, clip, and Slug data are uploaded once per quad instead of four times,
-  there is no index buffer, and all visible shapes/text use one draw call.
-- CPU culling removes off-clip text lines and glyph quads before upload. `DrawList::textStatic`
-  lets persistent long-form text avoid a per-frame string copy while keeping ordinary owned text safe.
+- One immutable GPU atlas, a dynamic host-visible instance ring, and optional retained device-local
+  text buffers. Quad vertices come from `gl_VertexIndex`; there is no index buffer. Adjacent dynamic
+  content remains one batch, while retained documents add only the draw boundaries needed to keep
+  declaration order correct.
+- CPU culling removes off-clip lines/glyphs from ordinary dynamic text. `DrawList::textStatic`
+  avoids a string copy but still lays out dynamic text; `VulkanRenderer::createRetainedText` resolves
+  and uploads an immutable document once, then `DrawList::retainedText` changes only GPU transform
+  and hardware clip during real-time zoom/pan.
 - Analytic Slug antialiasing is performed in the fragment shader from the pixel footprint and exact
   quadratic intersections. MSAA or a bitmap/SDF glyph cache is not required.
 - GLFW framebuffer-size/refresh callbacks redraw declarative content inside the Windows modal
@@ -65,7 +68,8 @@ Path / FreeType glyph
        v
 slughorn CurveDecomposer -> Slug curve + band atlas (build once)
                                       |
-Declarative DrawList + UiContext -----+----> culled quad-instance batch
+Declarative DrawList + UiContext -----+----> dynamic quad-instance batch
+Retained document --------------------+----> device-local instance buffer
                                       |
                                       v
                       Vulkan Slug coverage shader + GPU paint
@@ -87,16 +91,17 @@ outside that coverage calculation deliberately small:
 
 - At atlas-build time, FreeType and slughorn run on the CPU to read outlines and create the Slug
   quadratic-curve and band textures. This is not repeated each frame.
-- Each frame, the CPU handles operating-system input, UI hit testing/state, small text layout,
-  visible destination instances, one buffer copy, and Vulkan command submission. `DrawList` owns one ordered
-  command stream; it does not mirror shapes or copy text into a second per-frame list.
+- Each frame, the CPU handles operating-system input, UI hit testing/state, small dynamic text
+  layout, visible destination instances, one mapped-buffer copy, and Vulkan command submission.
+  Retained documents skip layout and upload; their zoom/pan changes one 48-byte push-constant block.
+  `DrawList` owns one ordered command stream and mixes both paths without mirroring geometry.
 - The GPU transforms quads, finds candidate curves through the Slug band texture, solves quadratic
   antialiased coverage in the fragment shader, evaluates common fill/stroke/text paint, and blends.
 
 The CPU cannot be removed: Vulkan requires host-side resource and command submission, while input,
-layout, and outline-to-atlas conversion are not jobs performed by the Slug shaders. It is possible
-to cache retained text/layout in a future layer, but making that mandatory here would add state and
-invalidation machinery to the minimal immediate/declarative path.
+layout, and outline-to-atlas conversion are not jobs performed by the Slug shaders. Retention is
+explicit rather than mandatory, so frequently changing widgets keep the small immediate/declarative
+path and large immutable documents opt into caching without global invalidation machinery.
 
 Per-frame instances are copied once into persistently mapped host-visible/coherent Vulkan memory;
 there is no second staging-buffer submission and no GPU-to-CPU readback in the interactive path.
@@ -132,8 +137,9 @@ ctest --test-dir build -C Release --output-on-failure
 .\build\Release\slugvk_example.exe
 ```
 
-The single canonical Windows Example output is `build\Release\slugvk_example.exe`. Use
-`slugvk_example.exe --smoke` for a short non-interactive Vulkan validation run.
+The single canonical Windows Example output is `build\Release\slugvk_example.exe`. SPIR-V is
+embedded and the MSVC runtime is linked statically, so no adjacent shader directory or project DLL
+is required. Use `slugvk_example.exe --smoke` for a short Vulkan validation run.
 
 ## Build on macOS with MoltenVK
 
@@ -147,7 +153,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DVulkan_ROOT="$VULKAN_SDK"
 cmake --build build
 ctest --test-dir build --output-on-failure
-./build/slugvk_example
+open ./build/slugvk_example.app
 ```
 
 For a directly built MoltenVK package rather than the SDK-installed ICD, point the loader at its
@@ -160,6 +166,14 @@ export VK_DRIVER_FILES=/path/to/MoltenVK/Package/Latest/MoltenVK/macOS/MoltenVK_
 SlugVulkan enumerates `VK_KHR_portability_enumeration` before setting
 `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR`, and enables `VK_KHR_portability_subset` only
 when the chosen device advertises it. GLFW supplies `VK_EXT_metal_surface` and creates the surface.
+The release workflow produces a Universal (`arm64` + `x86_64`) app bundle containing the Vulkan
+Loader, MoltenVK, and its bundle-relative ICD manifest, so release users do not install the SDK.
+
+## Release builds
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`. It builds/tests the single Windows x64 EXE,
+builds/tests a macOS Universal app through MoltenVK, validates both SPIR-V modules, and publishes
+`SlugVulkanGUI-Windows-x64.zip` plus `SlugVulkanGUI-macOS-Universal.zip` to the matching GitHub Release.
 
 ## Minimal API
 
@@ -194,9 +208,9 @@ See [`examples/kitchen_sink.cpp`](examples/kitchen_sink.cpp) for all components 
   full HarfBuzz shaping/Unicode bidi/line breaking. The glyph renderer itself is vector Slug.
 - Bold and italic are synthetic presentation options. Load dedicated bold/italic font files under
   their family names when exact typeface masters are required.
-- macOS code paths are implemented against Vulkan portability rules but cannot be executed by the
-  Windows CI machine used for this milestone. Build and validation on Apple Silicon should be added
-  to CI before claiming release-grade macOS support.
+- macOS is compiled as a Universal app in GitHub Actions. The hosted job verifies both slices,
+  bundle linkage, unit tests, and SPIR-V; interactive latency still requires measurement on physical
+  Apple hardware because hosted runners are not a display-performance benchmark.
 - Custom paint currently selects the built-in procedural shader branch and a float parameter.
   Arbitrary user SPIR-V pipeline registration is intentionally deferred until its descriptor and
   synchronization contract can be made safe.

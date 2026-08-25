@@ -50,4 +50,11 @@ void DrawList::textStatic(std::string_view utf8, Rect bounds, TextStyle style) {
   else commands_.emplace_back(std::move(command));
 }
 
+void DrawList::retainedText(RetainedTextId text, Vec2 position, float scale) {
+  if (text == 0 || scale <= 0.0f) return;
+  RetainedTextCommand command{text, position, scale, clip_};
+  if (overlayMode_) overlayCommands_.emplace_back(command);
+  else commands_.emplace_back(command);
+}
+
 } // namespace slugvk
