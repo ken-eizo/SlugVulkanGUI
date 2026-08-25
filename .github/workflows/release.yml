@@ -141,5 +141,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$TAG" dist/*.zip --verify-tag --generate-notes --title "SlugVulkanGUI $TAG"
+          gh release create "$TAG" dist/*.zip --repo "$GH_REPO" --verify-tag --generate-notes --title "SlugVulkanGUI $TAG"
