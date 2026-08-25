@@ -30,13 +30,23 @@ with reproducible cross-library benchmarks; this repository does not make that u
   switch, horizontal/vertical scrollbar, tooltip, tree view, and grid view.
 - Press-edge state updates, cursor-position drag mapping, hover feedback for interactive controls,
   and a final overlay command layer for dropdowns and tooltips. Overlay content remains part of the
-  single indexed GPU batch but is emitted after ordinary panels and widgets.
-- A low-latency frame path: one frame in flight, IMMEDIATE present preferred over MAILBOX,
-  post-dispatch cursor resampling, reusable CPU staging vectors, and `prepareFrame()` so fence and
-  swapchain-image waits happen before the application samples input and builds its DrawList.
+  single instanced GPU batch but is emitted after ordinary panels and widgets.
+- A low-latency frame path: one frame in flight, smooth MAILBOX present preferred by default,
+  post-dispatch cursor resampling in framebuffer coordinates (including HiDPI), reusable CPU
+  staging memory, and `prepareFrame()` so waits happen before input sampling and DrawList creation.
+  Set `RendererConfig::allowTearing` for the absolute-latency IMMEDIATE mode.
 - Generic `Tween<T>` with linear, ease-in/out, smooth-step, and spring easing.
-- One immutable GPU atlas and a dynamic host-visible vertex/index ring. All visible shapes and text
-  are submitted as one indexed draw call per frame.
+- One immutable GPU atlas and a dynamic host-visible instance ring. Quad vertices come from
+  `gl_VertexIndex`; paint, clip, and Slug data are uploaded once per quad instead of four times,
+  there is no index buffer, and all visible shapes/text use one draw call.
+- CPU culling removes off-clip text lines and glyph quads before upload. `DrawList::textStatic`
+  lets persistent long-form text avoid a per-frame string copy while keeping ordinary owned text safe.
+- Analytic Slug antialiasing is performed in the fragment shader from the pixel footprint and exact
+  quadratic intersections. MSAA or a bitmap/SDF glyph cache is not required.
+- Live framebuffer-size detection recreates only swapchain image resources. The render pass and
+  graphics pipeline are reused unless the surface format actually changes.
+- Optional Vulkan timestamp queries expose CPU mesh-build time, GPU render time, upload bytes, and
+  FPS in the Example so a 240 Hz target can be checked against its 4.17 ms frame budget.
 - Resize/minimize-safe swapchain recreation; frame fences; acquire semaphores per frame; present
   semaphores per swapchain image; device-loss errors are surfaced as exceptions.
 - MoltenVK portability enumeration and portability-subset device-extension handling.
@@ -52,7 +62,7 @@ Path / FreeType glyph
        v
 slughorn CurveDecomposer -> Slug curve + band atlas (build once)
                                       |
-Declarative DrawList + UiContext -----+----> dynamic quad batch
+Declarative DrawList + UiContext -----+----> culled quad-instance batch
                                       |
                                       v
                       Vulkan Slug coverage shader + GPU paint
@@ -75,10 +85,10 @@ outside that coverage calculation deliberately small:
 - At atlas-build time, FreeType and slughorn run on the CPU to read outlines and create the Slug
   quadratic-curve and band textures. This is not repeated each frame.
 - Each frame, the CPU handles operating-system input, UI hit testing/state, small text layout,
-  destination quads, buffer copies, and Vulkan command submission. `DrawList` owns one ordered
+  visible destination instances, one buffer copy, and Vulkan command submission. `DrawList` owns one ordered
   command stream; it does not mirror shapes or copy text into a second per-frame list.
 - The GPU transforms quads, finds candidate curves through the Slug band texture, solves quadratic
-  coverage in the fragment shader, evaluates the common fill/stroke/text paint, and blends.
+  antialiased coverage in the fragment shader, evaluates common fill/stroke/text paint, and blends.
 
 The CPU cannot be removed: Vulkan requires host-side resource and command submission, while input,
 layout, and outline-to-atlas conversion are not jobs performed by the Slug shaders. It is possible
@@ -152,7 +162,7 @@ atlas.loadFont(slugvk::findDefaultSystemFont());
 atlas.build();
 
 slugvk::Window window;
-slugvk::VulkanRenderer renderer(window, atlas, {.vsync = false}); // prefer mailbox/immediate
+slugvk::VulkanRenderer renderer(window, atlas, {.vsync = false}); // MAILBOX when available
 slugvk::DrawList draw;
 
 while (!window.shouldClose()) {

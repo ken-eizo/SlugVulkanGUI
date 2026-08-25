@@ -14,15 +14,20 @@ class Window;
 struct RendererConfig {
   Color clearColor = Color::fromRgb8(0x0b1020);
   bool validation = false;
-  // false selects the lowest-latency available mode: IMMEDIATE, then MAILBOX, then FIFO.
+  // false prefers refresh-synchronized MAILBOX for smooth low-latency interaction.
   bool vsync = false;
-  std::size_t initialVertexCapacity = 1U << 16U;
+  // Select IMMEDIATE before MAILBOX when tearing is acceptable and absolute latency is primary.
+  bool allowTearing = false;
+  // Number of quad instances preallocated per frame; buffers grow geometrically when needed.
+  std::size_t initialVertexCapacity = 1U << 12U;
 };
 
 struct RendererStats {
-  std::uint32_t vertices = 0;
-  std::uint32_t indices = 0;
+  std::uint32_t quads = 0;
   std::uint32_t drawCalls = 0;
+  std::size_t uploadedBytes = 0;
+  float cpuBuildMilliseconds = 0.0f;
+  float gpuMilliseconds = 0.0f;
 };
 
 class VulkanRenderer {

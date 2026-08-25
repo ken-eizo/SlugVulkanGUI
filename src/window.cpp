@@ -3,6 +3,7 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace slugvk {
@@ -10,6 +11,18 @@ namespace slugvk {
 namespace {
 InputState* inputStateFrom(GLFWwindow* window) {
   return static_cast<InputState*>(glfwGetWindowUserPointer(window));
+}
+
+Vec2 cursorInFramebuffer(GLFWwindow* window, double x, double y) {
+  int windowWidth = 0;
+  int windowHeight = 0;
+  int framebufferWidth = 0;
+  int framebufferHeight = 0;
+  glfwGetWindowSize(window, &windowWidth, &windowHeight);
+  glfwGetFramebufferSize(window, &framebufferWidth, &framebufferHeight);
+  const double scaleX = windowWidth > 0 ? static_cast<double>(framebufferWidth) / windowWidth : 1.0;
+  const double scaleY = windowHeight > 0 ? static_cast<double>(framebufferHeight) / windowHeight : 1.0;
+  return {static_cast<float>(x * scaleX), static_cast<float>(y * scaleY)};
 }
 }
 
@@ -28,7 +41,8 @@ Window::Window(const WindowConfig& config) {
 
   glfwSetWindowUserPointer(window_, &input_);
   glfwSetCursorPosCallback(window_, [](GLFWwindow* w, double x, double y) {
-    inputStateFrom(w)->onCursor(x, y);
+    const Vec2 position = cursorInFramebuffer(w, x, y);
+    inputStateFrom(w)->onCursor(position.x, position.y);
   });
   glfwSetMouseButtonCallback(window_, [](GLFWwindow* w, int button, int action, int) {
     inputStateFrom(w)->onMouseButton(button, action);
@@ -46,7 +60,8 @@ Window::Window(const WindowConfig& config) {
   double x = 0.0;
   double y = 0.0;
   glfwGetCursorPos(window_, &x, &y);
-  input_.onCursor(x, y);
+  const Vec2 position = cursorInFramebuffer(window_, x, y);
+  input_.onCursor(position.x, position.y);
 }
 
 Window::~Window() {
@@ -56,6 +71,9 @@ Window::~Window() {
 
 bool Window::shouldClose() const { return glfwWindowShouldClose(window_) == GLFW_TRUE; }
 void Window::requestClose() { glfwSetWindowShouldClose(window_, GLFW_TRUE); }
+void Window::setSize(int width, int height) {
+  glfwSetWindowSize(window_, std::max(width, 1), std::max(height, 1));
+}
 
 void Window::pollEvents() {
   input_.beginFrame();
@@ -65,7 +83,8 @@ void Window::pollEvents() {
   double cursorX = 0.0;
   double cursorY = 0.0;
   glfwGetCursorPos(window_, &cursorX, &cursorY);
-  input_.onCursor(cursorX, cursorY);
+  const Vec2 position = cursorInFramebuffer(window_, cursorX, cursorY);
+  input_.onCursor(position.x, position.y);
   input_.finishFrame(glfwGetTime());
 }
 

@@ -1,15 +1,14 @@
 #version 450
 
-layout(location = 0) in vec2 inPositionPx;
-layout(location = 1) in vec2 inEmCoord;
-layout(location = 2) in vec2 inUv;
-layout(location = 3) in vec4 inBandTransform;
-layout(location = 4) in uvec4 inShapeData;
-layout(location = 5) in vec4 inColor0;
-layout(location = 6) in vec4 inColor1;
-layout(location = 7) in vec4 inPaint;
-layout(location = 8) in vec4 inGradient;
-layout(location = 9) in vec4 inClip;
+layout(location = 0) in vec4 inPositionRect;
+layout(location = 1) in vec4 inEmRect;
+layout(location = 2) in vec4 inBandTransform;
+layout(location = 3) in uvec4 inShapeData;
+layout(location = 4) in vec4 inColor0;
+layout(location = 5) in vec4 inColor1;
+layout(location = 6) in vec4 inPaint;
+layout(location = 7) in vec4 inGradient;
+layout(location = 8) in vec4 inClip;
 
 layout(push_constant) uniform PushConstants {
   vec2 viewport;
@@ -26,13 +25,19 @@ layout(location = 7) flat out vec4 gradientData;
 layout(location = 8) flat out vec4 clipRect;
 
 void main() {
+  const vec2 corners[6] = vec2[6](
+    vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0),
+    vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
+  vec2 corner = corners[gl_VertexIndex];
+  vec2 positionPx = mix(inPositionRect.xy, inPositionRect.zw, corner);
+  positionPx.x += inPaint.w * (1.0 - corner.y);
   vec2 ndc = vec2(
-    inPositionPx.x * 2.0 / pushConstants.viewport.x - 1.0,
-    inPositionPx.y * 2.0 / pushConstants.viewport.y - 1.0
+    positionPx.x * 2.0 / pushConstants.viewport.x - 1.0,
+    positionPx.y * 2.0 / pushConstants.viewport.y - 1.0
   );
   gl_Position = vec4(ndc, 0.0, 1.0);
-  emCoord = inEmCoord;
-  uv = inUv;
+  emCoord = mix(inEmRect.xy, inEmRect.zw, corner);
+  uv = inShapeData.x == 0xFFFFFFFFu ? emCoord / max(inBandTransform.xy, vec2(0.0001)) : corner;
   bandTransform = inBandTransform;
   shapeData = inShapeData;
   color0 = inColor0;

@@ -16,6 +16,16 @@ namespace {
 constexpr float pi = 3.14159265358979323846f;
 slughorn::slug_t sv(float value) { return static_cast<slughorn::slug_t>(value); }
 
+struct TransparentStringHash {
+  using is_transparent = void;
+  std::size_t operator()(std::string_view value) const noexcept {
+    return std::hash<std::string_view>{}(value);
+  }
+  std::size_t operator()(const std::string& value) const noexcept {
+    return (*this)(std::string_view(value));
+  }
+};
+
 slughorn::canvas::LineCap cap(LineCap value) {
   switch (value) {
     case LineCap::Round: return slughorn::canvas::LineCap::Round;
@@ -121,7 +131,7 @@ struct VectorAtlas::Impl {
   std::string family;
   std::string style;
   std::uint8_t nextFontMask = 0;
-  std::unordered_map<std::string, std::uint8_t> fontMasks;
+  std::unordered_map<std::string, std::uint8_t, TransparentStringHash, std::equal_to<>> fontMasks;
 
   Impl() : atlas(1024) {}
 };
@@ -241,7 +251,7 @@ ShapeId VectorAtlas::addStroke(const Path& path, const StrokeStyle& style) {
   }
 
   // Slughorn expands the centerline once during atlas construction. Runtime transforms therefore
-  // update only four vertices per shape, while caps/joins remain exact vector curves.
+  // update one compact quad instance per shape, while caps/joins remain exact vector curves.
   if (!centerline.strokePath(sv(style.width), false, join(style.join), cap(style.cap), sv(4.0f))) return 0;
   const ShapeId id = impl_->nextId++;
   slughorn::canvas::Canvas canvas(impl_->atlas);
@@ -289,7 +299,7 @@ std::string VectorAtlas::fontFamily() const { return impl_->family; }
 std::string VectorAtlas::fontStyle() const { return impl_->style; }
 ShapeId VectorAtlas::glyph(std::uint32_t codepoint, std::string_view fontName) const {
   std::uint8_t mask = 0;
-  const auto found = impl_->fontMasks.find(std::string(fontName));
+  const auto found = impl_->fontMasks.find(fontName);
   if (found != impl_->fontMasks.end()) mask = found->second;
   return slughorn::Key(codepoint, mask).codepoint();
 }

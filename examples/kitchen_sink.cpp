@@ -34,7 +34,7 @@ Shapes buildAtlas(VectorAtlas& atlas) {
   iconStroke.width = 10;
   iconStroke.cap = LineCap::Round;
   iconStroke.join = LineJoin::Round;
-  shapes.check = atlas.addStroke(Path{}.moveTo(8, 50).lineTo(38, 80).lineTo(92, 13), iconStroke);
+  shapes.check = atlas.addStroke(Path{}.moveTo(8, 50).lineTo(38, 20).lineTo(92, 87), iconStroke);
 
   Path wave;
   wave.moveTo(0, 50).cubicTo(30, 0, 70, 100, 100, 50).cubicTo(130, 0, 170, 100, 200, 50);
@@ -73,7 +73,7 @@ constexpr std::string_view longText =
   "SLUG VECTOR TEXT - CONTINUOUS SCALE DEMONSTRATION\n"
   "\n"
   "This page renders every glyph from immutable Slug curve and band textures.\n"
-  "Only four dynamic vertices are emitted for each visible vector glyph.\n"
+  "One compact instance is uploaded per visible glyph; six quad vertices are generated on GPU.\n"
   "Use the slider, the minus and plus buttons, or the mouse wheel over this page.\n"
   "\n"
   "A vector renderer should remain stable when typography changes every frame.\n"
@@ -132,6 +132,7 @@ int main(int argc, char** argv) try {
   Vec2 textPan = {};
   int spinValue = 12;
   float sliderValue = 0.42f;
+  float continuousCorners = 50.0f;
   ListBoxModel list{{"Alpha", "Beta", "Gamma", "Delta"}, 1};
   bool checked = true;
   ComboBoxModel combo{{"Vulkan", "Metal via MoltenVK", "DirectX (future)"}, 0, false};
@@ -153,6 +154,7 @@ int main(int argc, char** argv) try {
   bool reverseMotion = false;
   int smokeFrames = 0;
   auto previous = std::chrono::steady_clock::now();
+  float smoothedFrameMs = 1000.0f / 60.0f;
 
   while (!window.shouldClose()) {
     renderer.prepareFrame();
@@ -160,6 +162,8 @@ int main(int argc, char** argv) try {
     const auto now = std::chrono::steady_clock::now();
     const float deltaMs = std::chrono::duration<float, std::milli>(now - previous).count();
     previous = now;
+    if (deltaMs > 0.0f && deltaMs < 100.0f)
+      smoothedFrameMs += (deltaMs - smoothedFrameMs) * 0.08f;
     if (!motion.running()) {
       reverseMotion = !reverseMotion;
       motion.restart(reverseMotion ? 1.0f : 0.0f, reverseMotion ? 0.0f : 1.0f, 1800.0f, Easing::Spring);
@@ -199,9 +203,11 @@ int main(int argc, char** argv) try {
     draw.roundedRect({18, 105, 420, 228}, 14.0f, skin.panel, 100.0f);
     draw.text("GPU VECTOR PAINTS", {34, 116, 390, 24}, textStyle(13));
     draw.shape(shapes.rectangle, {35, 149, 180, 37}, Paint::solid(Color::fromRgb8(0x4f67ff), 0.84f));
+    ui.slider(hashId("continuous-corners"), "Corner %", {235, 184, 180, 20},
+              continuousCorners, 0.0f, 100.0f);
     draw.roundedRect({235, 149, 180, 37}, 10.0f,
       Paint::gradient(GradientKind::Linear, Color::fromRgb8(0xff4d8d), Color::fromRgb8(0xffca55), {0, 0}, {1, 0}),
-      100.0f);
+      continuousCorners);
     draw.shape(shapes.polygon, {38, 204, 72, 72},
       Paint::gradient(GradientKind::Diamond, Color::fromRgb8(0x86f7d4), Color::fromRgb8(0x116a9c), {.5f, .5f}, {1, 1}));
     draw.shape(shapes.circle, {130, 204, 72, 72},
@@ -213,7 +219,8 @@ int main(int argc, char** argv) try {
       Paint::gradient(GradientKind::Linear, Color::fromRgb8(0xff5e9c), Color::fromRgb8(0xffd66b)));
     draw.stroke(shapes.taperStroke, {310, 276, 105, 25}, Paint::solid(Color::fromRgb8(0x8cff81)));
     draw.text("solid / opacity", {42, 155, 165, 20}, textStyle(12));
-    draw.text("linear", {242, 155, 165, 20}, textStyle(12));
+    draw.text("Continuous Corners " + std::to_string(static_cast<int>(continuousCorners + 0.5f)) + "%",
+              {242, 155, 165, 20}, textStyle(12));
     draw.text("shader fill + line", {220, 294, 190, 18}, textStyle(11));
 
     // Typography gallery.
@@ -341,10 +348,10 @@ int main(int argc, char** argv) try {
       documentText.letterSpacing = 0.1f * textZoom;
       documentText.paint = Paint::gradient(GradientKind::Linear,
         Color::fromRgb8(0xf5f8ff), Color::fromRgb8(0x79d9ff), {0.0f, 0.0f}, {1.0f, 0.7f});
-      draw.text(std::string(longText),
-                {document.x + 24.0f + textPan.x, document.y + 38.0f + textPan.y,
-                 document.width - 48.0f, document.height - 54.0f},
-                documentText);
+      draw.textStatic(longText,
+                      {document.x + 24.0f + textPan.x, document.y + 38.0f + textPan.y,
+                       document.width - 48.0f, document.height - 54.0f},
+                      documentText);
       draw.setClip(oldClip);
     }
 
@@ -352,18 +359,28 @@ int main(int argc, char** argv) try {
 
     const auto previousStats = renderer.stats();
     std::ostringstream footer;
-    footer << "GPU batch: " << previousStats.drawCalls << " draw | " << previousStats.vertices
-           << " vertices | " << previousStats.indices << " indices | atlas immutable, frame data dynamic";
+    footer << std::fixed << std::setprecision(1)
+           << 1000.0f / std::max(smoothedFrameMs, 0.001f) << " fps | "
+           << previousStats.cpuBuildMilliseconds << " ms CPU / "
+           << previousStats.gpuMilliseconds << " ms GPU | "
+           << previousStats.uploadedBytes / 1024.0f << " KiB upload | "
+           << previousStats.drawCalls << " draw | " << previousStats.quads << " quads";
     draw.text(footer.str(), {24, framebuffer.y - 42, framebuffer.x - 48, 25}, textStyle(12));
     renderer.draw(draw);
-    if (smokeTest && ++smokeFrames >= 12) window.requestClose();
+    if (smokeTest) {
+      ++smokeFrames;
+      if (smokeFrames == 3) window.setSize(1320, 820);
+      if (smokeFrames >= 12) window.requestClose();
+    }
   }
   renderer.waitIdle();
   if (smokeTest) {
     const auto finalStats = renderer.stats();
-    std::cout << "Smoke batch: " << finalStats.drawCalls << " draw, " << finalStats.vertices
-              << " vertices, " << finalStats.indices << " indices\n";
-    if (finalStats.drawCalls != 1 || finalStats.vertices == 0 || finalStats.indices == 0)
+    std::cout << "Smoke batch: " << finalStats.drawCalls << " draw, " << finalStats.quads << " quads, "
+              << std::fixed << std::setprecision(3) << finalStats.cpuBuildMilliseconds
+              << " ms CPU, " << finalStats.gpuMilliseconds << " ms GPU, "
+              << finalStats.uploadedBytes / 1024.0f << " KiB upload\n";
+    if (finalStats.drawCalls != 1 || finalStats.quads == 0)
       throw std::runtime_error("Smoke test produced an empty GPU batch");
   }
   return 0;

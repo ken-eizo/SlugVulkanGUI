@@ -37,6 +37,12 @@ int main() try {
           std::get<DrawCommand>(paintList.overlayCommands().front()).paint.kind == GradientKind::Shader,
           "fill and line share Paint");
 
+  constexpr std::string_view persistentText = "persistent text without a frame copy";
+  DrawList staticTextList;
+  staticTextList.textStatic(persistentText, {0, 0, 300, 30}, {});
+  require(std::get<TextCommand>(staticTextList.commands().front()).text() == persistentText,
+          "borrowed static text command");
+
   DrawList cornerList;
   cornerList.roundedRect({20, 30, 360, 72}, 12.0f, sharedShader, 100.0f);
   require(cornerList.commands().size() == 1, "analytic rounded rectangle command");

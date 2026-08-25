@@ -38,7 +38,14 @@ void DrawList::roundedRect(Rect destination, float radiusPx, Paint paint,
 
 void DrawList::text(std::string utf8, Rect bounds, TextStyle style) {
   if (utf8.empty() || style.size <= 0.0f) return;
-  TextCommand command{std::move(utf8), bounds, clip_, std::move(style)};
+  TextCommand command{std::move(utf8), {}, bounds, clip_, std::move(style)};
+  if (overlayMode_) overlayCommands_.emplace_back(std::move(command));
+  else commands_.emplace_back(std::move(command));
+}
+
+void DrawList::textStatic(std::string_view utf8, Rect bounds, TextStyle style) {
+  if (utf8.empty() || style.size <= 0.0f) return;
+  TextCommand command{{}, utf8, bounds, clip_, std::move(style)};
   if (overlayMode_) overlayCommands_.emplace_back(std::move(command));
   else commands_.emplace_back(std::move(command));
 }

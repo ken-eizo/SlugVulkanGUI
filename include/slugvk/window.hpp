@@ -25,6 +25,7 @@ public:
 
   [[nodiscard]] bool shouldClose() const;
   void requestClose();
+  void setSize(int width, int height);
   void pollEvents();
   void waitForVisibleFramebuffer();
   void setRawMouseMotion(bool enabled);

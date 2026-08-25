@@ -18,9 +18,14 @@ struct DrawCommand {
 
 struct TextCommand {
   std::string utf8;
+  std::string_view borrowedUtf8 = {};
   Rect bounds = {};
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
   TextStyle style = {};
+
+  [[nodiscard]] std::string_view text() const {
+    return borrowedUtf8.data() ? borrowedUtf8 : std::string_view(utf8);
+  }
 };
 
 struct RoundedRectCommand {
@@ -55,6 +60,8 @@ public:
   void roundedRect(Rect destination, float radiusPx, Paint paint,
                    float continuousCornersPercent = 0.0f);
   void text(std::string utf8, Rect bounds, TextStyle style);
+  // The referenced bytes must remain alive until VulkanRenderer::draw() returns.
+  void textStatic(std::string_view utf8, Rect bounds, TextStyle style);
 
   [[nodiscard]] const std::vector<DisplayCommand>& commands() const { return commands_; }
   [[nodiscard]] const std::vector<DisplayCommand>& overlayCommands() const { return overlayCommands_; }

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -115,10 +116,9 @@ SwapchainSupport querySwapchain(VkPhysicalDevice device, VkSurfaceKHR surface) {
   return result;
 }
 
-struct Vertex {
-  float position[2];
-  float emCoord[2];
-  float uv[2];
+struct Instance {
+  float positionRect[4];
+  float emRect[4];
   float bandTransform[4];
   std::uint32_t shapeData[4];
   float color0[4];
@@ -194,13 +194,14 @@ struct VulkanRenderer::Impl {
   struct Frame {
     VkSemaphore imageAvailable = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
-    Buffer vertices{};
-    Buffer indices{};
+    VkQueryPool timestamps = VK_NULL_HANDLE;
+    bool timestampsWritten = false;
+    Buffer instances{};
   };
   std::array<Frame, framesInFlight> frames{};
   std::size_t currentFrame = 0;
-  std::vector<Vertex> stagingVertices{};
-  std::vector<std::uint32_t> stagingIndices{};
+  std::vector<Instance> stagingInstances{};
+  std::uint32_t timestampValidBits = 0;
   bool framePrepared = false;
   std::uint32_t preparedImageIndex = 0;
   VkResult preparedAcquireResult = VK_SUCCESS;
@@ -538,8 +539,10 @@ struct VulkanRenderer::Impl {
 
   VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& modes) const {
     if (!config.vsync) {
-      for (auto mode : modes) if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) return mode;
+      if (config.allowTearing)
+        for (auto mode : modes) if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) return mode;
       for (auto mode : modes) if (mode == VK_PRESENT_MODE_MAILBOX_KHR) return mode;
+      for (auto mode : modes) if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) return mode;
     }
     return VK_PRESENT_MODE_FIFO_KHR;
   }
@@ -612,18 +615,17 @@ struct VulkanRenderer::Impl {
     fragmentStage.pName = "main";
     const std::array stages{vertexStage, fragmentStage};
 
-    VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    std::array<VkVertexInputAttributeDescription, 10> attributes{{
-      {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, position)},
-      {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, emCoord)},
-      {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)},
-      {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, bandTransform)},
-      {4, 0, VK_FORMAT_R32G32B32A32_UINT, offsetof(Vertex, shapeData)},
-      {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color0)},
-      {6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color1)},
-      {7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, paint)},
-      {8, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, gradient)},
-      {9, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, clip)}
+    VkVertexInputBindingDescription binding{0, sizeof(Instance), VK_VERTEX_INPUT_RATE_INSTANCE};
+    std::array<VkVertexInputAttributeDescription, 9> attributes{{
+      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, positionRect)},
+      {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, emRect)},
+      {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, bandTransform)},
+      {3, 0, VK_FORMAT_R32G32B32A32_UINT, offsetof(Instance, shapeData)},
+      {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color0)},
+      {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color1)},
+      {6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, paint)},
+      {7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, gradient)},
+      {8, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, clip)}
     }};
     VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vertexInput.vertexBindingDescriptionCount = 1;
@@ -687,7 +689,7 @@ struct VulkanRenderer::Impl {
     vkDestroyShaderModule(device, fragmentModule, nullptr);
   }
 
-  void createSwapchainResources() {
+  void createSwapchainResources(VkSwapchainKHR oldSwapchain = VK_NULL_HANDLE) {
     window.waitForVisibleFramebuffer();
     const auto support = querySwapchain(physicalDevice, surface);
     const auto chosenFormat = chooseFormat(support.formats);
@@ -714,7 +716,20 @@ struct VulkanRenderer::Impl {
     swapchainPresentMode = choosePresentMode(support.presentModes);
     info.presentMode = swapchainPresentMode;
     info.clipped = VK_TRUE;
-    check(vkCreateSwapchainKHR(device, &info, nullptr, &swapchain), "vkCreateSwapchainKHR");
+    info.oldSwapchain = oldSwapchain;
+    VkSwapchainKHR newSwapchain = VK_NULL_HANDLE;
+    check(vkCreateSwapchainKHR(device, &info, nullptr, &newSwapchain), "vkCreateSwapchainKHR");
+    swapchain = newSwapchain;
+    if (oldSwapchain) vkDestroySwapchainKHR(device, oldSwapchain, nullptr);
+    const bool formatChanged = swapchainFormat != VK_FORMAT_UNDEFINED && swapchainFormat != chosenFormat.format;
+    if (formatChanged) {
+      if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+      if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+      if (renderPass) vkDestroyRenderPass(device, renderPass, nullptr);
+      pipeline = VK_NULL_HANDLE;
+      pipelineLayout = VK_NULL_HANDLE;
+      renderPass = VK_NULL_HANDLE;
+    }
     swapchainFormat = chosenFormat.format;
     vkGetSwapchainImagesKHR(device, swapchain, &imageCount, nullptr);
     swapchainImages.resize(imageCount);
@@ -728,8 +743,10 @@ struct VulkanRenderer::Impl {
       view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
       check(vkCreateImageView(device, &view, nullptr, &swapchainViews[i]), "vkCreateImageView(swapchain)");
     }
-    createRenderPass();
-    createPipeline();
+    if (!renderPass) {
+      createRenderPass();
+      createPipeline();
+    }
     framebuffers.resize(imageCount);
     for (std::size_t i = 0; i < imageCount; ++i) {
       VkFramebufferCreateInfo framebuffer{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -748,30 +765,39 @@ struct VulkanRenderer::Impl {
       check(vkCreateSemaphore(device, &semaphore, nullptr, &value), "vkCreateSemaphore(present)");
   }
 
-  void destroySwapchainResources() {
+  void destroySwapchainImages(bool destroySwapchain) {
     for (auto semaphore : renderFinished) if (semaphore) vkDestroySemaphore(device, semaphore, nullptr);
     renderFinished.clear();
     imageFences.clear();
     for (auto framebuffer : framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
     framebuffers.clear();
+    for (auto view : swapchainViews) vkDestroyImageView(device, view, nullptr);
+    swapchainViews.clear();
+    swapchainImages.clear();
+    if (destroySwapchain && swapchain) {
+      vkDestroySwapchainKHR(device, swapchain, nullptr);
+      swapchain = VK_NULL_HANDLE;
+    }
+  }
+
+  void destroySwapchainResources() {
+    destroySwapchainImages(true);
     if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
     if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
     if (renderPass) vkDestroyRenderPass(device, renderPass, nullptr);
     pipeline = VK_NULL_HANDLE;
     pipelineLayout = VK_NULL_HANDLE;
     renderPass = VK_NULL_HANDLE;
-    for (auto view : swapchainViews) vkDestroyImageView(device, view, nullptr);
-    swapchainViews.clear();
-    swapchainImages.clear();
-    if (swapchain) vkDestroySwapchainKHR(device, swapchain, nullptr);
-    swapchain = VK_NULL_HANDLE;
   }
 
   void recreateSwapchain() {
     window.waitForVisibleFramebuffer();
     check(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(resize)");
-    destroySwapchainResources();
-    createSwapchainResources();
+    const VkSwapchainKHR oldSwapchain = swapchain;
+    destroySwapchainImages(false);
+    swapchain = VK_NULL_HANDLE;
+    createSwapchainResources(oldSwapchain);
+    framePrepared = false;
   }
 
   void createFrames() {
@@ -783,125 +809,120 @@ struct VulkanRenderer::Impl {
     VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    std::uint32_t queueCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, nullptr);
+    std::vector<VkQueueFamilyProperties> queueProperties(queueCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, queueProperties.data());
+    timestampValidBits = queueFamilies.graphics ? queueProperties[*queueFamilies.graphics].timestampValidBits : 0;
+    const bool timestampsSupported = timestampValidBits > 0 && deviceProperties.limits.timestampPeriod > 0.0f;
     for (auto& frame : frames) {
       check(vkCreateSemaphore(device, &semaphore, nullptr, &frame.imageAvailable), "vkCreateSemaphore(acquire)");
       check(vkCreateFence(device, &fence, nullptr, &frame.fence), "vkCreateFence");
-      createBuffer(config.initialVertexCapacity * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, frame.vertices, true);
-      createBuffer(config.initialVertexCapacity * 2 * sizeof(std::uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, frame.indices, true);
+      createBuffer(config.initialVertexCapacity * sizeof(Instance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, frame.instances, true);
+      if (timestampsSupported) {
+        VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        query.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query.queryCount = 2;
+        check(vkCreateQueryPool(device, &query, nullptr, &frame.timestamps), "vkCreateQueryPool(timestamp)");
+      }
     }
   }
 
-  void appendShape(std::vector<Vertex>& vertices, std::vector<std::uint32_t>& indices,
-                   ShapeId id, Rect destination, const Paint& paintValue, Rect clip, float italicShear = 0.0f) const {
-    const auto shape = vectorAtlas.native().getShape(slughorn::Key(id));
-    if (!shape || shape->width <= 0 || shape->height <= 0 || destination.width <= 0 || destination.height <= 0) return;
+  void appendResolvedShape(std::vector<Instance>& instances, const slughorn::Atlas::Shape& shape,
+                           Rect destination, const Paint& paintValue, Rect clip,
+                           float italicShear = 0.0f) const {
+    if (shape.width <= 0 || shape.height <= 0 || destination.width <= 0 || destination.height <= 0) return;
     constexpr float padding = 1.25f;
-    const float emPaddingX = static_cast<float>(shape->width) / destination.width * padding;
-    const float emPaddingY = static_cast<float>(shape->height) / destination.height * padding;
-    const float emLeft = static_cast<float>(shape->bearingX) - emPaddingX;
-    const float emRight = static_cast<float>(shape->bearingX + shape->width) + emPaddingX;
-    const float emTop = static_cast<float>(shape->bearingY) + emPaddingY;
-    const float emBottom = static_cast<float>(shape->bearingY - shape->height) - emPaddingY;
+    const float emPaddingX = static_cast<float>(shape.width) / destination.width * padding;
+    const float emPaddingY = static_cast<float>(shape.height) / destination.height * padding;
+    const float emLeft = static_cast<float>(shape.bearingX) - emPaddingX;
+    const float emRight = static_cast<float>(shape.bearingX + shape.width) + emPaddingX;
+    const float emTop = static_cast<float>(shape.bearingY) + emPaddingY;
+    const float emBottom = static_cast<float>(shape.bearingY - shape.height) - emPaddingY;
     const float left = destination.x - padding;
     const float right = destination.x + destination.width + padding;
     const float top = destination.y - padding;
     const float bottom = destination.y + destination.height + padding;
     const float shear = italicShear * destination.height;
-    const std::array<std::array<float, 2>, 4> positions{{
-      {left + shear, top}, {right + shear, top}, {right, bottom}, {left, bottom}
-    }};
-    const std::array<std::array<float, 2>, 4> em{{
-      {emLeft, emTop}, {emRight, emTop}, {emRight, emBottom}, {emLeft, emBottom}
-    }};
-    const std::array<std::array<float, 2>, 4> uv{{{{0, 0}}, {{1, 0}}, {{1, 1}}, {{0, 1}}}};
-    const std::uint32_t base = static_cast<std::uint32_t>(vertices.size());
-    for (std::size_t i = 0; i < 4; ++i) {
-      Vertex vertex{};
-      std::copy(positions[i].begin(), positions[i].end(), vertex.position);
-      std::copy(em[i].begin(), em[i].end(), vertex.emCoord);
-      std::copy(uv[i].begin(), uv[i].end(), vertex.uv);
-      vertex.bandTransform[0] = static_cast<float>(shape->bandScaleX);
-      vertex.bandTransform[1] = static_cast<float>(shape->bandScaleY);
-      vertex.bandTransform[2] = static_cast<float>(shape->bandOffsetX);
-      vertex.bandTransform[3] = static_cast<float>(shape->bandOffsetY);
-      vertex.shapeData[0] = shape->bandTexX;
-      vertex.shapeData[1] = shape->bandTexY;
-      vertex.shapeData[2] = shape->bandMaxX;
-      vertex.shapeData[3] = shape->bandMaxY;
-      const float first[4]{paintValue.start.r, paintValue.start.g, paintValue.start.b, paintValue.start.a};
-      const float second[4]{paintValue.end.r, paintValue.end.g, paintValue.end.b, paintValue.end.a};
-      std::copy(std::begin(first), std::end(first), vertex.color0);
-      std::copy(std::begin(second), std::end(second), vertex.color1);
-      vertex.paint[0] = static_cast<float>(paintValue.kind);
-      vertex.paint[1] = paintValue.opacity;
-      vertex.paint[2] = paintValue.shaderParameter;
-      vertex.gradient[0] = paintValue.origin.x;
-      vertex.gradient[1] = paintValue.origin.y;
-      vertex.gradient[2] = paintValue.target.x;
-      vertex.gradient[3] = paintValue.target.y;
-      vertex.clip[0] = clip.x;
-      vertex.clip[1] = clip.y;
-      vertex.clip[2] = clip.width;
-      vertex.clip[3] = clip.height;
-      vertices.push_back(vertex);
-    }
-    const std::uint32_t local[]{0, 1, 2, 0, 2, 3};
-    for (auto index : local) indices.push_back(base + index);
+    if (right + std::max(shear, 0.0f) <= clip.x || left + std::min(shear, 0.0f) >= clip.x + clip.width ||
+        bottom <= clip.y || top >= clip.y + clip.height) return;
+
+    Instance quad{};
+    const float positionRect[4]{left, top, right, bottom};
+    const float emRect[4]{emLeft, emTop, emRight, emBottom};
+    std::copy(std::begin(positionRect), std::end(positionRect), quad.positionRect);
+    std::copy(std::begin(emRect), std::end(emRect), quad.emRect);
+    quad.bandTransform[0] = static_cast<float>(shape.bandScaleX);
+    quad.bandTransform[1] = static_cast<float>(shape.bandScaleY);
+    quad.bandTransform[2] = static_cast<float>(shape.bandOffsetX);
+    quad.bandTransform[3] = static_cast<float>(shape.bandOffsetY);
+    quad.shapeData[0] = shape.bandTexX;
+    quad.shapeData[1] = shape.bandTexY;
+    quad.shapeData[2] = shape.bandMaxX;
+    quad.shapeData[3] = shape.bandMaxY;
+    const float first[4]{paintValue.start.r, paintValue.start.g, paintValue.start.b, paintValue.start.a};
+    const float second[4]{paintValue.end.r, paintValue.end.g, paintValue.end.b, paintValue.end.a};
+    std::copy(std::begin(first), std::end(first), quad.color0);
+    std::copy(std::begin(second), std::end(second), quad.color1);
+    quad.paint[0] = static_cast<float>(paintValue.kind);
+    quad.paint[1] = paintValue.opacity;
+    quad.paint[2] = paintValue.shaderParameter;
+    quad.paint[3] = shear;
+    quad.gradient[0] = paintValue.origin.x;
+    quad.gradient[1] = paintValue.origin.y;
+    quad.gradient[2] = paintValue.target.x;
+    quad.gradient[3] = paintValue.target.y;
+    quad.clip[0] = clip.x;
+    quad.clip[1] = clip.y;
+    quad.clip[2] = clip.width;
+    quad.clip[3] = clip.height;
+    instances.push_back(quad);
   }
 
-  void appendRoundedRect(std::vector<Vertex>& vertices, std::vector<std::uint32_t>& indices,
-                         const RoundedRectCommand& command) const {
+  void appendShape(std::vector<Instance>& instances, ShapeId id, Rect destination,
+                   const Paint& paintValue, Rect clip, float italicShear = 0.0f) const {
+    const auto shape = vectorAtlas.native().getShape(slughorn::Key(id));
+    if (shape) appendResolvedShape(instances, *shape, destination, paintValue, clip, italicShear);
+  }
+
+  void appendRoundedRect(std::vector<Instance>& instances, const RoundedRectCommand& command) const {
     const Rect destination = command.destination;
     if (destination.width <= 0.0f || destination.height <= 0.0f) return;
     constexpr float padding = 1.25f;
-    const std::array<std::array<float, 2>, 4> positions{{
-      {{destination.x - padding, destination.y - padding}},
-      {{destination.x + destination.width + padding, destination.y - padding}},
-      {{destination.x + destination.width + padding, destination.y + destination.height + padding}},
-      {{destination.x - padding, destination.y + destination.height + padding}}
-    }};
-    const std::array<std::array<float, 2>, 4> local{{
-      {{-padding, -padding}}, {{destination.width + padding, -padding}},
-      {{destination.width + padding, destination.height + padding}}, {{-padding, destination.height + padding}}
-    }};
-    const std::array<std::array<float, 2>, 4> uv{{
-      {{-padding / destination.width, -padding / destination.height}},
-      {{1.0f + padding / destination.width, -padding / destination.height}},
-      {{1.0f + padding / destination.width, 1.0f + padding / destination.height}},
-      {{-padding / destination.width, 1.0f + padding / destination.height}}
-    }};
-    const std::uint32_t base = static_cast<std::uint32_t>(vertices.size());
-    for (std::size_t i = 0; i < 4; ++i) {
-      Vertex vertex{};
-      std::copy(positions[i].begin(), positions[i].end(), vertex.position);
-      std::copy(local[i].begin(), local[i].end(), vertex.emCoord);
-      std::copy(uv[i].begin(), uv[i].end(), vertex.uv);
-      vertex.bandTransform[0] = destination.width;
-      vertex.bandTransform[1] = destination.height;
-      vertex.bandTransform[2] = std::min(command.radiusPx, std::min(destination.width, destination.height) * 0.5f);
-      vertex.bandTransform[3] = command.continuousCornersPercent;
-      vertex.shapeData[0] = analyticRoundedRectShape;
-      const float first[4]{command.paint.start.r, command.paint.start.g, command.paint.start.b, command.paint.start.a};
-      const float second[4]{command.paint.end.r, command.paint.end.g, command.paint.end.b, command.paint.end.a};
-      std::copy(std::begin(first), std::end(first), vertex.color0);
-      std::copy(std::begin(second), std::end(second), vertex.color1);
-      vertex.paint[0] = static_cast<float>(command.paint.kind);
-      vertex.paint[1] = command.paint.opacity;
-      vertex.paint[2] = command.paint.shaderParameter;
-      vertex.gradient[0] = command.paint.origin.x;
-      vertex.gradient[1] = command.paint.origin.y;
-      vertex.gradient[2] = command.paint.target.x;
-      vertex.gradient[3] = command.paint.target.y;
-      vertex.clip[0] = command.clip.x;
-      vertex.clip[1] = command.clip.y;
-      vertex.clip[2] = command.clip.width;
-      vertex.clip[3] = command.clip.height;
-      vertices.push_back(vertex);
-    }
-    const std::uint32_t localIndices[]{0, 1, 2, 0, 2, 3};
-    for (auto index : localIndices) indices.push_back(base + index);
+    const float left = destination.x - padding;
+    const float top = destination.y - padding;
+    const float right = destination.x + destination.width + padding;
+    const float bottom = destination.y + destination.height + padding;
+    if (right <= command.clip.x || left >= command.clip.x + command.clip.width ||
+        bottom <= command.clip.y || top >= command.clip.y + command.clip.height) return;
+
+    Instance quad{};
+    const float positionRect[4]{left, top, right, bottom};
+    const float emRect[4]{-padding, -padding, destination.width + padding, destination.height + padding};
+    std::copy(std::begin(positionRect), std::end(positionRect), quad.positionRect);
+    std::copy(std::begin(emRect), std::end(emRect), quad.emRect);
+    quad.bandTransform[0] = destination.width;
+    quad.bandTransform[1] = destination.height;
+    quad.bandTransform[2] = std::min(command.radiusPx, std::min(destination.width, destination.height) * 0.5f);
+    quad.bandTransform[3] = command.continuousCornersPercent;
+    quad.shapeData[0] = analyticRoundedRectShape;
+    const float first[4]{command.paint.start.r, command.paint.start.g, command.paint.start.b, command.paint.start.a};
+    const float second[4]{command.paint.end.r, command.paint.end.g, command.paint.end.b, command.paint.end.a};
+    std::copy(std::begin(first), std::end(first), quad.color0);
+    std::copy(std::begin(second), std::end(second), quad.color1);
+    quad.paint[0] = static_cast<float>(command.paint.kind);
+    quad.paint[1] = command.paint.opacity;
+    quad.paint[2] = command.paint.shaderParameter;
+    quad.gradient[0] = command.paint.origin.x;
+    quad.gradient[1] = command.paint.origin.y;
+    quad.gradient[2] = command.paint.target.x;
+    quad.gradient[3] = command.paint.target.y;
+    quad.clip[0] = command.clip.x;
+    quad.clip[1] = command.clip.y;
+    quad.clip[2] = command.clip.width;
+    quad.clip[3] = command.clip.height;
+    instances.push_back(quad);
   }
 
   float textWidth(const std::vector<std::uint32_t>& codepoints, const TextStyle& style) const {
@@ -913,23 +934,37 @@ struct VulkanRenderer::Impl {
     return std::max(0.0f, width - style.letterSpacing);
   }
 
-  void appendText(std::vector<Vertex>& vertices, std::vector<std::uint32_t>& indices,
-                  const TextCommand& command) const {
-    std::string text = command.utf8;
-    if (command.style.listMarker == ListMarker::Bullet) text = "* " + text;
-    else if (command.style.listMarker == ListMarker::Numbered) text = "1. " + text;
+  void appendText(std::vector<Instance>& instances, const TextCommand& command) const {
+    std::string prefixed;
+    std::string_view text = command.text();
+    if (command.style.listMarker != ListMarker::None) {
+      const std::string_view marker = command.style.listMarker == ListMarker::Bullet ? "* " : "1. ";
+      prefixed.reserve(marker.size() + text.size());
+      prefixed.append(marker);
+      prefixed.append(text);
+      text = prefixed;
+    }
     std::size_t lineStart = 0;
     std::size_t lineNumber = 0;
     while (lineStart <= text.size()) {
       const std::size_t lineEnd = text.find('\n', lineStart);
       const std::string_view line(text.data() + lineStart,
         (lineEnd == std::string::npos ? text.size() : lineEnd) - lineStart);
+      const float top = command.bounds.y + static_cast<float>(lineNumber) * command.style.size * command.style.lineHeight;
+      const float lineBottom = top + command.style.size * std::max(command.style.lineHeight, 1.25f);
+      if (lineBottom < command.clip.y || top - command.style.size * 0.5f > command.clip.y + command.clip.height) {
+        if (lineEnd == std::string::npos) break;
+        lineStart = lineEnd + 1;
+        ++lineNumber;
+        continue;
+      }
       const auto codepoints = decodeUtf8(line);
-      const float width = textWidth(codepoints, command.style);
+      const bool needsWidth = command.style.align != HorizontalAlign::Left ||
+                              command.style.underline || command.style.strikethrough;
+      const float width = needsWidth ? textWidth(codepoints, command.style) : 0.0f;
       float x = command.bounds.x + command.style.indent;
       if (command.style.align == HorizontalAlign::Center) x += (command.bounds.width - width) * 0.5f;
       else if (command.style.align == HorizontalAlign::Right) x += command.bounds.width - width;
-      const float top = command.bounds.y + static_cast<float>(lineNumber) * command.style.size * command.style.lineHeight;
       const float baseline = top + command.style.size;
       const float lineX = x;
       for (auto codepoint : codepoints) {
@@ -944,23 +979,25 @@ struct VulkanRenderer::Impl {
             static_cast<float>(glyph->width) * command.style.size,
             static_cast<float>(glyph->height) * command.style.size
           };
-          appendShape(vertices, indices, glyphId, destination, command.style.paint, command.clip,
-                      command.style.italic ? 0.18f : 0.0f);
+          appendResolvedShape(instances, *glyph, destination, command.style.paint, command.clip,
+                              command.style.italic ? 0.18f : 0.0f);
           if (command.style.bold) {
             destination.x += std::max(0.55f, command.style.size * 0.035f);
-            appendShape(vertices, indices, glyphId, destination, command.style.paint, command.clip,
-                        command.style.italic ? 0.18f : 0.0f);
+            appendResolvedShape(instances, *glyph, destination, command.style.paint, command.clip,
+                                command.style.italic ? 0.18f : 0.0f);
           }
         }
         x += advance + command.style.letterSpacing;
       }
       if (width > 0.0f && command.style.underline) {
         Rect decoration{lineX, baseline + command.style.size * 0.07f, width, std::max(1.0f, command.style.size * 0.065f)};
-        appendShape(vertices, indices, vectorAtlas.glyph('_', command.style.fontName), decoration, command.style.paint, command.clip);
+        appendShape(instances, vectorAtlas.glyph('_', command.style.fontName), decoration,
+                    command.style.paint, command.clip);
       }
       if (width > 0.0f && command.style.strikethrough) {
         Rect decoration{lineX, baseline - command.style.size * 0.32f, width, std::max(1.0f, command.style.size * 0.06f)};
-        appendShape(vertices, indices, vectorAtlas.glyph('-', command.style.fontName), decoration, command.style.paint, command.clip);
+        appendShape(instances, vectorAtlas.glyph('-', command.style.fontName), decoration,
+                    command.style.paint, command.clip);
       }
       if (lineEnd == std::string::npos) break;
       lineStart = lineEnd + 1;
@@ -968,18 +1005,17 @@ struct VulkanRenderer::Impl {
     }
   }
 
-  void buildMesh(const DrawList& list, std::vector<Vertex>& vertices, std::vector<std::uint32_t>& indices) const {
+  void buildMesh(const DrawList& list, std::vector<Instance>& instances) const {
     const std::size_t commandCount = list.commands().size() + list.overlayCommands().size();
-    vertices.reserve(commandCount * 4);
-    indices.reserve(commandCount * 6);
+    instances.reserve(commandCount);
     const auto appendCommands = [&](const auto& commands) {
       for (const auto& display : commands) {
         if (const auto* shapeCommand = std::get_if<DrawCommand>(&display))
-          appendShape(vertices, indices, shapeCommand->shape, shapeCommand->destination, shapeCommand->paint,
+          appendShape(instances, shapeCommand->shape, shapeCommand->destination, shapeCommand->paint,
                       shapeCommand->clip, shapeCommand->italicShear);
         else if (const auto* textCommand = std::get_if<TextCommand>(&display))
-          appendText(vertices, indices, *textCommand);
-        else appendRoundedRect(vertices, indices, std::get<RoundedRectCommand>(display));
+          appendText(instances, *textCommand);
+        else appendRoundedRect(instances, std::get<RoundedRectCommand>(display));
       }
     };
     appendCommands(list.commands());
@@ -995,10 +1031,14 @@ struct VulkanRenderer::Impl {
                  buffer, true);
   }
 
-  void record(VkCommandBuffer command, std::uint32_t imageIndex, const Frame& frame,
-              std::uint32_t indexCount) {
+  void record(VkCommandBuffer command, std::uint32_t imageIndex, Frame& frame,
+              std::uint32_t instanceCount) {
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(frame)");
+    if (frame.timestamps) {
+      vkCmdResetQueryPool(command, frame.timestamps, 0, 2);
+      vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame.timestamps, 0);
+    }
     VkClearValue clear{{{config.clearColor.r, config.clearColor.g, config.clearColor.b, config.clearColor.a}}};
     VkRenderPassBeginInfo render{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     render.renderPass = renderPass;
@@ -1007,7 +1047,7 @@ struct VulkanRenderer::Impl {
     render.clearValueCount = 1;
     render.pClearValues = &clear;
     vkCmdBeginRenderPass(command, &render, VK_SUBPASS_CONTENTS_INLINE);
-    if (indexCount) {
+    if (instanceCount) {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
       VkViewport viewport{0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
       VkRect2D scissor{{0, 0}, extent};
@@ -1015,21 +1055,38 @@ struct VulkanRenderer::Impl {
       vkCmdSetScissor(command, 0, 1, &scissor);
       vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
       const VkDeviceSize offset = 0;
-      vkCmdBindVertexBuffers(command, 0, 1, &frame.vertices.buffer, &offset);
-      vkCmdBindIndexBuffer(command, frame.indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+      vkCmdBindVertexBuffers(command, 0, 1, &frame.instances.buffer, &offset);
       const float viewportSize[]{static_cast<float>(extent.width), static_cast<float>(extent.height)};
       vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(viewportSize), viewportSize);
-      vkCmdDrawIndexed(command, indexCount, 1, 0, 0, 0);
+      vkCmdDraw(command, 6, instanceCount, 0, 0);
     }
     vkCmdEndRenderPass(command);
+    if (frame.timestamps)
+      vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, frame.timestamps, 1);
     check(vkEndCommandBuffer(command), "vkEndCommandBuffer(frame)");
   }
 
   void prepareFrame() {
     if (framePrepared) return;
+    const Vec2 framebuffer = window.framebufferSize();
+    if (framebuffer.x > 0.0f && framebuffer.y > 0.0f &&
+        (static_cast<std::uint32_t>(framebuffer.x) != extent.width ||
+         static_cast<std::uint32_t>(framebuffer.y) != extent.height))
+      recreateSwapchain();
     while (!framePrepared) {
       Frame& frame = frames[currentFrame];
       check(vkWaitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(frame)");
+      if (frame.timestamps && frame.timestampsWritten) {
+        std::uint64_t ticks[2]{};
+        check(vkGetQueryPoolResults(device, frame.timestamps, 0, 2, sizeof(ticks), ticks,
+                                    sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+              "vkGetQueryPoolResults(timestamp)");
+        const std::uint64_t timestampMask = timestampValidBits >= 64 ? ~std::uint64_t{0} :
+          (std::uint64_t{1} << timestampValidBits) - 1;
+        const std::uint64_t elapsedTicks = (ticks[1] - ticks[0]) & timestampMask;
+        statistics.gpuMilliseconds = static_cast<float>(elapsedTicks) *
+          deviceProperties.limits.timestampPeriod / 1'000'000.0f;
+      }
       preparedAcquireResult = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
                                                      frame.imageAvailable, VK_NULL_HANDLE,
                                                      &preparedImageIndex);
@@ -1052,19 +1109,17 @@ struct VulkanRenderer::Impl {
     Frame& frame = frames[currentFrame];
     const std::uint32_t imageIndex = preparedImageIndex;
 
-    stagingVertices.clear();
-    stagingIndices.clear();
-    buildMesh(list, stagingVertices, stagingIndices);
-    ensureCapacity(frame.vertices, stagingVertices.size() * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    ensureCapacity(frame.indices, stagingIndices.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-    if (!stagingVertices.empty())
-      std::memcpy(frame.vertices.mapped, stagingVertices.data(), stagingVertices.size() * sizeof(Vertex));
-    if (!stagingIndices.empty())
-      std::memcpy(frame.indices.mapped, stagingIndices.data(), stagingIndices.size() * sizeof(std::uint32_t));
+    const auto cpuBuildStart = std::chrono::steady_clock::now();
+    stagingInstances.clear();
+    buildMesh(list, stagingInstances);
+    ensureCapacity(frame.instances, stagingInstances.size() * sizeof(Instance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    if (!stagingInstances.empty())
+      std::memcpy(frame.instances.mapped, stagingInstances.data(), stagingInstances.size() * sizeof(Instance));
+    const auto cpuBuildEnd = std::chrono::steady_clock::now();
 
     check(vkResetFences(device, 1, &frame.fence), "vkResetFences");
     check(vkResetCommandBuffer(commandBuffers[currentFrame], 0), "vkResetCommandBuffer");
-    record(commandBuffers[currentFrame], imageIndex, frame, static_cast<std::uint32_t>(stagingIndices.size()));
+    record(commandBuffers[currentFrame], imageIndex, frame, static_cast<std::uint32_t>(stagingInstances.size()));
     const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = 1;
@@ -1075,6 +1130,7 @@ struct VulkanRenderer::Impl {
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &renderFinished[imageIndex];
     check(vkQueueSubmit(graphicsQueue, 1, &submit, frame.fence), "vkQueueSubmit(frame)");
+    frame.timestampsWritten = frame.timestamps != VK_NULL_HANDLE;
 
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
@@ -1083,13 +1139,15 @@ struct VulkanRenderer::Impl {
     present.pSwapchains = &swapchain;
     present.pImageIndices = &imageIndex;
     const VkResult presented = vkQueuePresentKHR(presentQueue, &present);
-    const bool needsRecreate = presented == VK_ERROR_OUT_OF_DATE_KHR ||
-      presented == VK_SUBOPTIMAL_KHR || preparedAcquireResult == VK_SUBOPTIMAL_KHR;
-    if (!needsRecreate && presented != VK_SUCCESS) check(presented, "vkQueuePresentKHR");
+    const bool needsRecreate = presented == VK_ERROR_OUT_OF_DATE_KHR;
+    if (presented != VK_SUCCESS && presented != VK_SUBOPTIMAL_KHR && !needsRecreate)
+      check(presented, "vkQueuePresentKHR");
 
-    statistics.vertices = static_cast<std::uint32_t>(stagingVertices.size());
-    statistics.indices = static_cast<std::uint32_t>(stagingIndices.size());
-    statistics.drawCalls = stagingIndices.empty() ? 0U : 1U;
+    statistics.quads = static_cast<std::uint32_t>(stagingInstances.size());
+    statistics.drawCalls = stagingInstances.empty() ? 0U : 1U;
+    statistics.uploadedBytes = stagingInstances.size() * sizeof(Instance);
+    statistics.cpuBuildMilliseconds =
+      std::chrono::duration<float, std::milli>(cpuBuildEnd - cpuBuildStart).count();
     framePrepared = false;
     currentFrame = (currentFrame + 1) % framesInFlight;
     if (needsRecreate) recreateSwapchain();
@@ -1099,8 +1157,8 @@ struct VulkanRenderer::Impl {
     if (device) vkDeviceWaitIdle(device);
     if (device) {
       for (auto& frame : frames) {
-        destroyBuffer(frame.vertices);
-        destroyBuffer(frame.indices);
+        destroyBuffer(frame.instances);
+        if (frame.timestamps) vkDestroyQueryPool(device, frame.timestamps, nullptr);
         if (frame.imageAvailable) vkDestroySemaphore(device, frame.imageAvailable, nullptr);
         if (frame.fence) vkDestroyFence(device, frame.fence, nullptr);
         frame = {};
