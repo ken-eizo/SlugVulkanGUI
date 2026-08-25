@@ -2,14 +2,19 @@ cmake_minimum_required(VERSION 3.24)
 
 project(SlugVulkan VERSION 0.1.0 LANGUAGES C CXX)
 
-option(SLUGVK_BUILD_EXAMPLE "Build the kitchen-sink example" ON)
-option(SLUGVK_BUILD_TESTS "Build unit tests" ON)
+option(SLUGVK_BUILD_EXAMPLE "Build the kitchen-sink example" ${PROJECT_IS_TOP_LEVEL})
+option(SLUGVK_BUILD_TESTS "Build unit tests" ${PROJECT_IS_TOP_LEVEL})
 option(SLUGVK_ENABLE_VALIDATION "Enable Vulkan validation in debug builds" ON)
+option(SLUGVK_STATIC_MSVC_RUNTIME "Link the standalone MSVC build against the static runtime"
+       ${PROJECT_IS_TOP_LEVEL})
+option(SLUGVK_INSTALL "Install the raw static library and public headers" ${PROJECT_IS_TOP_LEVEL})
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(MSVC AND SLUGVK_STATIC_MSVC_RUNTIME)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 find_package(Vulkan REQUIRED)
 
@@ -93,6 +98,7 @@ add_library(slugvk STATIC
   src/vulkan_renderer.cpp
   "${SLUGVK_EMBEDDED_SHADER_HEADER}"
 )
+add_library(SlugVulkan::slugvk ALIAS slugvk)
 add_dependencies(slugvk slugvk_shaders)
 target_include_directories(slugvk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
                                   PRIVATE "${SLUGVK_GENERATED_DIR}")
@@ -109,7 +115,7 @@ endif()
 
 if(SLUGVK_BUILD_EXAMPLE)
   add_executable(slugvk_example MACOSX_BUNDLE examples/kitchen_sink.cpp)
-  target_link_libraries(slugvk_example PRIVATE slugvk)
+  target_link_libraries(slugvk_example PRIVATE SlugVulkan::slugvk)
   add_dependencies(slugvk_example slugvk_shaders)
   set_target_properties(slugvk_example PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME "SlugVulkanGUI Example"
@@ -121,9 +127,11 @@ endif()
 if(SLUGVK_BUILD_TESTS)
   enable_testing()
   add_executable(slugvk_tests tests/core_tests.cpp)
-  target_link_libraries(slugvk_tests PRIVATE slugvk)
+  target_link_libraries(slugvk_tests PRIVATE SlugVulkan::slugvk)
   add_test(NAME slugvk_core COMMAND slugvk_tests)
 endif()
 
-install(TARGETS slugvk ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
-install(DIRECTORY include/ DESTINATION include)
+if(SLUGVK_INSTALL)
+  install(TARGETS slugvk ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+  install(DIRECTORY include/ DESTINATION include)
+endif()

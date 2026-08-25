@@ -24,12 +24,18 @@ void DrawList::shape(ShapeId id, Rect destination, Paint paint, Rect clip) {
 
 void DrawList::roundedRect(Rect destination, float radiusPx, Paint paint,
                            float continuousCornersPercent) {
+  roundedRect(destination, CornerRadii::all(radiusPx), std::move(paint),
+              CornerSmoothing::all(continuousCornersPercent));
+}
+
+void DrawList::roundedRect(Rect destination, CornerRadii radiiPx, Paint paint,
+                           CornerSmoothing continuousCorners) {
   if (destination.width <= 0.0f || destination.height <= 0.0f) return;
   RoundedRectCommand command{
     destination,
     clip_,
-    std::max(radiusPx, 0.0f),
-    std::clamp(continuousCornersPercent, 0.0f, 100.0f),
+    radiiPx,
+    continuousCorners,
     paint
   };
   if (overlayMode_) overlayCommands_.emplace_back(std::move(command));

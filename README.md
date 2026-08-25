@@ -9,6 +9,16 @@ The current milestone is a working, testable foundation for the long-term goal o
 fast and stable dynamic vector/UI renderer. “Fastest in the world” is a target that must be proven
 with reproducible cross-library benchmarks; this repository does not make that unsupported claim.
 
+## Documentation
+
+- [Technical documentation index](docs/README.md)
+- [Build and source integration](docs/BUILD_AND_INTEGRATION.md)
+- [Architecture and CPU/GPU responsibilities](docs/ARCHITECTURE.md)
+- [API guide](docs/API_GUIDE.md)
+- [Performance and low-latency guide](docs/PERFORMANCE.md)
+- [Generic native-host embedding design](docs/EMBEDDING.md), including the path toward dockable
+  DCC/plugin panels without making the core host-specific
+
 ## Implemented
 
 - Solid, linear, diamond, radial, and procedural shader paints; per-paint opacity. The same `Paint`
@@ -18,8 +28,14 @@ with reproducible cross-library benchmarks; this repository does not make that u
 - Rectangle, circle, ellipse, polygon, star, cubic and quadratic paths. `DrawList::roundedRect`
   applies its radius in absolute framebuffer pixels after width/height placement, including a
   0–100% continuous-corner control; resizing the rectangle never stretches its corner radius.
+  The compact scalar overload remains the normal API. An optional `CornerRadii` / `CornerSmoothing`
+  overload independently overrides the four corners without increasing the GPU instance size.
 - Multiple independently painted stroke shapes, width, butt/round/square caps,
   miter/round/bevel joins, dash arrays, gap lengths, dash offset, and start/end width taper.
+  `cap` remains the only required/default cap field. Optional whole-path `startCap` / `endCap`,
+  dash-wide `dashStartCap` / `dashEndCap`, and indexed `dashCaps` override only explicitly supplied
+  endpoints. Styles that omit them keep the original API and remain one immutable Slug shape at
+  runtime.
   The Example exposes live dash-length, gap, and offset sliders; its straight-line preview emits
   only the visible analytic dash instances and does not rebuild the immutable Slug atlas.
 - FreeType outlines loaded into the same Slug atlas. Multiple fonts are namespaced by font family
@@ -35,8 +51,13 @@ with reproducible cross-library benchmarks; this repository does not make that u
   single instanced GPU batch but is emitted after ordinary panels and widgets.
 - A low-latency frame path: one frame in flight, smooth MAILBOX present preferred by default,
   post-dispatch cursor resampling in framebuffer coordinates (including HiDPI), reusable CPU
-  staging memory, and `prepareFrame()` so waits happen before input sampling and DrawList creation.
-  Set `RendererConfig::allowTearing` for the absolute-latency IMMEDIATE mode.
+  staging memory, cached framebuffer scaling for high-rate cursor callbacks, and `prepareFrame()`
+  so waits happen before input sampling and DrawList creation.
+  One-frame mode omits the redundant per-image fence wait. GPU timestamp commands are opt-in and
+  can be sampled rather than emitted every frame. Set `RendererConfig::allowTearing` for the
+  absolute-latency IMMEDIATE mode; the Example enables it and samples the pointer again immediately
+  before declaring interactive controls. IMMEDIATE also uses the minimum legal swapchain image
+  count; launch the Example with `--mailbox` when tear-free presentation is preferred.
 - Generic `Tween<T>` with linear, ease-in/out, smooth-step, and spring easing.
 - One immutable GPU atlas, a dynamic host-visible instance ring, and optional retained device-local
   text buffers. Quad vertices come from `gl_VertexIndex`; there is no index buffer. Adjacent dynamic
@@ -202,6 +223,21 @@ while (!window.shouldClose()) {
 
 See [`examples/kitchen_sink.cpp`](examples/kitchen_sink.cpp) for all components in one executable.
 
+### Use from another CMake project
+
+Source integration is the supported library-consumption path in the current `0.x` series. Example,
+tests, install rules, and static MSVC runtime selection default to OFF when this repository is added
+as a subproject.
+
+```cmake
+add_subdirectory(external/SlugVulkanGUI)
+target_link_libraries(my_application PRIVATE SlugVulkan::slugvk)
+```
+
+The current install rule copies the raw archive and headers; it is not yet a complete exported
+`find_package(SlugVulkan)` package. See the [integration guide](docs/BUILD_AND_INTEGRATION.md) for
+options, CRT/ABI constraints, lifecycle, and MoltenVK packaging.
+
 ## Current boundaries
 
 - The included text layout is intentionally small and currently performs codepoint layout, not
@@ -217,6 +253,9 @@ See [`examples/kitchen_sink.cpp`](examples/kitchen_sink.cpp) for all components 
 - `Path::roundedRect` remains an ordinary authored vector path and therefore scales like any other
   path when its destination transform changes. Use `DrawList::roundedRect` for layout rectangles
   whose corner radius must remain an absolute pixel value.
+- The current `Window`/`VulkanRenderer` backend owns a GLFW top-level window and its Vulkan surface.
+  Host-owned `HWND` / `NSView` embedding is a documented backend-decomposition roadmap, not an
+  already supported constructor. Host SDK adapters remain separate from the general-purpose core.
 
 ## Dependency revisions
 

@@ -22,19 +22,34 @@ layout(location = 0) out vec4 outColor;
 const int indirectionSize = 32;
 const uint analyticRoundedRectShape = 0xFFFFFFFFu;
 
+vec2 unpackFixed16(uint packed, float scale) {
+  return vec2(float(packed & 0xFFFFu), float(packed >> 16u)) / scale;
+}
+
 float roundedRectCoverage(vec2 point, vec4 metrics) {
   vec2 size = max(metrics.xy, vec2(0.0001));
-  vec2 halfSize = size * 0.5;
-  float radius = clamp(metrics.z, 0.0, min(halfSize.x, halfSize.y));
-  vec2 centered = abs(point - halfSize);
-  if (radius <= 0.0001) {
-    vec2 q = centered - halfSize;
+  vec4 radii = vec4(unpackFixed16(shapeData.y, 16.0), unpackFixed16(shapeData.z, 16.0));
+  vec4 smoothing = vec4(unpackFixed16(shapeData.w, 256.0),
+                        unpackFixed16(floatBitsToUint(paintData.w), 256.0));
+  int cornerIndex = -1;
+  if (point.x < radii.x && point.y < radii.x) cornerIndex = 0;
+  else if (point.x > size.x - radii.y && point.y < radii.y) cornerIndex = 1;
+  else if (point.x > size.x - radii.z && point.y > size.y - radii.z) cornerIndex = 2;
+  else if (point.x < radii.w && point.y > size.y - radii.w) cornerIndex = 3;
+  if (cornerIndex < 0) {
+    vec2 halfSize = size * 0.5;
+    vec2 q = abs(point - halfSize) - halfSize;
     float distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
     float aa = max(fwidth(distance), 0.0001);
     return 1.0 - smoothstep(-aa, aa, distance);
   }
-  vec2 corner = max(centered - (halfSize - vec2(radius)), 0.0) / radius;
-  float exponent = mix(2.0, 5.0, clamp(metrics.w * 0.01, 0.0, 1.0));
+  float radius = radii[cornerIndex];
+  vec2 center = cornerIndex == 0 ? vec2(radius, radius)
+    : cornerIndex == 1 ? vec2(size.x - radius, radius)
+    : cornerIndex == 2 ? vec2(size.x - radius, size.y - radius)
+    : vec2(radius, size.y - radius);
+  vec2 corner = abs(point - center) / max(radius, 0.0001);
+  float exponent = mix(2.0, 5.0, clamp(smoothing[cornerIndex] * 0.01, 0.0, 1.0));
   float implicitCurve = pow(corner.x, exponent) + pow(corner.y, exponent) - 1.0;
   float aa = max(fwidth(implicitCurve), 0.0001);
   return 1.0 - smoothstep(-aa, aa, implicitCurve);

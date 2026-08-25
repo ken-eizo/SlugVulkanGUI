@@ -41,6 +41,127 @@ slughorn::canvas::LineJoin join(LineJoin value) {
     default: return slughorn::canvas::LineJoin::Miter;
   }
 }
+
+LineCap resolvedStartCap(const StrokeStyle& style, std::size_t dashIndex,
+                         bool atPathStart, bool dashed) {
+  if (dashed && dashIndex < style.dashCaps.size() && style.dashCaps[dashIndex].start)
+    return *style.dashCaps[dashIndex].start;
+  if (atPathStart && style.startCap) return *style.startCap;
+  if (dashed && style.dashStartCap) return *style.dashStartCap;
+  return style.cap;
+}
+
+LineCap resolvedEndCap(const StrokeStyle& style, std::size_t dashIndex,
+                       bool atPathEnd, bool dashed) {
+  if (dashed && dashIndex < style.dashCaps.size() && style.dashCaps[dashIndex].end)
+    return *style.dashCaps[dashIndex].end;
+  if (atPathEnd && style.endCap) return *style.endCap;
+  if (dashed && style.dashEndCap) return *style.dashEndCap;
+  return style.cap;
+}
+
+void appendCap(slughorn::canvas::Path& output, const slughorn::canvas::Path::Sample& endpoint,
+               float halfWidth, LineCap lineCap, bool start) {
+  if (halfWidth <= 0.0f || lineCap == LineCap::Butt) return;
+  slughorn::canvas::Path capPath;
+  if (lineCap == LineCap::Round) {
+    capPath.circle(endpoint.x, endpoint.y, sv(halfWidth));
+  } else {
+    const float direction = start ? -1.0f : 1.0f;
+    const float tx = std::cos(static_cast<float>(endpoint.angle)) * direction;
+    const float ty = std::sin(static_cast<float>(endpoint.angle)) * direction;
+    const float nx = -std::sin(static_cast<float>(endpoint.angle));
+    const float ny = std::cos(static_cast<float>(endpoint.angle));
+    const float ax = static_cast<float>(endpoint.x) + nx * halfWidth;
+    const float ay = static_cast<float>(endpoint.y) + ny * halfWidth;
+    const float bx = static_cast<float>(endpoint.x) - nx * halfWidth;
+    const float by = static_cast<float>(endpoint.y) - ny * halfWidth;
+    capPath.moveTo(sv(ax), sv(ay));
+    capPath.lineTo(sv(bx), sv(by));
+    capPath.lineTo(sv(bx + tx * halfWidth), sv(by + ty * halfWidth));
+    capPath.lineTo(sv(ax + tx * halfWidth), sv(ay + ty * halfWidth));
+    capPath.closePath();
+  }
+  output.addPath(capPath);
+}
+
+bool appendStrokedPath(slughorn::canvas::Path& output, slughorn::canvas::Path centerline,
+                       float width, LineJoin lineJoin, LineCap startCap, LineCap endCap) {
+  const auto start = centerline.sample(0.0f);
+  const auto end = centerline.sample(1.0f);
+  if (startCap == endCap) {
+    if (!centerline.strokePath(sv(width), false, join(lineJoin), cap(startCap), sv(4.0f))) return false;
+    output.addPath(centerline);
+    return true;
+  }
+  if (!centerline.strokePath(sv(width), false, join(lineJoin),
+                             slughorn::canvas::LineCap::Butt, sv(4.0f))) return false;
+  output.addPath(centerline);
+  appendCap(output, start, width * 0.5f, startCap, true);
+  appendCap(output, end, width * 0.5f, endCap, false);
+  return true;
+}
+
+struct DashSegment {
+  slughorn::canvas::Path path;
+  std::size_t visibleIndex = 0;
+  bool atPathStart = false;
+  bool atPathEnd = false;
+};
+
+std::vector<DashSegment> splitDashes(const slughorn::canvas::Path& source,
+                                     const StrokeStyle& style) {
+  std::vector<DashSegment> segments;
+  std::vector<float> pattern;
+  pattern.reserve(style.dashLengths.size() * 2U);
+  for (float value : style.dashLengths) pattern.push_back(std::max(value, 0.001f));
+  if (pattern.size() & 1U) pattern.insert(pattern.end(), pattern.begin(), pattern.end());
+  float patternLength = 0.0f;
+  for (float value : pattern) patternLength += value;
+  const float totalLength = static_cast<float>(source.arcLength());
+  if (patternLength <= 0.0f || totalLength <= 0.00001f) return {};
+
+  float phase = std::fmod(style.dashOffset, patternLength);
+  if (phase < 0.0f) phase += patternLength;
+  std::size_t patternIndex = 0;
+  while (phase >= pattern[patternIndex]) {
+    phase -= pattern[patternIndex];
+    patternIndex = (patternIndex + 1U) % pattern.size();
+  }
+  float distance = 0.0f;
+  float remaining = pattern[patternIndex] - phase;
+  std::size_t visibleIndex = 0;
+  constexpr float samplesPerPath = 1024.0f;
+  const float sampleStep = totalLength / samplesPerPath;
+  while (distance < totalLength - 0.00001f) {
+    const float intervalEnd = std::min(distance + remaining, totalLength);
+    if ((patternIndex & 1U) == 0U && intervalEnd > distance + 0.00001f) {
+      DashSegment segment;
+      segment.visibleIndex = visibleIndex++;
+      segment.atPathStart = distance <= 0.00001f;
+      segment.atPathEnd = intervalEnd >= totalLength - 0.00001f;
+      const auto first = source.sample(sv(distance / totalLength));
+      segment.path.moveTo(first.x, first.y);
+      float sampleDistance = (std::floor(distance / sampleStep) + 1.0f) * sampleStep;
+      while (sampleDistance < intervalEnd - 0.00001f) {
+        const auto point = source.sample(sv(sampleDistance / totalLength));
+        segment.path.lineTo(point.x, point.y);
+        sampleDistance += sampleStep;
+      }
+      const auto last = source.sample(sv(intervalEnd / totalLength));
+      segment.path.lineTo(last.x, last.y);
+      segments.push_back(std::move(segment));
+    }
+    const float consumed = intervalEnd - distance;
+    distance = intervalEnd;
+    remaining -= consumed;
+    if (remaining <= 0.00001f) {
+      patternIndex = (patternIndex + 1U) % pattern.size();
+      remaining = pattern[patternIndex];
+    }
+  }
+  return segments;
+}
 }
 
 struct Path::Impl { slughorn::canvas::Path value; };
@@ -130,7 +251,7 @@ struct VectorAtlas::Impl {
   ShapeId nextId = slughorn::KeyIterator::AUTO_KEY_START;
   std::string family;
   std::string style;
-  std::uint8_t nextFontMask = 0;
+  std::uint16_t nextFontMask = 0;
   std::unordered_map<std::string, std::uint8_t, TransparentStringHash, std::equal_to<>> fontMasks;
 
   Impl() : atlas(1024) {}
@@ -161,19 +282,25 @@ ShapeId VectorAtlas::addStroke(const Path& path, const StrokeStyle& style) {
     // Only authored geometry changes; the runtime still renders one immutable Slug shape.
     slughorn::canvas::Path outline;
     constexpr int samples = 192;
+    std::vector<float> pattern;
+    pattern.reserve(style.dashLengths.size() * 2U);
+    for (float value : style.dashLengths) pattern.push_back(std::max(value, 0.001f));
+    if (pattern.size() & 1U) pattern.insert(pattern.end(), pattern.begin(), pattern.end());
     float patternLength = 0.0f;
-    for (float value : style.dashLengths) patternLength += std::max(value, 0.001f);
+    for (float value : pattern) patternLength += value;
     float phase = patternLength > 0.0f ? std::fmod(style.dashOffset, patternLength) : 0.0f;
     if (phase < 0.0f) phase += patternLength;
     std::size_t patternIndex = 0;
-    while (patternLength > 0.0f && phase > style.dashLengths[patternIndex]) {
-      phase -= style.dashLengths[patternIndex];
-      patternIndex = (patternIndex + 1U) % style.dashLengths.size();
+    while (patternLength > 0.0f && phase >= pattern[patternIndex]) {
+      phase -= pattern[patternIndex];
+      patternIndex = (patternIndex + 1U) % pattern.size();
     }
     float remaining = patternLength > 0.0f
-      ? std::max(style.dashLengths[patternIndex] - phase, 0.001f)
+      ? pattern[patternIndex] - phase
       : std::numeric_limits<float>::max();
     bool drawing = patternLength <= 0.0f || (patternIndex & 1U) == 0U;
+    bool runOpen = false;
+    std::size_t visibleIndex = 0;
     auto previous = centerline.sample(0.0f);
     for (int i = 1; i <= samples; ++i) {
       const float t0 = static_cast<float>(i - 1) / samples;
@@ -187,6 +314,12 @@ ShapeId VectorAtlas::addStroke(const Path& path, const StrokeStyle& style) {
       const float half1 = style.width * 0.5f * std::max(0.0f, style.startTaper +
         (style.endTaper - style.startTaper) * t1);
       if (drawing && distance > 0.00001f && (half0 > 0.0f || half1 > 0.0f)) {
+        if (!runOpen) {
+          appendCap(outline, previous, half0,
+                    resolvedStartCap(style, visibleIndex, t0 <= 0.00001f,
+                                     patternLength > 0.0f), true);
+          runOpen = true;
+        }
         const float nx0 = -std::sin(static_cast<float>(previous.angle));
         const float ny0 = std::cos(static_cast<float>(previous.angle));
         const float nx1 = -std::sin(static_cast<float>(current.angle));
@@ -199,13 +332,25 @@ ShapeId VectorAtlas::addStroke(const Path& path, const StrokeStyle& style) {
       }
       if (patternLength > 0.0f) {
         remaining -= distance;
-        if (remaining <= 0.0f) {
-          patternIndex = (patternIndex + 1U) % style.dashLengths.size();
+        while (remaining <= 0.0f) {
+          const bool wasDrawing = drawing;
+          patternIndex = (patternIndex + 1U) % pattern.size();
           drawing = (patternIndex & 1U) == 0U;
-          remaining += std::max(style.dashLengths[patternIndex], 0.001f);
+          remaining += pattern[patternIndex];
+          if (wasDrawing && !drawing && runOpen) {
+            appendCap(outline, current, half1,
+                      resolvedEndCap(style, visibleIndex, i == samples, true), false);
+            runOpen = false;
+            ++visibleIndex;
+          }
         }
       }
       previous = current;
+    }
+    if (runOpen) {
+      const float endHalf = style.width * 0.5f * std::max(0.0f, style.endTaper);
+      appendCap(outline, previous, endHalf,
+                resolvedEndCap(style, visibleIndex, true, patternLength > 0.0f), false);
     }
     const ShapeId id = impl_->nextId++;
     slughorn::canvas::Canvas canvas(impl_->atlas);
@@ -213,56 +358,35 @@ ShapeId VectorAtlas::addStroke(const Path& path, const StrokeStyle& style) {
     return id;
   }
 
-  if (!style.dashLengths.empty()) {
-    float patternLength = 0.0f;
-    for (float value : style.dashLengths) patternLength += std::max(value, 0.001f);
-    if (patternLength > 0.0f) {
-      slughorn::canvas::Path dashed;
-      constexpr int samples = 1024;
-      float phase = std::fmod(style.dashOffset, patternLength);
-      if (phase < 0.0f) phase += patternLength;
-      std::size_t patternIndex = 0;
-      while (phase > style.dashLengths[patternIndex]) {
-        phase -= style.dashLengths[patternIndex];
-        patternIndex = (patternIndex + 1U) % style.dashLengths.size();
-      }
-      auto previous = centerline.sample(0.0f);
-      bool drawing = (patternIndex & 1U) == 0U;
-      float remaining = std::max(style.dashLengths[patternIndex] - phase, 0.001f);
-      for (int i = 1; i <= samples; ++i) {
-        auto current = centerline.sample(sv(static_cast<float>(i) / samples));
-        const float dx = static_cast<float>(current.x - previous.x);
-        const float dy = static_cast<float>(current.y - previous.y);
-        const float distance = std::sqrt(dx * dx + dy * dy);
-        if (drawing) {
-          dashed.moveTo(previous.x, previous.y);
-          dashed.lineTo(current.x, current.y);
-        }
-        remaining -= distance;
-        if (remaining <= 0.0f) {
-          patternIndex = (patternIndex + 1U) % style.dashLengths.size();
-          drawing = (patternIndex & 1U) == 0U;
-          remaining += std::max(style.dashLengths[patternIndex], 0.001f);
-        }
-        previous = current;
-      }
-      centerline = std::move(dashed);
-    }
-  }
-
   // Slughorn expands the centerline once during atlas construction. Runtime transforms therefore
   // update one compact quad instance per shape, while caps/joins remain exact vector curves.
-  if (!centerline.strokePath(sv(style.width), false, join(style.join), cap(style.cap), sv(4.0f))) return 0;
+  slughorn::canvas::Path outline;
+  if (style.dashLengths.empty()) {
+    if (!appendStrokedPath(outline, std::move(centerline), style.width, style.join,
+                           resolvedStartCap(style, 0, true, false),
+                           resolvedEndCap(style, 0, true, false))) return 0;
+  } else {
+    auto segments = splitDashes(centerline, style);
+    if (segments.empty()) return 0;
+    for (auto& segment : segments) {
+      if (!appendStrokedPath(outline, std::move(segment.path), style.width, style.join,
+                             resolvedStartCap(style, segment.visibleIndex,
+                                              segment.atPathStart, true),
+                             resolvedEndCap(style, segment.visibleIndex,
+                                            segment.atPathEnd, true))) return 0;
+    }
+  }
   const ShapeId id = impl_->nextId++;
   slughorn::canvas::Canvas canvas(impl_->atlas);
-  if (!canvas.defineShape(centerline, slughorn::Key(id))) return 0;
+  if (!canvas.defineShape(outline, slughorn::Key(id))) return 0;
   return id;
 }
 
 bool VectorAtlas::loadFont(const std::string& fontPath, const std::vector<std::uint32_t>& codepoints) {
   if (impl_->atlas.isBuilt()) throw std::logic_error("VectorAtlas is already built");
+  if (impl_->nextFontMask > std::numeric_limits<std::uint8_t>::max()) return false;
   slughorn::freetype::LoadConfig config;
-  config.mask = impl_->nextFontMask;
+  config.mask = static_cast<std::uint8_t>(impl_->nextFontMask);
   std::size_t count = 0;
   if (codepoints.empty()) {
     count = slughorn::freetype::loadAsciiFont(fontPath, impl_->atlas, &config) ? 95U : 0U;
@@ -277,7 +401,7 @@ bool VectorAtlas::loadFont(const std::string& fontPath, const std::vector<std::u
     }
     if (!config.familyName.empty()) impl_->fontMasks[config.familyName] = config.mask;
     impl_->fontMasks[std::filesystem::path(fontPath).stem().string()] = config.mask;
-    if (impl_->nextFontMask < 255) ++impl_->nextFontMask;
+    ++impl_->nextFontMask;
   }
   return count > 0;
 }
@@ -307,23 +431,36 @@ const slughorn::Atlas& VectorAtlas::native() const { return impl_->atlas; }
 
 std::vector<std::uint32_t> decodeUtf8(std::string_view text) {
   std::vector<std::uint32_t> result;
+  result.reserve(text.size());
   for (std::size_t i = 0; i < text.size();) {
     const auto first = static_cast<unsigned char>(text[i]);
-    std::uint32_t codepoint = 0xfffdU;
-    std::size_t length = 1;
-    if (first < 0x80U) codepoint = first;
-    else if ((first & 0xe0U) == 0xc0U && i + 1 < text.size()) {
-      codepoint = ((first & 0x1fU) << 6U) | (static_cast<unsigned char>(text[i + 1]) & 0x3fU); length = 2;
-    } else if ((first & 0xf0U) == 0xe0U && i + 2 < text.size()) {
-      codepoint = ((first & 0x0fU) << 12U) | ((static_cast<unsigned char>(text[i + 1]) & 0x3fU) << 6U)
-                | (static_cast<unsigned char>(text[i + 2]) & 0x3fU); length = 3;
-    } else if ((first & 0xf8U) == 0xf0U && i + 3 < text.size()) {
-      codepoint = ((first & 0x07U) << 18U) | ((static_cast<unsigned char>(text[i + 1]) & 0x3fU) << 12U)
-                | ((static_cast<unsigned char>(text[i + 2]) & 0x3fU) << 6U)
-                | (static_cast<unsigned char>(text[i + 3]) & 0x3fU); length = 4;
+    if (first < 0x80U) {
+      result.push_back(first);
+      ++i;
+      continue;
     }
-    result.push_back(codepoint <= 0x10ffffU ? codepoint : 0xfffdU);
-    i += length;
+
+    std::size_t length = 0;
+    std::uint32_t codepoint = 0;
+    std::uint32_t minimum = 0;
+    if ((first & 0xe0U) == 0xc0U) {
+      length = 2; codepoint = first & 0x1fU; minimum = 0x80U;
+    } else if ((first & 0xf0U) == 0xe0U) {
+      length = 3; codepoint = first & 0x0fU; minimum = 0x800U;
+    } else if ((first & 0xf8U) == 0xf0U) {
+      length = 4; codepoint = first & 0x07U; minimum = 0x10000U;
+    }
+
+    bool valid = length != 0 && i + length <= text.size();
+    for (std::size_t j = 1; valid && j < length; ++j) {
+      const auto continuation = static_cast<unsigned char>(text[i + j]);
+      valid = (continuation & 0xc0U) == 0x80U;
+      if (valid) codepoint = (codepoint << 6U) | (continuation & 0x3fU);
+    }
+    valid = valid && codepoint >= minimum && codepoint <= 0x10ffffU &&
+            !(codepoint >= 0xd800U && codepoint <= 0xdfffU);
+    result.push_back(valid ? codepoint : 0xfffdU);
+    i += valid ? length : 1U;
   }
   return result;
 }

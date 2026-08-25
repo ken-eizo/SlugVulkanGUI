@@ -31,8 +31,8 @@ struct TextCommand {
 struct RoundedRectCommand {
   Rect destination = {};
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
-  float radiusPx = 0.0f;
-  float continuousCornersPercent = 0.0f;
+  CornerRadii radiiPx = {};
+  CornerSmoothing continuousCorners = {};
   Paint paint = {};
 };
 
@@ -66,6 +66,10 @@ public:
   // Applies radius after destination sizing. radiusPx is absolute framebuffer pixels.
   void roundedRect(Rect destination, float radiusPx, Paint paint,
                    float continuousCornersPercent = 0.0f);
+  // Individual values are optional at the API level: use this overload only where a corner
+  // differs. Radii remain absolute framebuffer pixels after destination sizing.
+  void roundedRect(Rect destination, CornerRadii radiiPx, Paint paint,
+                   CornerSmoothing continuousCorners = {});
   void text(std::string utf8, Rect bounds, TextStyle style);
   // The referenced bytes must remain alive until VulkanRenderer::draw() returns.
   void textStatic(std::string_view utf8, Rect bounds, TextStyle style);

@@ -45,11 +45,15 @@ void InputState::beginFrame() {
 }
 
 void InputState::finishFrame(double nowSeconds) {
-  cursorDelta_ = cursor_ - previousCursor_;
+  refreshCursorDelta();
   if (scroll_.active && lastScrollTime_ >= 0.0 && nowSeconds - lastScrollTime_ > 0.12) {
     scroll_.active = false;
     scroll_.ended = true;
   }
+}
+
+void InputState::refreshCursorDelta() {
+  cursorDelta_ = cursor_ - previousCursor_;
 }
 
 void InputState::onCursor(double x, double y) {
@@ -85,7 +89,8 @@ void InputState::onScroll(double x, double y, double nowSeconds) {
 }
 
 void InputState::onCodepoint(std::uint32_t codepoint) {
-  if (codepoint <= 0x10ffffU) textInput_.push_back(static_cast<char32_t>(codepoint));
+  if (codepoint <= 0x10ffffU && !(codepoint >= 0xd800U && codepoint <= 0xdfffU))
+    textInput_.push_back(static_cast<char32_t>(codepoint));
 }
 
 } // namespace slugvk

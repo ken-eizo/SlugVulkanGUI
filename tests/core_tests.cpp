@@ -20,6 +20,15 @@ int main() try {
   auto decoded = decodeUtf8("A\xE3\x81\x82\xF0\x9F\x98\x80");
   require(decoded.size() == 3 && decoded[0] == 'A' && decoded[1] == 0x3042 && decoded[2] == 0x1f600,
           "UTF-8 decoding");
+  const auto overlong = decodeUtf8(std::string_view{"\xC0\xAF", 2});
+  require(overlong.size() == 2 && overlong[0] == 0xfffdU && overlong[1] == 0xfffdU,
+          "overlong UTF-8 rejection");
+  const auto surrogate = decodeUtf8(std::string_view{"\xED\xA0\x80", 3});
+  require(!surrogate.empty() && surrogate[0] == 0xfffdU,
+          "UTF-8 surrogate rejection");
+  const auto truncated = decodeUtf8(std::string_view{"\xE3\x81", 2});
+  require(truncated.size() == 2 && truncated[0] == 0xfffdU && truncated[1] == 0xfffdU,
+          "truncated UTF-8 rejection");
 
   const Paint sharedShader = Paint::shader(Color::fromRgb8(0x10e0b0), Color::fromRgb8(0x8040ff), 0.75f);
   require(sharedShader.kind == GradientKind::Shader && std::abs(sharedShader.shaderParameter - 0.75f) < 0.0001f,
@@ -49,8 +58,17 @@ int main() try {
   const auto& corner = std::get<RoundedRectCommand>(cornerList.commands().front());
   require(std::abs(corner.destination.width - 360.0f) < 0.0001f &&
           std::abs(corner.destination.height - 72.0f) < 0.0001f &&
-          std::abs(corner.radiusPx - 12.0f) < 0.0001f,
+          std::abs(corner.radiiPx.topLeft - 12.0f) < 0.0001f &&
+          std::abs(corner.radiiPx.bottomRight - 12.0f) < 0.0001f,
           "rounded rectangle keeps absolute pixel radius after sizing");
+  DrawList individualCornerList;
+  individualCornerList.roundedRect({0, 0, 200, 80}, {4, 12, 20, 28}, sharedShader,
+                                   {0, 25, 50, 100});
+  const auto& individualCorner = std::get<RoundedRectCommand>(individualCornerList.commands().front());
+  require(individualCorner.radiiPx.topLeft == 4 && individualCorner.radiiPx.bottomLeft == 28 &&
+          individualCorner.continuousCorners.topRightPercent == 25 &&
+          individualCorner.continuousCorners.bottomLeftPercent == 100,
+          "individual corner radius and smoothing overrides");
 
   VectorAtlas atlas;
   const ShapeId rectangle = atlas.addPath(Path{}.rect(0, 0, 100, 40));
@@ -59,6 +77,12 @@ int main() try {
   dashed.width = 3;
   dashed.cap = LineCap::Round;
   dashed.dashLengths = {8, 4};
+  dashed.startCap = LineCap::Square;
+  dashed.endCap = LineCap::Butt;
+  dashed.dashStartCap = LineCap::Butt;
+  dashed.dashEndCap = LineCap::Square;
+  dashed.dashCaps.resize(2);
+  dashed.dashCaps[1] = {LineCap::Round, LineCap::Butt};
   const ShapeId stroke = atlas.addStroke(Path{}.moveTo(0, 0).cubicTo(30, 50, 70, -50, 100, 0), dashed);
   StrokeStyle tapered;
   tapered.width = 6;

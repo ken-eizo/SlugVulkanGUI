@@ -1,0 +1,242 @@
+# ネイティブホストへの埋め込み設計
+
+## 目的と現在地
+
+After Effectsのdockable panelのように、外部applicationが所有するnative UI領域へSlugVulkanGUIを描画する
+ことは重要な利用例です。ただし、SlugVulkanGUI本体をAfter Effects、AEGP、Panelator固有仕様にはしません。
+
+現在実装済みの`Window`と`VulkanRenderer`は次を一体で所有します。
+
+- GLFW top-level windowとinput callbacks
+- Vulkan instance、physical/logical device、queue
+- GLFW経由の`VkSurfaceKHR`
+- swapchain、pipeline、atlas GPU resource、frame synchronization
+
+したがって現バージョンはスタンドアロンwindow向けで、host所有の`HWND`/`NSView`へそのまま接続する公開APIは
+まだありません。この文書の後半は、そのadapterを追加するときの**汎用契約と実装計画**です。コアのPath、
+atlas、paint、DrawList、UI modelは現在のまま再利用できます。
+
+## 分離するべき所有単位
+
+計画するbackend分割:
+
+```text
+Application / plugin adapter
+   | native view, size/scale, input, invalidate
+   v
+PlatformSurface contract
+   |
+   +--> RenderDevice  (VkInstance/device/queue, pipeline, atlas textures)
+   |
+   +--> RenderSurface (VkSurfaceKHR/swapchain, extent, per-image sync)
+   |
+   +--> UiContext     (panelごとのhover/focus/active/model)
+```
+
+### `RenderDevice`（計画）
+
+- Vulkan instance、physical device、logical device、queue
+- descriptor layout、pipeline cache、shader modules
+- atlas texturesとsampler
+- optional device-wide allocator
+
+同じGPU/atlasを使う複数panelで共有可能にします。共有しない単純構成も許可します。
+
+### `RenderSurface`（計画）
+
+- host native viewから作る`VkSurfaceKHR`
+- swapchain images/views/framebuffers
+- extent、surface format、present mode
+- acquire/present semaphore、fence、frame instance buffer
+- resize/out-of-date/minimize処理
+
+panelごとに独立させます。1 panelのresizeや破棄でdevice/atlas全体を再作成しないことが目的です。
+
+### Platform contract（計画）
+
+Vulkan instance作成前に必要extensionが分かり、作成後にsurfaceを生成できる必要があります。具体的な公開APIを
+固定する前の契約イメージは次の通りです。
+
+```cpp
+struct PlatformSurfaceSource {
+  std::span<const char* const> requiredInstanceExtensions() const;
+  VkSurfaceKHR createSurface(VkInstance instance) const;
+  slugvk::Vec2 framebufferSize() const;
+  float contentScale() const;
+  bool visible() const;
+  void requestRedraw() const;
+};
+```
+
+実APIでは`VkSurfaceKHR`の所有権、allocator、destroy順、extension stringの寿命、失敗型を明記します。Vulkan型を
+含むadapter headerと、Vulkanを知らないvector/UI core headerも分けます。
+
+## Windows adapter
+
+host SDKが所有するpanel/containerから子`HWND`を取得または作成し、次の一般的な経路を使います。
+
+1. `VK_KHR_surface`と`VK_KHR_win32_surface`をinstance extensionへ追加
+2. `VkWin32SurfaceCreateInfoKHR`へ対象`HWND`と`HINSTANCE`を渡してsurface作成
+3. `WM_SIZE`またはhost resize通知から最新client pixel sizeを保存
+4. resize通知では重い再構築を直接せず、render時にswapchain out-of-date/extentを処理
+5. `WM_DPICHANGED`等でlogical→framebuffer scaleを更新
+6. mouse/pointer/key/character eventをpanel-local framebuffer座標の`InputState` snapshotへ変換
+
+adapterが作成した子`HWND`を使う場合、そのlifetimeはhost containerより短くします。hostが提供した`HWND`を
+借用する場合はdestroyしません。どちらかを型または明示ownership flagで区別し、暗黙判定しません。
+
+`VkSurfaceKHR`とswapchainは`HWND`破棄前に停止・破棄します。現在のframeが実行中なら該当surface fenceを待ち、
+全panel共有deviceに対する毎回の`vkDeviceWaitIdle()`は避けます。device loss時はhost processを落とさず、panelを
+error stateへ移してhost側へ通知します。
+
+## macOS / MoltenVK adapter
+
+hostが所有する`NSView`内にplugin用child viewを置き、backing layerとして`CAMetalLayer`を用意します。
+
+1. `VK_KHR_surface`、`VK_EXT_metal_surface`、利用可能ならportability enumerationをinstanceへ追加
+2. `VkMetalSurfaceCreateInfoEXT::pLayer`へ`CAMetalLayer`を渡してsurface作成
+3. viewのbounds、`backingScaleFactor`/content scaleから`drawableSize`をpixelで更新
+4. view/layerの作成・付替え・破棄はmacOS main threadで行う
+5. resize/scale changeはsurface stateへ通知し、render境界でswapchain再作成
+6. MoltenVK deviceがadvertiseした場合だけ`VK_KHR_portability_subset`をenable
+
+host viewのlayer policyをpluginが無断で置き換えず、専用child view/layerを所有する構成を優先します。Retinaの
+point座標をそのまま描画座標にせず、常にdrawable pixelへ変換します。
+
+plugin bundleではVulkan loader、MoltenVK dylib、ICD discovery、`@rpath`、code signingを一組で設計します。
+host process全体の環境変数やloader search pathを書き換える方式は、他pluginとの衝突を起こすため避けます。
+
+## Input adapter
+
+現在`InputState`のframe更新methodは`Window`だけが呼べるため、外部host対応時は公開read APIを変えず、backend用の
+writerを分離します。
+
+```text
+Host event callbacks -> InputWriter/backend queue -> immutable frame snapshot -> UiContext
+```
+
+必要なevent:
+
+- pointer position、relative/raw delta、enter/leave
+- 左右middleと追加buttonのpress/release/down
+- wheel/trackpad delta、gesture start/active/end
+- physical key press/repeat/release
+- Unicode committed text
+- focus gained/lost、capture lost
+
+capture lost時はdown/activeを必ずcancelし、panel外でbuttonが離されてもstuck dragを残しません。IME composition、
+selection、candidate window位置は簡易`textField`ではなく、host/native text serviceと接続する上位editor層の責務です。
+
+低遅延dragでは、event queueを全部処理した後に最新pointer positionを一度sampleし、UI declaration直前にsnapshotへ
+反映します。古いmove eventを順番に描画する必要はなく、press/release順だけは失いません。
+
+## Host event loopと再描画
+
+pluginはhostのevent loopを所有しません。adapterは次の2 modeを使い分けます。
+
+- event-driven: state変更、resize、露出、animation tick時に`requestRedraw()`
+- active interaction: drag、scroll、zoom、animation中だけdisplay refreshに合わせて連続描画
+
+静止panelで240回/秒busy loopする必要はありません。drag中はhostが許すdisplay-linked callbackまたは短いrender tickを
+使い、入力をlate sampleしてからsubmitします。hostのmain threadを占有する独自message loopやsleep loopは作りません。
+
+Windowsのmodal resizeやmacOS live resize中もhostが許可するdraw callbackからdeclarative sceneを再発行します。
+swapchain再作成と同時submitを直列化し、0×0/hidden panelではacquireせずinvalidated stateだけ保持します。
+
+## Threading
+
+現在の`Window`/`VulkanRenderer`は単一UI/render thread契約です。埋め込みbackendの第一段階も同じ契約にして、
+正しさとhost SDK制約を優先します。
+
+将来render threadを分ける場合:
+
+1. main threadでhost eventとhost SDK APIを処理
+2. modelのimmutable snapshotまたはdouble-buffered DrawListをrender threadへ渡す
+3. render threadはVulkan resource/submitだけを処理
+4. host viewの作成破棄やhost SDK callbackをrender threadから呼ばない
+5. panel close時は新規frameを止め、surface fence完了後にresourceを破棄
+
+`UiContext`やmodelをmutexなしで両threadから読む構成は禁止します。高頻度pointerはSPSC queueまたはatomic latest
+position、edge eventは順序付きqueueなど、意味の異なる入力を分離します。
+
+## 複数panelとresource共有
+
+1つのhost processで複数panel instanceが存在し得ます。理想構成は次の通りです。
+
+- process/plugin module内にGPUごとの`RenderDevice`
+- atlas内容ごとに共有`VectorResources`
+- panelごとに`RenderSurface`、dynamic instance ring、`UiContext`、model
+- retained documentはdevice resourceとして参照countまたはowner IDで管理
+
+最初のadapterは安全のためpanelごとにdeviceを作る実装でも構いませんが、公開APIにその前提を埋め込みません。
+device共有へ移行できるownership境界を先に保ちます。
+
+## ABIとpackage
+
+SlugVulkanGUIをplugin内部へstatic linkする場合、pluginとlibraryを同じcompiler/runtime設定でbuildするのが最も単純です。
+host/plugin ABI境界へ`std::string`、`std::vector`、例外、allocator ownershipを直接渡さないでください。
+
+将来binary renderer serviceを分離する場合は、versioned C ABI handle + POD descriptorを検討します。最低限:
+
+- API/structure versionとsize
+- caller/calleeのallocation/free対
+- exceptionを境界外へ出さないerror code
+- device/surface/retained resourceの明示destroy
+- thread affinityとcallback lifetime
+
+Adobe等のhost SDKに依存するcode、SDK headers、licensing/build設定は`adapters/<host-name>`または別repositoryへ置き、
+`slugvk` targetのpublic dependencyにしません。
+
+## After Effects型panelへの適用
+
+AEGP/Panelator型の利用では、host SDK側がdockable/resizable panelとnative containerを管理し、SlugVulkanGUI adapterが
+そのcontainer内の子viewとVulkan surfaceだけを管理する構成にします。
+
+```text
+After Effects SDK / panel framework
+       | lifecycle, dock, resize, focus, host commands
+       v
+AE adapter（別層）
+       | generic PlatformSurface + InputWriter + redraw callback
+       v
+SlugVulkanGUI backend
+       | DrawList / UiContext / Slug atlas
+       v
+plugin application model
+```
+
+host project data取得、AEGP suite呼出し、undo、render queue、selection等はadapter/application側です。SlugVulkanGUIは
+それらを知りません。これにより同じrenderer/UIを他のDCC、editor、standalone toolへ転用できます。
+
+host SDKのversionごとにnative handle取得方法やthread制約が異なる可能性があるため、adapter実装時は対象SDKの
+公式仕様を固定し、runtime capability checkを入れます。「Panelatorのような見た目」をコアのwindow ownershipへ
+混ぜないことが重要です。
+
+## 実装ロードマップ
+
+### Phase 1: 所有権分離
+
+- `VulkanRenderer`内部からdevice-levelとsurface-level resourceを抽出
+- 既存`VulkanRenderer(Window&, ...)`は互換facadeとして維持
+- surface factory、extent、visibilityのbackend contractとlifetime testを追加
+
+### Phase 2: 外部surfaceとinput
+
+- Win32 `HWND` adapterとhidden child-window smoke test
+- macOS `NSView/CAMetalLayer` adapterとMoltenVK smoke test
+- backend専用`InputWriter`、focus/capture loss、HiDPI test
+
+### Phase 3: 複数surface
+
+- device/atlas共有、per-surface swapchain/sync
+- panel単位destroy、resize storm、minimize、device loss test
+- surfaceごとのpresent schedulingとstats
+
+### Phase 4: host adapter
+
+- 対象host SDKを別targetで接続
+- dock/undock/live resize/focus/close/reloadを実機検証
+- plugin-relative Vulkan/MoltenVK package、codesign、crash-safe teardown
+- 240 Hz環境でinput-to-photonとframe pacingを測定
+
+この順序なら、スタンドアロン利用を壊さず、外部hostを特別扱いせず、最終的なAE panel開発を進められます。

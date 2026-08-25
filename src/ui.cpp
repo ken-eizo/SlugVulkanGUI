@@ -1,4 +1,5 @@
 #include "slugvk/ui.hpp"
+#include "slugvk/vector_atlas.hpp"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -34,9 +35,7 @@ WidgetId childId(WidgetId parent, std::uint64_t child) {
 }
 }
 
-UiContext::UiContext(UiSkin skin) : skin_(std::move(skin)) {
-  skin_.text.paint = Paint::solid(Color::fromRgb8(0xeaf0ff));
-}
+UiContext::UiContext(UiSkin skin) : skin_(std::move(skin)) {}
 
 void UiContext::beginFrame(const InputState& inputState, DrawList& drawList) {
   input_ = &inputState;
@@ -267,7 +266,11 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
   if (focused_ == id && input_) {
     for (char32_t cp : input_->textInput()) { value += utf8(cp); changed = true; }
     if (input_->key(GLFW_KEY_BACKSPACE).pressed && !value.empty()) {
-      do { value.pop_back(); } while (!value.empty() && (static_cast<unsigned char>(value.back()) & 0xc0U) == 0x80U);
+      std::size_t eraseFrom = value.size() - 1U;
+      while (eraseFrom > 0U &&
+             (static_cast<unsigned char>(value[eraseFrom]) & 0xc0U) == 0x80U)
+        --eraseFrom;
+      value.erase(eraseFrom);
       changed = true;
     }
     if (input_->key(GLFW_KEY_ENTER).pressed || input_->key(GLFW_KEY_ESCAPE).pressed) focused_ = 0;
@@ -277,7 +280,8 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
     label(placeholder, bounds, HorizontalAlign::Left, &faded);
   } else label(value, bounds);
   if (focused_ == id && (frame_ / 30U) % 2U == 0U) {
-    const float approximateX = bounds.x + 9.0f + static_cast<float>(value.size()) * skin_.text.size * 0.52f;
+    const float approximateX = bounds.x + 9.0f +
+      static_cast<float>(decodeUtf8(value).size()) * skin_.text.size * 0.52f;
     draw_->shape(skin_.rectangle, {std::min(approximateX, bounds.x + bounds.width - 5.0f), bounds.y + 6.0f,
                                    1.5f, bounds.height - 12.0f}, skin_.accent);
   }
@@ -338,7 +342,7 @@ bool UiContext::treeNode(WidgetId id, TreeNode& node, float x, float& y, float w
   Rect row{x, y, width, rowHeight};
   y += rowHeight;
   if (row.y + row.height < clip.y || row.y > clip.y + clip.height) return false;
-  const WidgetId nodeId = childId(id, hashId(node.label));
+  const WidgetId nodeId = id;
   const auto state = interaction(nodeId, row);
   const float indent = 16.0f * static_cast<float>(depth);
   bool changed = false;
@@ -353,7 +357,9 @@ bool UiContext::treeNode(WidgetId id, TreeNode& node, float x, float& y, float w
     label(node.expanded ? "v" : ">", {row.x + indent, row.y, 18.0f, row.height}, HorizontalAlign::Center);
   label(node.label, {row.x + indent + 18.0f, row.y, row.width - indent - 18.0f, row.height});
   if (node.expanded) {
-    for (auto& child : node.children) changed = treeNode(nodeId, child, x, y, width, rowHeight, depth + 1, clip) || changed;
+    for (std::size_t i = 0; i < node.children.size(); ++i)
+      changed = treeNode(childId(nodeId, static_cast<WidgetId>(i + 1U)), node.children[i],
+                         x, y, width, rowHeight, depth + 1, clip) || changed;
   }
   return changed;
 }
@@ -365,7 +371,9 @@ bool UiContext::treeView(WidgetId id, Rect bounds, std::vector<TreeNode>& roots,
   draw_->setClip(bounds);
   float y = bounds.y + 3.0f;
   bool changed = false;
-  for (auto& root : roots) changed = treeNode(id, root, bounds.x + 3.0f, y, bounds.width - 6.0f, rowHeight, 0, bounds) || changed;
+  for (std::size_t i = 0; i < roots.size(); ++i)
+    changed = treeNode(childId(id, static_cast<WidgetId>(i + 1U)), roots[i],
+                       bounds.x + 3.0f, y, bounds.width - 6.0f, rowHeight, 0, bounds) || changed;
   draw_->setClip(old);
   return changed;
 }

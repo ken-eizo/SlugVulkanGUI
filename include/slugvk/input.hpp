@@ -42,6 +42,7 @@ private:
   friend class Window;
   void beginFrame();
   void finishFrame(double nowSeconds);
+  void refreshCursorDelta();
   void onCursor(double x, double y);
   void onMouseButton(int button, int action);
   void onKey(int key, int action);

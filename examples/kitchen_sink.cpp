@@ -19,6 +19,7 @@ struct Shapes {
   ShapeId polygon = 0;
   ShapeId star = 0;
   ShapeId solidStroke = 0;
+  ShapeId mixedDashStroke = 0;
   ShapeId taperStroke = 0;
 };
 
@@ -42,6 +43,14 @@ Shapes buildAtlas(VectorAtlas& atlas) {
   solid.cap = LineCap::Round;
   solid.join = LineJoin::Round;
   shapes.solidStroke = atlas.addStroke(wave, solid);
+  StrokeStyle mixedDash = solid;
+  mixedDash.dashLengths = {18.0f, 10.0f};
+  mixedDash.cap = LineCap::Butt;
+  mixedDash.dashEndCap = LineCap::Square;
+  mixedDash.dashCaps.resize(3);
+  mixedDash.dashCaps[1] = {LineCap::Round, LineCap::Round};
+  mixedDash.dashCaps[2] = {LineCap::Square, LineCap::Butt};
+  shapes.mixedDashStroke = atlas.addStroke(Path{}.moveTo(0, 0).lineTo(200, 0), mixedDash);
   StrokeStyle tapered = solid;
   tapered.startTaper = 0.05f;
   tapered.endTaper = 1.35f;
@@ -61,8 +70,18 @@ TextStyle textStyle(float size = 14.0f) {
   return style;
 }
 
+void horizontalCap(DrawList& draw, float x, Rect bounds, LineCap cap, bool start,
+                   const Paint& paint) {
+  const float half = bounds.height * 0.5f;
+  if (cap == LineCap::Round) {
+    draw.roundedRect({x - half, bounds.y, bounds.height, bounds.height}, half, paint);
+  } else if (cap == LineCap::Square) {
+    draw.roundedRect({start ? x - half : x, bounds.y, half, bounds.height}, 0.0f, paint);
+  }
+}
+
 void dynamicDashedLine(DrawList& draw, Rect bounds, float dashLength, float gapLength,
-                       float offset, const Paint& paint) {
+                       float offset, LineCap startCap, LineCap endCap, const Paint& paint) {
   dashLength = std::max(dashLength, 0.5f);
   gapLength = std::max(gapLength, 0.5f);
   const float period = dashLength + gapLength;
@@ -72,9 +91,25 @@ void dynamicDashedLine(DrawList& draw, Rect bounds, float dashLength, float gapL
   for (float x = bounds.x - phase; x < right; x += period) {
     const float start = std::max(x, bounds.x);
     const float end = std::min(x + dashLength, right);
-    if (end > start)
-      draw.roundedRect({start, bounds.y, end - start, bounds.height}, bounds.height * 0.5f, paint);
+    if (end > start) {
+      draw.roundedRect({start, bounds.y, end - start, bounds.height}, 0.0f, paint);
+      horizontalCap(draw, start, bounds, startCap, true, paint);
+      horizontalCap(draw, end, bounds, endCap, false, paint);
+    }
   }
+}
+
+const char* capName(LineCap cap) {
+  switch (cap) {
+    case LineCap::Round: return "Round";
+    case LineCap::Square: return "Square";
+    default: return "Butt";
+  }
+}
+
+LineCap nextCap(LineCap cap) {
+  return cap == LineCap::Butt ? LineCap::Round
+       : cap == LineCap::Round ? LineCap::Square : LineCap::Butt;
 }
 
 enum class DemoPage { Components, TextZoom };
@@ -115,15 +150,27 @@ constexpr bool validationEnabled = true;
 } // namespace
 
 int main(int argc, char** argv) try {
-  const bool smokeTest = argc > 1 && std::string_view(argv[1]) == "--smoke";
+  const auto hasArgument = [argc, argv](std::string_view value) {
+    for (int i = 1; i < argc; ++i) if (std::string_view(argv[i]) == value) return true;
+    return false;
+  };
+  const bool smokeTest = hasArgument("--smoke");
+  const bool lowestLatency = !hasArgument("--mailbox");
   VectorAtlas atlas;
   const Shapes shapes = buildAtlas(atlas);
 
   Window window({1500, 950, "SlugVulkan - Vector Renderer + Declarative GUI", true, !smokeTest});
+  if (smokeTest) {
+    // Destroy one of two live wrappers before creating the renderer. The surviving Window must
+    // keep GLFW initialized; this guards the process-wide lifetime reference contract.
+    Window lifecycleProbe({64, 64, "SlugVulkan GLFW lifetime probe", false, false});
+  }
   VulkanRenderer renderer(window, atlas, {
     .clearColor = Color::fromRgb8(0x090d19),
     .validation = smokeTest && validationEnabled,
-    .vsync = false
+    .vsync = false,
+    .allowTearing = lowestLatency,
+    .gpuTimingInterval = 16
   });
   std::cout << "SlugVulkan device: " << renderer.deviceName() << '\n';
   std::cout << "Present mode: " << renderer.presentModeName() << " | frames in flight: 1\n";
@@ -154,6 +201,8 @@ int main(int argc, char** argv) try {
   float dashLength = 13.0f;
   float dashGap = 8.0f;
   float dashOffset = 4.0f;
+  LineCap dashStartCap = LineCap::Butt;
+  LineCap dashEndCap = LineCap::Butt;
   ListBoxModel list{{"Alpha", "Beta", "Gamma", "Delta"}, 1};
   bool checked = true;
   ComboBoxModel combo{{"Vulkan", "Metal via MoltenVK", "DirectX (future)"}, 0, false};
@@ -208,6 +257,8 @@ int main(int argc, char** argv) try {
     draw.text("Exact Slug curves on Vulkan | retained atlas + declarative dynamic batch | Windows / MoltenVK",
               {38, 58, framebuffer.x - 80, 24}, subtitle);
 
+    // Sample after the static header is declared, immediately before latency-critical interactions.
+    window.resampleCursor();
     ui.beginFrame(window.input(), draw);
     const float navigationX = std::max(700.0f, framebuffer.x - 426.0f);
     if (ui.button(hashId("page-components"),
@@ -224,7 +275,8 @@ int main(int argc, char** argv) try {
     // Paint and vector geometry gallery.
     draw.roundedRect({18, 105, 420, 228}, 14.0f, skin.panel, 100.0f);
     draw.text("GPU VECTOR PAINTS", {34, 116, 390, 24}, textStyle(13));
-    draw.shape(shapes.rectangle, {35, 149, 180, 37}, Paint::solid(Color::fromRgb8(0x4f67ff), 0.84f));
+    draw.roundedRect({35, 149, 180, 37}, {3.0f, 8.0f, 14.0f, 18.0f},
+      Paint::solid(Color::fromRgb8(0x4f67ff), 0.84f), {0.0f, 35.0f, 70.0f, 100.0f});
     ui.slider(hashId("continuous-corners"), "Corner %", {235, 184, 180, 20},
               continuousCorners, 0.0f, 100.0f);
     draw.roundedRect({235, 149, 180, 37}, 10.0f,
@@ -243,13 +295,21 @@ int main(int argc, char** argv) try {
               {165, 312, 120, 18}, dashGap, 1.0f, 24.0f);
     ui.slider(hashId("dash-offset"), "Off " + std::to_string(static_cast<int>(dashOffset + 0.5f)),
               {295, 312, 120, 18}, dashOffset, 0.0f, 64.0f);
-    dynamicDashedLine(draw, {310, 247, 105, 7}, dashLength, dashGap, dashOffset,
+    dynamicDashedLine(draw, {310, 243, 105, 7}, dashLength, dashGap, dashOffset,
+      dashStartCap, dashEndCap,
       Paint::gradient(GradientKind::Linear, Color::fromRgb8(0xff5e9c), Color::fromRgb8(0xffd66b)));
+    draw.stroke(shapes.mixedDashStroke, {310, 256, 105, 10}, shaderPaint);
     draw.stroke(shapes.taperStroke, {310, 276, 105, 25}, Paint::solid(Color::fromRgb8(0x8cff81)));
-    draw.text("solid / opacity", {42, 155, 165, 20}, textStyle(12));
+    if (ui.button(hashId("dash-start-cap"), std::string("Start: ") + capName(dashStartCap),
+                  {35, 282, 120, 24}))
+      dashStartCap = nextCap(dashStartCap);
+    if (ui.button(hashId("dash-end-cap"), std::string("End: ") + capName(dashEndCap),
+                  {165, 282, 120, 24}))
+      dashEndCap = nextCap(dashEndCap);
+    draw.text("per-corner / opacity", {42, 155, 165, 20}, textStyle(12));
     draw.text("Continuous Corners " + std::to_string(static_cast<int>(continuousCorners + 0.5f)) + "%",
               {242, 155, 165, 20}, textStyle(12));
-    draw.text("DASH: length / gap / offset", {220, 294, 190, 18}, textStyle(11));
+    draw.text("mixed per-dash overrides", {292, 294, 125, 18}, textStyle(10));
 
     // Typography gallery.
     draw.roundedRect({18, 348, 420, 238}, 14.0f, skin.panel, 100.0f);
@@ -384,7 +444,8 @@ int main(int argc, char** argv) try {
     footer << std::fixed << std::setprecision(1)
            << 1000.0f / std::max(smoothedFrameMs, 0.001f) << " fps | "
            << previousStats.cpuBuildMilliseconds << " ms build + "
-           << previousStats.cpuUploadMilliseconds << " ms upload / "
+           << previousStats.cpuUploadMilliseconds << " ms upload + "
+           << previousStats.cpuSubmitMilliseconds << " ms submit / "
            << previousStats.gpuMilliseconds << " ms GPU | "
            << previousStats.uploadedBytes / 1024.0f << " KiB upload | "
            << previousStats.drawCalls << " draw | " << previousStats.quads << " quads ("
@@ -430,6 +491,7 @@ int main(int argc, char** argv) try {
     std::cout << "Smoke batch: " << finalStats.drawCalls << " draw, " << finalStats.quads << " quads, "
               << std::fixed << std::setprecision(3) << finalStats.cpuBuildMilliseconds
               << " ms build, " << finalStats.cpuUploadMilliseconds << " ms upload, "
+              << finalStats.cpuSubmitMilliseconds << " ms submit, "
               << finalStats.gpuMilliseconds << " ms GPU, "
               << finalStats.uploadedBytes / 1024.0f << " KiB upload, "
               << liveRefreshCount << " live resize redraws\n";

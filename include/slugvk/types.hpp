@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -103,6 +104,11 @@ struct Paint {
 enum class LineCap : std::uint8_t { Butt, Round, Square };
 enum class LineJoin : std::uint8_t { Miter, Round, Bevel };
 
+struct DashCapOverride {
+  std::optional<LineCap> start = {};
+  std::optional<LineCap> end = {};
+};
+
 struct StrokeStyle {
   Paint paint = Paint::solid(Color::fromRgb8(0xffffff));
   float width = 1.0f;
@@ -112,6 +118,31 @@ struct StrokeStyle {
   LineJoin join = LineJoin::Miter;
   std::vector<float> dashLengths = {};
   float dashOffset = 0.0f;
+  // Empty overrides preserve the compact legacy behavior: cap applies everywhere.
+  std::optional<LineCap> startCap = {};
+  std::optional<LineCap> endCap = {};
+  std::optional<LineCap> dashStartCap = {};
+  std::optional<LineCap> dashEndCap = {};
+  // Optional per-visible-dash overrides, indexed from the path start after dashOffset.
+  std::vector<DashCapOverride> dashCaps = {};
+};
+
+struct CornerRadii {
+  float topLeft = 0.0f;
+  float topRight = 0.0f;
+  float bottomRight = 0.0f;
+  float bottomLeft = 0.0f;
+
+  static constexpr CornerRadii all(float radius) { return {radius, radius, radius, radius}; }
+};
+
+struct CornerSmoothing {
+  float topLeftPercent = 0.0f;
+  float topRightPercent = 0.0f;
+  float bottomRightPercent = 0.0f;
+  float bottomLeftPercent = 0.0f;
+
+  static constexpr CornerSmoothing all(float percent) { return {percent, percent, percent, percent}; }
 };
 
 enum class HorizontalAlign : std::uint8_t { Left, Center, Right, Justify };

@@ -16,6 +16,9 @@ struct WindowConfig {
   std::string title = "SlugVulkan";
   bool resizable = true;
   bool visible = true;
+  // Set false only when the parent application initializes GLFW before this Window and
+  // terminates it after every SlugVulkan Window has been destroyed.
+  bool manageGlfwLifetime = true;
 };
 
 class Window {
@@ -31,6 +34,9 @@ public:
   // Invoked from the platform refresh event, including the Windows modal resize loop.
   void setRefreshCallback(std::function<void()> callback);
   void pollEvents();
+  // Refreshes only the absolute pointer position. Call immediately before building latency-critical
+  // drag UI when useful; button/key edges still come from pollEvents().
+  void resampleCursor();
   void waitForVisibleFramebuffer();
   void setRawMouseMotion(bool enabled);
   [[nodiscard]] bool rawMouseMotionSupported() const;
@@ -42,7 +48,11 @@ public:
 
 private:
   void invokeRefreshCallback() noexcept;
+  void updateFramebufferScale();
+  [[nodiscard]] Vec2 cursorInFramebuffer(double x, double y) const;
   GLFWwindow* window_ = nullptr;
+  bool ownsGlfwReference_ = false;
+  Vec2 framebufferScale_ = {1.0f, 1.0f};
   InputState input_{};
   std::function<void()> refreshCallback_{};
   std::exception_ptr callbackException_{};

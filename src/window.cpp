@@ -10,39 +10,54 @@
 namespace slugvk {
 
 namespace {
+int glfwReferenceCount = 0;
+
 Window* windowFrom(GLFWwindow* window) {
   return static_cast<Window*>(glfwGetWindowUserPointer(window));
 }
 
-Vec2 cursorInFramebuffer(GLFWwindow* window, double x, double y) {
-  int windowWidth = 0;
-  int windowHeight = 0;
-  int framebufferWidth = 0;
-  int framebufferHeight = 0;
-  glfwGetWindowSize(window, &windowWidth, &windowHeight);
-  glfwGetFramebufferSize(window, &framebufferWidth, &framebufferHeight);
-  const double scaleX = windowWidth > 0 ? static_cast<double>(framebufferWidth) / windowWidth : 1.0;
-  const double scaleY = windowHeight > 0 ? static_cast<double>(framebufferHeight) / windowHeight : 1.0;
-  return {static_cast<float>(x * scaleX), static_cast<float>(y * scaleY)};
+std::runtime_error glfwFailure(const char* operation) {
+  const char* description = nullptr;
+  const int code = glfwGetError(&description);
+  std::string message = operation;
+  message += " failed";
+  if (description) message += ": " + std::string(description);
+  if (code != GLFW_NO_ERROR) message += " (GLFW " + std::to_string(code) + ")";
+  return std::runtime_error(message);
 }
+
+void retainGlfw() {
+  if (glfwReferenceCount == 0 && glfwInit() != GLFW_TRUE) throw glfwFailure("glfwInit");
+  ++glfwReferenceCount;
+}
+
+void releaseGlfw() {
+  if (glfwReferenceCount > 0 && --glfwReferenceCount == 0) glfwTerminate();
+}
+
 }
 
 Window::Window(const WindowConfig& config) {
-  glfwSetErrorCallback([](int, const char*) {});
-  if (glfwInit() != GLFW_TRUE) throw std::runtime_error("glfwInit failed");
+  if (config.manageGlfwLifetime) {
+    retainGlfw();
+    ownsGlfwReference_ = true;
+  }
 
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
   glfwWindowHint(GLFW_RESIZABLE, config.resizable ? GLFW_TRUE : GLFW_FALSE);
   glfwWindowHint(GLFW_VISIBLE, config.visible ? GLFW_TRUE : GLFW_FALSE);
   window_ = glfwCreateWindow(config.width, config.height, config.title.c_str(), nullptr, nullptr);
   if (!window_) {
-    glfwTerminate();
-    throw std::runtime_error("glfwCreateWindow failed");
+    auto failure = glfwFailure("glfwCreateWindow");
+    if (ownsGlfwReference_) releaseGlfw();
+    ownsGlfwReference_ = false;
+    throw failure;
   }
 
   glfwSetWindowUserPointer(window_, this);
+  updateFramebufferScale();
   glfwSetCursorPosCallback(window_, [](GLFWwindow* w, double x, double y) {
-    const Vec2 position = cursorInFramebuffer(w, x, y);
+    const Vec2 position = windowFrom(w)->cursorInFramebuffer(x, y);
     windowFrom(w)->input_.onCursor(position.x, position.y);
   });
   glfwSetMouseButtonCallback(window_, [](GLFWwindow* w, int button, int action, int) {
@@ -61,19 +76,26 @@ Window::Window(const WindowConfig& config) {
     windowFrom(w)->invokeRefreshCallback();
   });
   glfwSetFramebufferSizeCallback(window_, [](GLFWwindow* w, int width, int height) {
+    windowFrom(w)->updateFramebufferScale();
     if (width > 0 && height > 0) windowFrom(w)->invokeRefreshCallback();
+  });
+  glfwSetWindowSizeCallback(window_, [](GLFWwindow* w, int, int) {
+    windowFrom(w)->updateFramebufferScale();
+  });
+  glfwSetWindowContentScaleCallback(window_, [](GLFWwindow* w, float, float) {
+    windowFrom(w)->updateFramebufferScale();
   });
 
   double x = 0.0;
   double y = 0.0;
   glfwGetCursorPos(window_, &x, &y);
-  const Vec2 position = cursorInFramebuffer(window_, x, y);
+  const Vec2 position = cursorInFramebuffer(x, y);
   input_.onCursor(position.x, position.y);
 }
 
 Window::~Window() {
   if (window_) glfwDestroyWindow(window_);
-  glfwTerminate();
+  if (ownsGlfwReference_) releaseGlfw();
 }
 
 bool Window::shouldClose() const { return glfwWindowShouldClose(window_) == GLFW_TRUE; }
@@ -94,6 +116,22 @@ void Window::invokeRefreshCallback() noexcept {
   }
 }
 
+void Window::updateFramebufferScale() {
+  int windowWidth = 0;
+  int windowHeight = 0;
+  int framebufferWidth = 0;
+  int framebufferHeight = 0;
+  glfwGetWindowSize(window_, &windowWidth, &windowHeight);
+  glfwGetFramebufferSize(window_, &framebufferWidth, &framebufferHeight);
+  framebufferScale_.x = windowWidth > 0 ? static_cast<float>(framebufferWidth) / windowWidth : 1.0f;
+  framebufferScale_.y = windowHeight > 0 ? static_cast<float>(framebufferHeight) / windowHeight : 1.0f;
+}
+
+Vec2 Window::cursorInFramebuffer(double x, double y) const {
+  return {static_cast<float>(x) * framebufferScale_.x,
+          static_cast<float>(y) * framebufferScale_.y};
+}
+
 void Window::pollEvents() {
   input_.beginFrame();
   glfwPollEvents();
@@ -103,12 +141,17 @@ void Window::pollEvents() {
   }
   // Sample once more after dispatching callbacks so high-rate pointer motion cannot leave the
   // declarative frame on an older coalesced callback position.
+  resampleCursor();
+  input_.finishFrame(glfwGetTime());
+}
+
+void Window::resampleCursor() {
   double cursorX = 0.0;
   double cursorY = 0.0;
   glfwGetCursorPos(window_, &cursorX, &cursorY);
-  const Vec2 position = cursorInFramebuffer(window_, cursorX, cursorY);
+  const Vec2 position = cursorInFramebuffer(cursorX, cursorY);
   input_.onCursor(position.x, position.y);
-  input_.finishFrame(glfwGetTime());
+  input_.refreshCursorDelta();
 }
 
 void Window::waitForVisibleFramebuffer() {

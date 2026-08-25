@@ -20,6 +20,8 @@ struct RendererConfig {
   bool allowTearing = false;
   // Number of quad instances preallocated per frame; buffers grow geometrically when needed.
   std::size_t initialVertexCapacity = 1U << 12U;
+  // GPU timestamps add query commands. Zero disables them; otherwise sample every Nth submission.
+  std::uint32_t gpuTimingInterval = 0;
 };
 
 struct RendererStats {
@@ -30,6 +32,7 @@ struct RendererStats {
   float cpuBuildMilliseconds = 0.0f;
   float cpuUploadMilliseconds = 0.0f;
   float gpuMilliseconds = 0.0f;
+  float cpuSubmitMilliseconds = 0.0f;
 };
 
 class VulkanRenderer {

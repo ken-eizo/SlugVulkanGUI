@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -31,6 +32,13 @@ namespace {
 constexpr std::size_t framesInFlight = 1;
 constexpr const char* portabilitySubsetExtension = "VK_KHR_portability_subset";
 constexpr std::uint32_t analyticRoundedRectShape = std::numeric_limits<std::uint32_t>::max();
+
+std::uint32_t packFixed16(float first, float second, float scale, float maximum) {
+  const auto quantize = [scale, maximum](float value) {
+    return static_cast<std::uint32_t>(std::lround(std::clamp(value, 0.0f, maximum) * scale));
+  };
+  return quantize(first) | (quantize(second) << 16U);
+}
 
 void check(VkResult result, const char* operation) {
   if (result != VK_SUCCESS) throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(result));
@@ -184,7 +192,6 @@ struct VulkanRenderer::Impl {
   std::vector<VkImageView> swapchainViews;
   std::vector<VkFramebuffer> framebuffers;
   std::vector<VkSemaphore> renderFinished;
-  std::vector<VkFence> imageFences;
 
   VkRenderPass renderPass = VK_NULL_HANDLE;
   VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
@@ -203,6 +210,7 @@ struct VulkanRenderer::Impl {
     VkFence fence = VK_NULL_HANDLE;
     VkQueryPool timestamps = VK_NULL_HANDLE;
     bool timestampsWritten = false;
+    bool writeTimestamps = false;
     Buffer instances{};
   };
   std::array<Frame, framesInFlight> frames{};
@@ -215,6 +223,7 @@ struct VulkanRenderer::Impl {
   };
   std::vector<RetainedText> retainedTexts{};
   std::uint32_t timestampValidBits = 0;
+  std::uint64_t submittedFrameCount = 0;
   bool framePrepared = false;
   std::uint32_t preparedImageIndex = 0;
   VkResult preparedAcquireResult = VK_SUCCESS;
@@ -707,7 +716,11 @@ struct VulkanRenderer::Impl {
     const auto support = querySwapchain(physicalDevice, surface);
     const auto chosenFormat = chooseFormat(support.formats);
     extent = chooseExtent(support.capabilities);
-    std::uint32_t imageCount = support.capabilities.minImageCount + 1;
+    swapchainPresentMode = choosePresentMode(support.presentModes);
+    // Absolute-latency IMMEDIATE uses the smallest legal swapchain. MAILBOX keeps one additional
+    // replacement image so the presentation engine can always retain only the newest frame.
+    std::uint32_t imageCount = support.capabilities.minImageCount +
+      (swapchainPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ? 1U : 0U);
     if (support.capabilities.maxImageCount && imageCount > support.capabilities.maxImageCount)
       imageCount = support.capabilities.maxImageCount;
     VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -726,7 +739,6 @@ struct VulkanRenderer::Impl {
     } else info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = support.capabilities.currentTransform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    swapchainPresentMode = choosePresentMode(support.presentModes);
     info.presentMode = swapchainPresentMode;
     info.clipped = VK_TRUE;
     info.oldSwapchain = oldSwapchain;
@@ -772,7 +784,6 @@ struct VulkanRenderer::Impl {
       check(vkCreateFramebuffer(device, &framebuffer, nullptr, &framebuffers[i]), "vkCreateFramebuffer");
     }
     renderFinished.resize(imageCount);
-    imageFences.assign(imageCount, VK_NULL_HANDLE);
     VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (auto& value : renderFinished)
       check(vkCreateSemaphore(device, &semaphore, nullptr, &value), "vkCreateSemaphore(present)");
@@ -781,7 +792,6 @@ struct VulkanRenderer::Impl {
   void destroySwapchainImages(bool destroySwapchain) {
     for (auto semaphore : renderFinished) if (semaphore) vkDestroySemaphore(device, semaphore, nullptr);
     renderFinished.clear();
-    imageFences.clear();
     for (auto framebuffer : framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
     framebuffers.clear();
     for (auto view : swapchainViews) vkDestroyImageView(device, view, nullptr);
@@ -827,7 +837,8 @@ struct VulkanRenderer::Impl {
     std::vector<VkQueueFamilyProperties> queueProperties(queueCount);
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, queueProperties.data());
     timestampValidBits = queueFamilies.graphics ? queueProperties[*queueFamilies.graphics].timestampValidBits : 0;
-    const bool timestampsSupported = timestampValidBits > 0 && deviceProperties.limits.timestampPeriod > 0.0f;
+    const bool timestampsSupported = config.gpuTimingInterval > 0 && timestampValidBits > 0 &&
+                                     deviceProperties.limits.timestampPeriod > 0.0f;
     for (auto& frame : frames) {
       check(vkCreateSemaphore(device, &semaphore, nullptr, &frame.imageAvailable), "vkCreateSemaphore(acquire)");
       check(vkCreateFence(device, &fence, nullptr, &frame.fence), "vkCreateFence");
@@ -915,11 +926,37 @@ struct VulkanRenderer::Impl {
     const float emRect[4]{-padding, -padding, destination.width + padding, destination.height + padding};
     std::copy(std::begin(positionRect), std::end(positionRect), quad.positionRect);
     std::copy(std::begin(emRect), std::end(emRect), quad.emRect);
+    std::array<float, 4> radii{
+      std::max(command.radiiPx.topLeft, 0.0f),
+      std::max(command.radiiPx.topRight, 0.0f),
+      std::max(command.radiiPx.bottomRight, 0.0f),
+      std::max(command.radiiPx.bottomLeft, 0.0f)
+    };
+    // CSS-compatible normalization is used only when requested absolute radii cannot physically
+    // fit. Otherwise every corner remains the exact authored pixel radius.
+    float radiusScale = 1.0f;
+    const auto fit = [&radiusScale](float available, float sum) {
+      if (sum > 0.0f) radiusScale = std::min(radiusScale, available / sum);
+    };
+    fit(destination.width, radii[0] + radii[1]);
+    fit(destination.width, radii[3] + radii[2]);
+    fit(destination.height, radii[0] + radii[3]);
+    fit(destination.height, radii[1] + radii[2]);
+    for (float& radius : radii) radius *= std::clamp(radiusScale, 0.0f, 1.0f);
+    const std::array<float, 4> smoothing{
+      std::clamp(command.continuousCorners.topLeftPercent, 0.0f, 100.0f),
+      std::clamp(command.continuousCorners.topRightPercent, 0.0f, 100.0f),
+      std::clamp(command.continuousCorners.bottomRightPercent, 0.0f, 100.0f),
+      std::clamp(command.continuousCorners.bottomLeftPercent, 0.0f, 100.0f)
+    };
     quad.bandTransform[0] = destination.width;
     quad.bandTransform[1] = destination.height;
-    quad.bandTransform[2] = std::min(command.radiusPx, std::min(destination.width, destination.height) * 0.5f);
-    quad.bandTransform[3] = command.continuousCornersPercent;
     quad.shapeData[0] = analyticRoundedRectShape;
+    // Four radii (1/16 px) and four smoothing percentages (1/256%) fit unused analytic-instance
+    // words. Ordinary Slug glyph/shape instances therefore do not grow by a single byte.
+    quad.shapeData[1] = packFixed16(radii[0], radii[1], 16.0f, 4095.9375f);
+    quad.shapeData[2] = packFixed16(radii[2], radii[3], 16.0f, 4095.9375f);
+    quad.shapeData[3] = packFixed16(smoothing[0], smoothing[1], 256.0f, 100.0f);
     const float first[4]{command.paint.start.r, command.paint.start.g, command.paint.start.b, command.paint.start.a};
     const float second[4]{command.paint.end.r, command.paint.end.g, command.paint.end.b, command.paint.end.a};
     std::copy(std::begin(first), std::end(first), quad.color0);
@@ -927,6 +964,7 @@ struct VulkanRenderer::Impl {
     quad.paint[0] = static_cast<float>(command.paint.kind);
     quad.paint[1] = command.paint.opacity;
     quad.paint[2] = command.paint.shaderParameter;
+    quad.paint[3] = std::bit_cast<float>(packFixed16(smoothing[2], smoothing[3], 256.0f, 100.0f));
     quad.gradient[0] = command.paint.origin.x;
     quad.gradient[1] = command.paint.origin.y;
     quad.gradient[2] = command.paint.target.x;
@@ -1107,7 +1145,7 @@ struct VulkanRenderer::Impl {
   void record(VkCommandBuffer command, std::uint32_t imageIndex, Frame& frame) {
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(frame)");
-    if (frame.timestamps) {
+    if (frame.writeTimestamps) {
       vkCmdResetQueryPool(command, frame.timestamps, 0, 2);
       vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame.timestamps, 0);
     }
@@ -1152,7 +1190,7 @@ struct VulkanRenderer::Impl {
       }
     }
     vkCmdEndRenderPass(command);
-    if (frame.timestamps)
+    if (frame.writeTimestamps)
       vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, frame.timestamps, 1);
     check(vkEndCommandBuffer(command), "vkEndCommandBuffer(frame)");
   }
@@ -1177,6 +1215,7 @@ struct VulkanRenderer::Impl {
         const std::uint64_t elapsedTicks = (ticks[1] - ticks[0]) & timestampMask;
         statistics.gpuMilliseconds = static_cast<float>(elapsedTicks) *
           deviceProperties.limits.timestampPeriod / 1'000'000.0f;
+        frame.timestampsWritten = false;
       }
       preparedAcquireResult = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
                                                      frame.imageAvailable, VK_NULL_HANDLE,
@@ -1187,10 +1226,6 @@ struct VulkanRenderer::Impl {
       }
       if (preparedAcquireResult != VK_SUCCESS && preparedAcquireResult != VK_SUBOPTIMAL_KHR)
         check(preparedAcquireResult, "vkAcquireNextImageKHR");
-      if (imageFences[preparedImageIndex] != VK_NULL_HANDLE)
-        check(vkWaitForFences(device, 1, &imageFences[preparedImageIndex], VK_TRUE, UINT64_MAX),
-              "vkWaitForFences(image)");
-      imageFences[preparedImageIndex] = frame.fence;
       framePrepared = true;
     }
   }
@@ -1209,6 +1244,8 @@ struct VulkanRenderer::Impl {
       std::memcpy(frame.instances.mapped, stagingInstances.data(), stagingInstances.size() * sizeof(Instance));
     const auto cpuUploadEnd = std::chrono::steady_clock::now();
 
+    frame.writeTimestamps = config.gpuTimingInterval > 0 && frame.timestamps != VK_NULL_HANDLE &&
+      submittedFrameCount % config.gpuTimingInterval == 0;
     check(vkResetFences(device, 1, &frame.fence), "vkResetFences");
     check(vkResetCommandBuffer(commandBuffers[currentFrame], 0), "vkResetCommandBuffer");
     record(commandBuffers[currentFrame], imageIndex, frame);
@@ -1222,7 +1259,7 @@ struct VulkanRenderer::Impl {
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &renderFinished[imageIndex];
     check(vkQueueSubmit(graphicsQueue, 1, &submit, frame.fence), "vkQueueSubmit(frame)");
-    frame.timestampsWritten = frame.timestamps != VK_NULL_HANDLE;
+    frame.timestampsWritten = frame.writeTimestamps;
 
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
@@ -1234,6 +1271,7 @@ struct VulkanRenderer::Impl {
     const bool needsRecreate = presented == VK_ERROR_OUT_OF_DATE_KHR;
     if (presented != VK_SUCCESS && presented != VK_SUBOPTIMAL_KHR && !needsRecreate)
       check(presented, "vkQueuePresentKHR");
+    const auto cpuSubmitEnd = std::chrono::steady_clock::now();
 
     std::uint32_t retainedQuadCount = 0;
     for (const DrawBatch& batch : drawBatches)
@@ -1246,6 +1284,9 @@ struct VulkanRenderer::Impl {
       std::chrono::duration<float, std::milli>(cpuBuildEnd - cpuBuildStart).count();
     statistics.cpuUploadMilliseconds =
       std::chrono::duration<float, std::milli>(cpuUploadEnd - cpuBuildEnd).count();
+    statistics.cpuSubmitMilliseconds =
+      std::chrono::duration<float, std::milli>(cpuSubmitEnd - cpuUploadEnd).count();
+    ++submittedFrameCount;
     framePrepared = false;
     currentFrame = (currentFrame + 1) % framesInFlight;
     if (needsRecreate) recreateSwapchain();
