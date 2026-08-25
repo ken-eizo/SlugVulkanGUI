@@ -1,0 +1,12 @@
+[submodule "external/Slug"]
+	path = external/Slug
+	url = https://github.com/EricLengyel/Slug.git
+[submodule "external/slughorn"]
+	path = external/slughorn
+	url = https://github.com/AlphaPixel/slughorn.git
+[submodule "external/glfw"]
+	path = external/glfw
+	url = https://github.com/glfw/glfw.git
+[submodule "external/freetype"]
+	path = external/freetype
+	url = https://gitlab.freedesktop.org/freetype/freetype.git
