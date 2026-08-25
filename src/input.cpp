@@ -31,7 +31,7 @@ const ButtonState& InputState::key(int keyCode) const {
   return keyCode >= 0 && keyCode < keyCount ? keys_[static_cast<std::size_t>(keyCode)] : emptyButton;
 }
 
-void InputState::beginFrame(double) {
+void InputState::beginFrame() {
   for (auto& state : mouse_) { state.pressed = false; state.released = false; }
   for (auto& state : keys_) { state.pressed = false; state.released = false; }
   previousCursor_ = cursor_;
@@ -57,10 +57,6 @@ void InputState::onCursor(double x, double y) {
   const Vec2 delta = next - cursor_;
   cursor_ = next;
   rawDelta_ = rawDelta_ + delta;
-}
-
-void InputState::onRawDelta(double x, double y) {
-  rawDelta_ = rawDelta_ + Vec2{static_cast<float>(x), static_cast<float>(y)};
 }
 
 void InputState::onMouseButton(int button, int action) {

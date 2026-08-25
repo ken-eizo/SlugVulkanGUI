@@ -67,6 +67,38 @@ For truly new paths at runtime, build a replacement atlas off the render thread,
 renderer, and swap renderer/atlas instances. A future generation-safe atlas swap API can automate
 that policy without weakening the immutable fast path.
 
+### CPU and GPU responsibilities
+
+Slug is GPU vector **coverage**, not an all-GPU application pipeline. SlugVulkan keeps the CPU work
+outside that coverage calculation deliberately small:
+
+- At atlas-build time, FreeType and slughorn run on the CPU to read outlines and create the Slug
+  quadratic-curve and band textures. This is not repeated each frame.
+- Each frame, the CPU handles operating-system input, UI hit testing/state, small text layout,
+  destination quads, buffer copies, and Vulkan command submission. `DrawList` owns one ordered
+  command stream; it does not mirror shapes or copy text into a second per-frame list.
+- The GPU transforms quads, finds candidate curves through the Slug band texture, solves quadratic
+  coverage in the fragment shader, evaluates the common fill/stroke/text paint, and blends.
+
+The CPU cannot be removed: Vulkan requires host-side resource and command submission, while input,
+layout, and outline-to-atlas conversion are not jobs performed by the Slug shaders. It is possible
+to cache retained text/layout in a future layer, but making that mandatory here would add state and
+invalidation machinery to the minimal immediate/declarative path.
+
+### What “minimal” means here
+
+`external/Slug` contains reference HLSL shaders, not a complete windowing/rendering/UI runtime, so
+an executable-size or whole-library-size comparison with it would be misleading. SlugVulkan reuses
+its curve/band algorithm, builds only slughorn's core plus its FreeType bridge, disables unused
+FreeType codecs, and keeps the Example and tests optional. A renderer-only application that links
+the static library does not pull unused Example/test object code.
+
+The adapted Slug shaders are smaller in raw source than the two upstream reference shaders, but
+source length is not a performance benchmark: SlugVulkan also includes common paints, clipping,
+and absolute-pixel analytic rounded rectangles. Claims of equal or better speed require a matched
+GPU, content, resolution, compiler, and benchmark harness; this project does not substitute binary
+or line counts for that measurement.
+
 ## Build on Windows
 
 Requirements: Visual Studio 2022 with C++, CMake 3.24+, and the LunarG Vulkan SDK with `glslc`.
@@ -81,12 +113,8 @@ ctest --test-dir build -C Release --output-on-failure
 .\build\Release\slugvk_example.exe
 ```
 
-Debug validation smoke test:
-
-```powershell
-cmake --build build --config Debug --parallel
-.\build\Debug\slugvk_example.exe --smoke
-```
+The single canonical Windows Example output is `build\Release\slugvk_example.exe`. Use
+`slugvk_example.exe --smoke` for a short non-interactive Vulkan validation run.
 
 ## Build on macOS with MoltenVK
 

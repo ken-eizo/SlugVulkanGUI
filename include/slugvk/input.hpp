@@ -40,10 +40,9 @@ public:
 
 private:
   friend class Window;
-  void beginFrame(double nowSeconds);
+  void beginFrame();
   void finishFrame(double nowSeconds);
   void onCursor(double x, double y);
-  void onRawDelta(double x, double y);
   void onMouseButton(int button, int action);
   void onKey(int key, int action);
   void onScroll(double x, double y, double nowSeconds);

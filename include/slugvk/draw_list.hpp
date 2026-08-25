@@ -56,15 +56,11 @@ public:
                    float continuousCornersPercent = 0.0f);
   void text(std::string utf8, Rect bounds, TextStyle style);
 
-  [[nodiscard]] const std::vector<DrawCommand>& shapes() const { return shapes_; }
-  [[nodiscard]] const std::vector<TextCommand>& texts() const { return texts_; }
   [[nodiscard]] const std::vector<DisplayCommand>& commands() const { return commands_; }
   [[nodiscard]] const std::vector<DisplayCommand>& overlayCommands() const { return overlayCommands_; }
 
 private:
   Rect clip_ = {0.0f, 0.0f, 100000.0f, 100000.0f};
-  std::vector<DrawCommand> shapes_{};
-  std::vector<TextCommand> texts_{};
   std::vector<DisplayCommand> commands_{};
   std::vector<DisplayCommand> overlayCommands_{};
   bool overlayMode_ = false;

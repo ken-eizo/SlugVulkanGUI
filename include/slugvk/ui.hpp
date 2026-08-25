@@ -22,11 +22,8 @@ struct Interaction {
 
 struct UiSkin {
   ShapeId rectangle = 0;
-  // Retained for source compatibility; built-in controls use the absolute-pixel GPU primitive.
-  ShapeId rounded = 0;
   ShapeId circle = 0;
   ShapeId check = 0;
-  ShapeId chevron = 0;
   Paint panel = Paint::solid(Color::fromRgb8(0x151c30));
   Paint control = Paint::solid(Color::fromRgb8(0x27314d));
   Paint hovered = Paint::solid(Color::fromRgb8(0x354363));
@@ -68,7 +65,7 @@ class UiContext {
 public:
   explicit UiContext(UiSkin skin);
 
-  void beginFrame(const InputState& input, DrawList& drawList, float deltaMs);
+  void beginFrame(const InputState& input, DrawList& drawList);
   void endFrame();
 
   Interaction interaction(WidgetId id, Rect bounds);
@@ -104,7 +101,6 @@ private:
   UiSkin skin_;
   const InputState* input_ = nullptr;
   DrawList* draw_ = nullptr;
-  float deltaMs_ = 0.0f;
   WidgetId hovered_ = 0;
   WidgetId active_ = 0;
   WidgetId focused_ = 0;

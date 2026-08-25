@@ -38,7 +38,6 @@ public:
 private:
   GLFWwindow* window_ = nullptr;
   InputState input_{};
-  bool rawMouseMotion_ = false;
 };
 
 } // namespace slugvk

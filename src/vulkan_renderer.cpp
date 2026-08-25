@@ -970,8 +970,8 @@ struct VulkanRenderer::Impl {
 
   void buildMesh(const DrawList& list, std::vector<Vertex>& vertices, std::vector<std::uint32_t>& indices) const {
     const std::size_t commandCount = list.commands().size() + list.overlayCommands().size();
-    vertices.reserve(commandCount * 4 + list.texts().size() * 28);
-    indices.reserve(commandCount * 6 + list.texts().size() * 42);
+    vertices.reserve(commandCount * 4);
+    indices.reserve(commandCount * 6);
     const auto appendCommands = [&](const auto& commands) {
       for (const auto& display : commands) {
         if (const auto* shapeCommand = std::get_if<DrawCommand>(&display))

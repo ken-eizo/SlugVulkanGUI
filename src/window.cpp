@@ -58,8 +58,7 @@ bool Window::shouldClose() const { return glfwWindowShouldClose(window_) == GLFW
 void Window::requestClose() { glfwSetWindowShouldClose(window_, GLFW_TRUE); }
 
 void Window::pollEvents() {
-  const double now = glfwGetTime();
-  input_.beginFrame(now);
+  input_.beginFrame();
   glfwPollEvents();
   // Sample once more after dispatching callbacks so high-rate pointer motion cannot leave the
   // declarative frame on an older coalesced callback position.
@@ -81,10 +80,10 @@ void Window::waitForVisibleFramebuffer() {
 }
 
 void Window::setRawMouseMotion(bool enabled) {
-  rawMouseMotion_ = enabled && rawMouseMotionSupported();
-  glfwSetInputMode(window_, GLFW_CURSOR, rawMouseMotion_ ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+  const bool rawMouseMotion = enabled && rawMouseMotionSupported();
+  glfwSetInputMode(window_, GLFW_CURSOR, rawMouseMotion ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
   if (rawMouseMotionSupported())
-    glfwSetInputMode(window_, GLFW_RAW_MOUSE_MOTION, rawMouseMotion_ ? GLFW_TRUE : GLFW_FALSE);
+    glfwSetInputMode(window_, GLFW_RAW_MOUSE_MOTION, rawMouseMotion ? GLFW_TRUE : GLFW_FALSE);
 }
 
 bool Window::rawMouseMotionSupported() const {

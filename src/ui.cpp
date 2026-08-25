@@ -38,10 +38,9 @@ UiContext::UiContext(UiSkin skin) : skin_(std::move(skin)) {
   skin_.text.paint = Paint::solid(Color::fromRgb8(0xeaf0ff));
 }
 
-void UiContext::beginFrame(const InputState& inputState, DrawList& drawList, float deltaMs) {
+void UiContext::beginFrame(const InputState& inputState, DrawList& drawList) {
   input_ = &inputState;
   draw_ = &drawList;
-  deltaMs_ = deltaMs;
   rootClip_ = drawList.clip();
   overlayClaimed_ = false;
   hovered_ = 0;

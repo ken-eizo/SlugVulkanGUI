@@ -16,7 +16,6 @@ struct Shapes {
   ShapeId rectangle = 0;
   ShapeId circle = 0;
   ShapeId check = 0;
-  ShapeId chevron = 0;
   ShapeId polygon = 0;
   ShapeId star = 0;
   ShapeId solidStroke = 0;
@@ -36,7 +35,6 @@ Shapes buildAtlas(VectorAtlas& atlas) {
   iconStroke.cap = LineCap::Round;
   iconStroke.join = LineJoin::Round;
   shapes.check = atlas.addStroke(Path{}.moveTo(8, 50).lineTo(38, 80).lineTo(92, 13), iconStroke);
-  shapes.chevron = atlas.addStroke(Path{}.moveTo(20, 28).lineTo(50, 60).lineTo(80, 28), iconStroke);
 
   Path wave;
   wave.moveTo(0, 50).cubicTo(30, 0, 70, 100, 100, 50).cubicTo(130, 0, 170, 100, 200, 50);
@@ -125,7 +123,6 @@ int main(int argc, char** argv) try {
   skin.rectangle = shapes.rectangle;
   skin.circle = shapes.circle;
   skin.check = shapes.check;
-  skin.chevron = shapes.chevron;
   skin.text = textStyle(14);
   UiContext ui(skin);
   DrawList draw;
@@ -185,7 +182,7 @@ int main(int argc, char** argv) try {
     draw.text("Exact Slug curves on Vulkan | retained atlas + declarative dynamic batch | Windows / MoltenVK",
               {38, 58, framebuffer.x - 80, 24}, subtitle);
 
-    ui.beginFrame(window.input(), draw, deltaMs);
+    ui.beginFrame(window.input(), draw);
     const float navigationX = std::max(700.0f, framebuffer.x - 426.0f);
     if (ui.button(hashId("page-components"),
                   page == DemoPage::Components ? "[ Components ]" : "Components",
