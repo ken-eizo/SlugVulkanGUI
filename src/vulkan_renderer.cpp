@@ -1,9 +1,10 @@
 #include "slugvk/vulkan_renderer.hpp"
 
+#include "slughorn/slughorn.hpp"
+#include "slugvk/platform_surface.hpp"
 #include "slugvk/vector_atlas.hpp"
 #include "slugvk/window.hpp"
 #include "slugvk_embedded_shaders.hpp"
-#include "slughorn/slughorn.hpp"
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -32,6 +33,52 @@ namespace {
 constexpr std::size_t framesInFlight = 1;
 constexpr const char* portabilitySubsetExtension = "VK_KHR_portability_subset";
 constexpr std::uint32_t analyticRoundedRectShape = std::numeric_limits<std::uint32_t>::max();
+constexpr std::uint32_t analyticStrokeSegmentShape = std::numeric_limits<std::uint32_t>::max() - 1U;
+
+class GlfwPlatformSurface final : public PlatformSurface {
+public:
+  explicit GlfwPlatformSurface(Window& window) : window_(window) {
+    std::uint32_t count = 0;
+    const char** required = glfwGetRequiredInstanceExtensions(&count);
+    if (!required || count == 0)
+      throw std::runtime_error("GLFW returned no Vulkan extensions");
+    extensions_.assign(required, required + count);
+  }
+
+  [[nodiscard]] std::span<const char* const> requiredInstanceExtensions() const noexcept override {
+    return extensions_;
+  }
+
+  VkResult createVulkanSurface(VkInstance instance, const VkAllocationCallbacks* allocator,
+                               VkSurfaceKHR* surface) const noexcept override {
+    return glfwCreateWindowSurface(instance, window_.native(), allocator, surface);
+  }
+
+  [[nodiscard]] Vec2 framebufferSize() const noexcept override {
+    return window_.framebufferSize();
+  }
+
+  [[nodiscard]] float contentScale() const noexcept override {
+    return window_.contentScale();
+  }
+
+  [[nodiscard]] bool visible() const noexcept override {
+    const Vec2 size = window_.framebufferSize();
+    return size.x > 0.0f && size.y > 0.0f;
+  }
+
+  void requestRedraw() noexcept override {
+    glfwPostEmptyEvent();
+  }
+
+  void waitForVisibleFramebuffer() override {
+    window_.waitForVisibleFramebuffer();
+  }
+
+private:
+  Window& window_;
+  std::vector<const char*> extensions_;
+};
 
 std::uint32_t packFixed16(float first, float second, float scale, float maximum) {
   const auto quantize = [scale, maximum](float value) {
@@ -41,15 +88,17 @@ std::uint32_t packFixed16(float first, float second, float scale, float maximum)
 }
 
 void check(VkResult result, const char* operation) {
-  if (result != VK_SUCCESS) throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(result));
+  if (result != VK_SUCCESS)
+    throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(result));
 }
 
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                              VkDebugUtilsMessageTypeFlagsEXT,
-                                              const VkDebugUtilsMessengerCallbackDataEXT* data,
-                                              void*) {
+                                             VkDebugUtilsMessageTypeFlagsEXT,
+                                             const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                             void*) {
   if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
-    std::cerr << "[Vulkan] " << (data && data->pMessage ? data->pMessage : "validation message") << '\n';
+    std::cerr << "[Vulkan] " << (data && data->pMessage ? data->pMessage : "validation message")
+              << '\n';
   return VK_FALSE;
 }
 
@@ -68,15 +117,16 @@ bool hasLayer(const char* name) {
   vkEnumerateInstanceLayerProperties(&count, nullptr);
   std::vector<VkLayerProperties> layers(count);
   vkEnumerateInstanceLayerProperties(&count, layers.data());
-  return std::any_of(layers.begin(), layers.end(), [name](const auto& layer) {
-    return std::strcmp(layer.layerName, name) == 0;
-  });
+  return std::any_of(layers.begin(), layers.end(),
+                     [name](const auto& layer) { return std::strcmp(layer.layerName, name) == 0; });
 }
 
 struct QueueFamilies {
   std::optional<std::uint32_t> graphics;
   std::optional<std::uint32_t> present;
-  [[nodiscard]] bool complete() const { return graphics.has_value() && present.has_value(); }
+  [[nodiscard]] bool complete() const {
+    return graphics.has_value() && present.has_value();
+  }
 };
 
 QueueFamilies findQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface) {
@@ -86,11 +136,14 @@ QueueFamilies findQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface) {
   std::vector<VkQueueFamilyProperties> properties(count);
   vkGetPhysicalDeviceQueueFamilyProperties(device, &count, properties.data());
   for (std::uint32_t i = 0; i < count; ++i) {
-    if (properties[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) result.graphics = i;
+    if (properties[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+      result.graphics = i;
     VkBool32 present = VK_FALSE;
     vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, &present);
-    if (present) result.present = i;
-    if (result.complete()) break;
+    if (present)
+      result.present = i;
+    if (result.complete())
+      break;
   }
   return result;
 }
@@ -117,11 +170,13 @@ SwapchainSupport querySwapchain(VkPhysicalDevice device, VkSurfaceKHR surface) {
   std::uint32_t count = 0;
   vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &count, nullptr);
   result.formats.resize(count);
-  if (count) vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &count, result.formats.data());
+  if (count)
+    vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &count, result.formats.data());
   count = 0;
   vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, &count, nullptr);
   result.presentModes.resize(count);
-  if (count) vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, &count, result.presentModes.data());
+  if (count)
+    vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, &count, result.presentModes.data());
   return result;
 }
 
@@ -169,7 +224,8 @@ struct Texture {
 } // namespace
 
 struct VulkanRenderer::Impl {
-  Window& window;
+  std::unique_ptr<PlatformSurface> ownedPlatformSurface;
+  PlatformSurface& platformSurface;
   const VectorAtlas& vectorAtlas;
   RendererConfig config;
   RendererStats statistics{};
@@ -228,10 +284,22 @@ struct VulkanRenderer::Impl {
   std::uint32_t preparedImageIndex = 0;
   VkResult preparedAcquireResult = VK_SUCCESS;
 
-  Impl(Window& inputWindow, const VectorAtlas& atlas, RendererConfig inputConfig)
-      : window(inputWindow), vectorAtlas(atlas), config(inputConfig) {
+  Impl(PlatformSurface& inputSurface, const VectorAtlas& atlas, RendererConfig inputConfig)
+      : platformSurface(inputSurface), vectorAtlas(atlas), config(inputConfig) {
+    initialize();
+  }
+
+  Impl(std::unique_ptr<PlatformSurface> inputSurface, const VectorAtlas& atlas,
+       RendererConfig inputConfig)
+      : ownedPlatformSurface(std::move(inputSurface)), platformSurface(*ownedPlatformSurface),
+        vectorAtlas(atlas), config(inputConfig) {
+    initialize();
+  }
+
+  void initialize() {
     try {
-      if (!vectorAtlas.built()) throw std::invalid_argument("VectorAtlas::build() must be called first");
+      if (!vectorAtlas.built())
+        throw std::invalid_argument("VectorAtlas::build() must be called first");
       createInstance();
       createSurface();
       pickPhysicalDevice();
@@ -247,7 +315,9 @@ struct VulkanRenderer::Impl {
     }
   }
 
-  ~Impl() { destroy(); }
+  ~Impl() {
+    destroy();
+  }
 
   void createInstance() {
     const char* validationLayer = "VK_LAYER_KHRONOS_validation";
@@ -256,10 +326,10 @@ struct VulkanRenderer::Impl {
 #endif
     config.validation = config.validation && hasLayer(validationLayer);
 
-    std::uint32_t glfwCount = 0;
-    const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwCount);
-    if (!glfwExtensions || glfwCount == 0) throw std::runtime_error("GLFW returned no Vulkan extensions");
-    std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwCount);
+    const auto requiredExtensions = platformSurface.requiredInstanceExtensions();
+    if (requiredExtensions.empty())
+      throw std::runtime_error("PlatformSurface returned no Vulkan extensions");
+    std::vector<const char*> extensions(requiredExtensions.begin(), requiredExtensions.end());
     if (config.validation && hasInstanceExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
       extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
@@ -276,7 +346,8 @@ struct VulkanRenderer::Impl {
     application.engineVersion = VK_MAKE_VERSION(0, 1, 0);
     application.apiVersion = VK_API_VERSION_1_1;
 
-    VkDebugUtilsMessengerCreateInfoEXT debugInfo{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    VkDebugUtilsMessengerCreateInfoEXT debugInfo{
+        VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
     debugInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
                                 VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
     debugInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
@@ -298,31 +369,39 @@ struct VulkanRenderer::Impl {
 
     if (config.validation) {
       auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
-        vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
-      if (create) check(create(instance, &debugInfo, nullptr, &debugMessenger), "vkCreateDebugUtilsMessengerEXT");
+          vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+      if (create)
+        check(create(instance, &debugInfo, nullptr, &debugMessenger),
+              "vkCreateDebugUtilsMessengerEXT");
     }
   }
 
   void createSurface() {
-    check(glfwCreateWindowSurface(instance, window.native(), nullptr, &surface), "glfwCreateWindowSurface");
+    check(platformSurface.createVulkanSurface(instance, nullptr, &surface),
+          "PlatformSurface::createVulkanSurface");
   }
 
   void pickPhysicalDevice() {
     std::uint32_t count = 0;
     check(vkEnumeratePhysicalDevices(instance, &count, nullptr), "vkEnumeratePhysicalDevices");
-    if (!count) throw std::runtime_error("No Vulkan physical device was found");
+    if (!count)
+      throw std::runtime_error("No Vulkan physical device was found");
     std::vector<VkPhysicalDevice> devices(count);
-    check(vkEnumeratePhysicalDevices(instance, &count, devices.data()), "vkEnumeratePhysicalDevices");
+    check(vkEnumeratePhysicalDevices(instance, &count, devices.data()),
+          "vkEnumeratePhysicalDevices");
     int bestScore = -1;
     for (VkPhysicalDevice candidate : devices) {
       const auto families = findQueueFamilies(candidate, surface);
-      if (!families.complete() || !hasDeviceExtension(candidate, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) continue;
+      if (!families.complete() || !hasDeviceExtension(candidate, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
+        continue;
       const auto support = querySwapchain(candidate, surface);
-      if (support.formats.empty() || support.presentModes.empty()) continue;
+      if (support.formats.empty() || support.presentModes.empty())
+        continue;
       VkPhysicalDeviceProperties properties{};
       vkGetPhysicalDeviceProperties(candidate, &properties);
       int score = static_cast<int>(properties.limits.maxImageDimension2D);
-      if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score += 100000;
+      if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+        score += 100000;
       if (score > bestScore) {
         bestScore = score;
         physicalDevice = candidate;
@@ -330,7 +409,8 @@ struct VulkanRenderer::Impl {
         deviceProperties = properties;
       }
     }
-    if (physicalDevice == VK_NULL_HANDLE) throw std::runtime_error("No present-capable Vulkan device supports VK_KHR_swapchain");
+    if (physicalDevice == VK_NULL_HANDLE)
+      throw std::runtime_error("No present-capable Vulkan device supports VK_KHR_swapchain");
   }
 
   void createDevice() {
@@ -362,7 +442,8 @@ struct VulkanRenderer::Impl {
 
   void createCommandPool() {
     VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    info.flags =
+        VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     info.queueFamilyIndex = *queueFamilies.graphics;
     check(vkCreateCommandPool(device, &info, nullptr, &commandPool), "vkCreateCommandPool");
   }
@@ -371,12 +452,13 @@ struct VulkanRenderer::Impl {
     VkPhysicalDeviceMemoryProperties properties{};
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &properties);
     for (std::uint32_t i = 0; i < properties.memoryTypeCount; ++i)
-      if ((bits & (1U << i)) && (properties.memoryTypes[i].propertyFlags & flags) == flags) return i;
+      if ((bits & (1U << i)) && (properties.memoryTypes[i].propertyFlags & flags) == flags)
+        return i;
     throw std::runtime_error("No compatible Vulkan memory type");
   }
 
-  void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                    VkMemoryPropertyFlags properties, Buffer& output, bool map) {
+  void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
+                    Buffer& output, bool map) {
     output.size = std::max<VkDeviceSize>(size, 4);
     VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bufferInfo.size = output.size;
@@ -390,13 +472,17 @@ struct VulkanRenderer::Impl {
     allocate.memoryTypeIndex = memoryType(requirements.memoryTypeBits, properties);
     check(vkAllocateMemory(device, &allocate, nullptr, &output.memory), "vkAllocateMemory(buffer)");
     check(vkBindBufferMemory(device, output.buffer, output.memory, 0), "vkBindBufferMemory");
-    if (map) check(vkMapMemory(device, output.memory, 0, output.size, 0, &output.mapped), "vkMapMemory");
+    if (map)
+      check(vkMapMemory(device, output.memory, 0, output.size, 0, &output.mapped), "vkMapMemory");
   }
 
   void destroyBuffer(Buffer& buffer) {
-    if (buffer.mapped) vkUnmapMemory(device, buffer.memory);
-    if (buffer.buffer) vkDestroyBuffer(device, buffer.buffer, nullptr);
-    if (buffer.memory) vkFreeMemory(device, buffer.memory, nullptr);
+    if (buffer.mapped)
+      vkUnmapMemory(device, buffer.memory);
+    if (buffer.buffer)
+      vkDestroyBuffer(device, buffer.buffer, nullptr);
+    if (buffer.memory)
+      vkFreeMemory(device, buffer.memory, nullptr);
     buffer = {};
   }
 
@@ -406,7 +492,8 @@ struct VulkanRenderer::Impl {
     allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocate.commandBufferCount = 1;
     VkCommandBuffer command = VK_NULL_HANDLE;
-    check(vkAllocateCommandBuffers(device, &allocate, &command), "vkAllocateCommandBuffers(upload)");
+    check(vkAllocateCommandBuffers(device, &allocate, &command),
+          "vkAllocateCommandBuffers(upload)");
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(upload)");
@@ -428,7 +515,8 @@ struct VulkanRenderer::Impl {
       throw std::runtime_error("Slug atlas returned an empty texture");
     Buffer staging{};
     createBuffer(source.bytes.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, true);
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 staging, true);
     std::memcpy(staging.mapped, source.bytes.data(), source.bytes.size());
 
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -447,7 +535,8 @@ struct VulkanRenderer::Impl {
     vkGetImageMemoryRequirements(device, output.image, &requirements);
     VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocate.allocationSize = requirements.size;
-    allocate.memoryTypeIndex = memoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    allocate.memoryTypeIndex =
+        memoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     check(vkAllocateMemory(device, &allocate, nullptr, &output.memory), "vkAllocateMemory(image)");
     check(vkBindImageMemory(device, output.image, output.memory, 0), "vkBindImageMemory");
 
@@ -465,7 +554,8 @@ struct VulkanRenderer::Impl {
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {source.width, source.height, 1};
-    vkCmdCopyBufferToImage(command, staging.buffer, output.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    vkCmdCopyBufferToImage(command, staging.buffer, output.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     VkImageMemoryBarrier toShader{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toShader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -475,8 +565,9 @@ struct VulkanRenderer::Impl {
     toShader.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     toShader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &toShader);
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                         &toShader);
     endSingleUse(command);
     destroyBuffer(staging);
 
@@ -489,9 +580,12 @@ struct VulkanRenderer::Impl {
   }
 
   void destroyTexture(Texture& texture) {
-    if (texture.view) vkDestroyImageView(device, texture.view, nullptr);
-    if (texture.image) vkDestroyImage(device, texture.image, nullptr);
-    if (texture.memory) vkFreeMemory(device, texture.memory, nullptr);
+    if (texture.view)
+      vkDestroyImageView(device, texture.view, nullptr);
+    if (texture.image)
+      vkDestroyImage(device, texture.image, nullptr);
+    if (texture.memory)
+      vkFreeMemory(device, texture.memory, nullptr);
     texture = {};
   }
 
@@ -522,19 +616,22 @@ struct VulkanRenderer::Impl {
     VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layout.bindingCount = static_cast<std::uint32_t>(bindings.size());
     layout.pBindings = bindings.data();
-    check(vkCreateDescriptorSetLayout(device, &layout, nullptr, &descriptorSetLayout), "vkCreateDescriptorSetLayout");
+    check(vkCreateDescriptorSetLayout(device, &layout, nullptr, &descriptorSetLayout),
+          "vkCreateDescriptorSetLayout");
     VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool.maxSets = 1;
     pool.poolSizeCount = 1;
     pool.pPoolSizes = &size;
-    check(vkCreateDescriptorPool(device, &pool, nullptr, &descriptorPool), "vkCreateDescriptorPool");
+    check(vkCreateDescriptorPool(device, &pool, nullptr, &descriptorPool),
+          "vkCreateDescriptorPool");
     VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocate.descriptorPool = descriptorPool;
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &descriptorSetLayout;
     check(vkAllocateDescriptorSets(device, &allocate, &descriptorSet), "vkAllocateDescriptorSets");
-    VkDescriptorImageInfo curve{sampler, curveTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo curve{sampler, curveTexture.view,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkDescriptorImageInfo band{sampler, bandTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     std::array<VkWriteDescriptorSet, 2> writes{};
     for (std::uint32_t i = 0; i < writes.size(); ++i) {
@@ -546,15 +643,18 @@ struct VulkanRenderer::Impl {
     }
     writes[0].pImageInfo = &curve;
     writes[1].pImageInfo = &band;
-    vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0,
+                           nullptr);
   }
 
   VkSurfaceFormatKHR chooseFormat(const std::vector<VkSurfaceFormatKHR>& formats) const {
     for (const auto& format : formats)
-      if (format.format == VK_FORMAT_B8G8R8A8_SRGB && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+      if (format.format == VK_FORMAT_B8G8R8A8_SRGB &&
+          format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
         return format;
     for (const auto& format : formats)
-      if (format.format == VK_FORMAT_R8G8B8A8_SRGB && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+      if (format.format == VK_FORMAT_R8G8B8A8_SRGB &&
+          format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
         return format;
     return formats.front();
   }
@@ -562,9 +662,15 @@ struct VulkanRenderer::Impl {
   VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& modes) const {
     if (!config.vsync) {
       if (config.allowTearing)
-        for (auto mode : modes) if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) return mode;
-      for (auto mode : modes) if (mode == VK_PRESENT_MODE_MAILBOX_KHR) return mode;
-      for (auto mode : modes) if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) return mode;
+        for (auto mode : modes)
+          if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR)
+            return mode;
+      for (auto mode : modes)
+        if (mode == VK_PRESENT_MODE_MAILBOX_KHR)
+          return mode;
+      for (auto mode : modes)
+        if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR)
+          return mode;
     }
     return VK_PRESENT_MODE_FIFO_KHR;
   }
@@ -572,13 +678,11 @@ struct VulkanRenderer::Impl {
   VkExtent2D chooseExtent(const VkSurfaceCapabilitiesKHR& capabilities) {
     if (capabilities.currentExtent.width != std::numeric_limits<std::uint32_t>::max())
       return capabilities.currentExtent;
-    const Vec2 framebuffer = window.framebufferSize();
-    return {
-      std::clamp(static_cast<std::uint32_t>(std::max(framebuffer.x, 1.0f)),
-                 capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
-      std::clamp(static_cast<std::uint32_t>(std::max(framebuffer.y, 1.0f)),
-                 capabilities.minImageExtent.height, capabilities.maxImageExtent.height)
-    };
+    const Vec2 framebuffer = platformSurface.framebufferSize();
+    return {std::clamp(static_cast<std::uint32_t>(std::max(framebuffer.x, 1.0f)),
+                       capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
+            std::clamp(static_cast<std::uint32_t>(std::max(framebuffer.y, 1.0f)),
+                       capabilities.minImageExtent.height, capabilities.maxImageExtent.height)};
   }
 
   void createRenderPass() {
@@ -613,7 +717,8 @@ struct VulkanRenderer::Impl {
   }
 
   VkShaderModule createShaderModule(const unsigned char* bytes, std::size_t byteCount) {
-    if (byteCount % 4 != 0) throw std::runtime_error("Invalid SPIR-V byte length");
+    if (byteCount % 4 != 0)
+      throw std::runtime_error("Invalid SPIR-V byte length");
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     info.codeSize = byteCount;
     info.pCode = reinterpret_cast<const std::uint32_t*>(bytes);
@@ -623,48 +728,54 @@ struct VulkanRenderer::Impl {
   }
 
   void createPipeline() {
-    VkShaderModule vertexModule = createShaderModule(embedded::vectorVert,
-                                                      embedded::vectorVertSize);
-    VkShaderModule fragmentModule = createShaderModule(embedded::vectorFrag,
-                                                        embedded::vectorFragSize);
-    VkPipelineShaderStageCreateInfo vertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    VkShaderModule vertexModule =
+        createShaderModule(embedded::vectorVert, embedded::vectorVertSize);
+    VkShaderModule fragmentModule =
+        createShaderModule(embedded::vectorFrag, embedded::vectorFragSize);
+    VkPipelineShaderStageCreateInfo vertexStage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     vertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     vertexStage.module = vertexModule;
     vertexStage.pName = "main";
-    VkPipelineShaderStageCreateInfo fragmentStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    VkPipelineShaderStageCreateInfo fragmentStage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     fragmentStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     fragmentStage.module = fragmentModule;
     fragmentStage.pName = "main";
     const std::array stages{vertexStage, fragmentStage};
 
     VkVertexInputBindingDescription binding{0, sizeof(Instance), VK_VERTEX_INPUT_RATE_INSTANCE};
-    std::array<VkVertexInputAttributeDescription, 9> attributes{{
-      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, positionRect)},
-      {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, emRect)},
-      {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, bandTransform)},
-      {3, 0, VK_FORMAT_R32G32B32A32_UINT, offsetof(Instance, shapeData)},
-      {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color0)},
-      {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color1)},
-      {6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, paint)},
-      {7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, gradient)},
-      {8, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, clip)}
-    }};
-    VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    std::array<VkVertexInputAttributeDescription, 9> attributes{
+        {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, positionRect)},
+         {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, emRect)},
+         {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, bandTransform)},
+         {3, 0, VK_FORMAT_R32G32B32A32_UINT, offsetof(Instance, shapeData)},
+         {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color0)},
+         {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color1)},
+         {6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, paint)},
+         {7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, gradient)},
+         {8, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, clip)}}};
+    VkPipelineVertexInputStateCreateInfo vertexInput{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vertexInput.vertexBindingDescriptionCount = 1;
     vertexInput.pVertexBindingDescriptions = &binding;
     vertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());
     vertexInput.pVertexAttributeDescriptions = attributes.data();
-    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo viewport{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     viewport.viewportCount = 1;
     viewport.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo raster{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     raster.polygonMode = VK_POLYGON_MODE_FILL;
     raster.cullMode = VK_CULL_MODE_NONE;
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo multisample{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineColorBlendAttachmentState attachment{};
     attachment.blendEnable = VK_TRUE;
@@ -676,7 +787,8 @@ struct VulkanRenderer::Impl {
     attachment.alphaBlendOp = VK_BLEND_OP_ADD;
     attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkPipelineColorBlendStateCreateInfo blend{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blend.attachmentCount = 1;
     blend.pAttachments = &attachment;
     const std::array dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -691,7 +803,8 @@ struct VulkanRenderer::Impl {
     layout.pSetLayouts = &descriptorSetLayout;
     layout.pushConstantRangeCount = 1;
     layout.pPushConstantRanges = &push;
-    check(vkCreatePipelineLayout(device, &layout, nullptr, &pipelineLayout), "vkCreatePipelineLayout");
+    check(vkCreatePipelineLayout(device, &layout, nullptr, &pipelineLayout),
+          "vkCreatePipelineLayout");
     VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
     pipelineInfo.pStages = stages.data();
@@ -712,7 +825,7 @@ struct VulkanRenderer::Impl {
   }
 
   void createSwapchainResources(VkSwapchainKHR oldSwapchain = VK_NULL_HANDLE) {
-    window.waitForVisibleFramebuffer();
+    platformSurface.waitForVisibleFramebuffer();
     const auto support = querySwapchain(physicalDevice, surface);
     const auto chosenFormat = chooseFormat(support.formats);
     extent = chooseExtent(support.capabilities);
@@ -720,7 +833,7 @@ struct VulkanRenderer::Impl {
     // Absolute-latency IMMEDIATE uses the smallest legal swapchain. MAILBOX keeps one additional
     // replacement image so the presentation engine can always retain only the newest frame.
     std::uint32_t imageCount = support.capabilities.minImageCount +
-      (swapchainPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ? 1U : 0U);
+                               (swapchainPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ? 1U : 0U);
     if (support.capabilities.maxImageCount && imageCount > support.capabilities.maxImageCount)
       imageCount = support.capabilities.maxImageCount;
     VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -736,7 +849,8 @@ struct VulkanRenderer::Impl {
       info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
       info.queueFamilyIndexCount = static_cast<std::uint32_t>(families.size());
       info.pQueueFamilyIndices = families.data();
-    } else info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    } else
+      info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = support.capabilities.currentTransform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     info.presentMode = swapchainPresentMode;
@@ -745,12 +859,17 @@ struct VulkanRenderer::Impl {
     VkSwapchainKHR newSwapchain = VK_NULL_HANDLE;
     check(vkCreateSwapchainKHR(device, &info, nullptr, &newSwapchain), "vkCreateSwapchainKHR");
     swapchain = newSwapchain;
-    if (oldSwapchain) vkDestroySwapchainKHR(device, oldSwapchain, nullptr);
-    const bool formatChanged = swapchainFormat != VK_FORMAT_UNDEFINED && swapchainFormat != chosenFormat.format;
+    if (oldSwapchain)
+      vkDestroySwapchainKHR(device, oldSwapchain, nullptr);
+    const bool formatChanged =
+        swapchainFormat != VK_FORMAT_UNDEFINED && swapchainFormat != chosenFormat.format;
     if (formatChanged) {
-      if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
-      if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-      if (renderPass) vkDestroyRenderPass(device, renderPass, nullptr);
+      if (pipeline)
+        vkDestroyPipeline(device, pipeline, nullptr);
+      if (pipelineLayout)
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+      if (renderPass)
+        vkDestroyRenderPass(device, renderPass, nullptr);
       pipeline = VK_NULL_HANDLE;
       pipelineLayout = VK_NULL_HANDLE;
       renderPass = VK_NULL_HANDLE;
@@ -766,7 +885,8 @@ struct VulkanRenderer::Impl {
       view.viewType = VK_IMAGE_VIEW_TYPE_2D;
       view.format = swapchainFormat;
       view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-      check(vkCreateImageView(device, &view, nullptr, &swapchainViews[i]), "vkCreateImageView(swapchain)");
+      check(vkCreateImageView(device, &view, nullptr, &swapchainViews[i]),
+            "vkCreateImageView(swapchain)");
     }
     if (!renderPass) {
       createRenderPass();
@@ -781,7 +901,8 @@ struct VulkanRenderer::Impl {
       framebuffer.width = extent.width;
       framebuffer.height = extent.height;
       framebuffer.layers = 1;
-      check(vkCreateFramebuffer(device, &framebuffer, nullptr, &framebuffers[i]), "vkCreateFramebuffer");
+      check(vkCreateFramebuffer(device, &framebuffer, nullptr, &framebuffers[i]),
+            "vkCreateFramebuffer");
     }
     renderFinished.resize(imageCount);
     VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -790,11 +911,15 @@ struct VulkanRenderer::Impl {
   }
 
   void destroySwapchainImages(bool destroySwapchain) {
-    for (auto semaphore : renderFinished) if (semaphore) vkDestroySemaphore(device, semaphore, nullptr);
+    for (auto semaphore : renderFinished)
+      if (semaphore)
+        vkDestroySemaphore(device, semaphore, nullptr);
     renderFinished.clear();
-    for (auto framebuffer : framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
+    for (auto framebuffer : framebuffers)
+      vkDestroyFramebuffer(device, framebuffer, nullptr);
     framebuffers.clear();
-    for (auto view : swapchainViews) vkDestroyImageView(device, view, nullptr);
+    for (auto view : swapchainViews)
+      vkDestroyImageView(device, view, nullptr);
     swapchainViews.clear();
     swapchainImages.clear();
     if (destroySwapchain && swapchain) {
@@ -805,16 +930,19 @@ struct VulkanRenderer::Impl {
 
   void destroySwapchainResources() {
     destroySwapchainImages(true);
-    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
-    if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-    if (renderPass) vkDestroyRenderPass(device, renderPass, nullptr);
+    if (pipeline)
+      vkDestroyPipeline(device, pipeline, nullptr);
+    if (pipelineLayout)
+      vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+    if (renderPass)
+      vkDestroyRenderPass(device, renderPass, nullptr);
     pipeline = VK_NULL_HANDLE;
     pipelineLayout = VK_NULL_HANDLE;
     renderPass = VK_NULL_HANDLE;
   }
 
   void recreateSwapchain() {
-    window.waitForVisibleFramebuffer();
+    platformSurface.waitForVisibleFramebuffer();
     check(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(resize)");
     const VkSwapchainKHR oldSwapchain = swapchain;
     destroySwapchainImages(false);
@@ -828,7 +956,8 @@ struct VulkanRenderer::Impl {
     command.commandPool = commandPool;
     command.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     command.commandBufferCount = static_cast<std::uint32_t>(commandBuffers.size());
-    check(vkAllocateCommandBuffers(device, &command, commandBuffers.data()), "vkAllocateCommandBuffers(frames)");
+    check(vkAllocateCommandBuffers(device, &command, commandBuffers.data()),
+          "vkAllocateCommandBuffers(frames)");
     VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
@@ -836,19 +965,24 @@ struct VulkanRenderer::Impl {
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, nullptr);
     std::vector<VkQueueFamilyProperties> queueProperties(queueCount);
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, queueProperties.data());
-    timestampValidBits = queueFamilies.graphics ? queueProperties[*queueFamilies.graphics].timestampValidBits : 0;
+    timestampValidBits =
+        queueFamilies.graphics ? queueProperties[*queueFamilies.graphics].timestampValidBits : 0;
     const bool timestampsSupported = config.gpuTimingInterval > 0 && timestampValidBits > 0 &&
                                      deviceProperties.limits.timestampPeriod > 0.0f;
     for (auto& frame : frames) {
-      check(vkCreateSemaphore(device, &semaphore, nullptr, &frame.imageAvailable), "vkCreateSemaphore(acquire)");
+      check(vkCreateSemaphore(device, &semaphore, nullptr, &frame.imageAvailable),
+            "vkCreateSemaphore(acquire)");
       check(vkCreateFence(device, &fence, nullptr, &frame.fence), "vkCreateFence");
-      createBuffer(config.initialVertexCapacity * sizeof(Instance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, frame.instances, true);
+      createBuffer(config.initialVertexCapacity * sizeof(Instance),
+                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   frame.instances, true);
       if (timestampsSupported) {
         VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         query.queryType = VK_QUERY_TYPE_TIMESTAMP;
         query.queryCount = 2;
-        check(vkCreateQueryPool(device, &query, nullptr, &frame.timestamps), "vkCreateQueryPool(timestamp)");
+        check(vkCreateQueryPool(device, &query, nullptr, &frame.timestamps),
+              "vkCreateQueryPool(timestamp)");
       }
     }
   }
@@ -856,7 +990,8 @@ struct VulkanRenderer::Impl {
   void appendResolvedShape(std::vector<Instance>& instances, const slughorn::Atlas::Shape& shape,
                            Rect destination, const Paint& paintValue, Rect clip,
                            float italicShear = 0.0f) const {
-    if (shape.width <= 0 || shape.height <= 0 || destination.width <= 0 || destination.height <= 0) return;
+    if (shape.width <= 0 || shape.height <= 0 || destination.width <= 0 || destination.height <= 0)
+      return;
     constexpr float padding = 1.25f;
     const float emPaddingX = static_cast<float>(shape.width) / destination.width * padding;
     const float emPaddingY = static_cast<float>(shape.height) / destination.height * padding;
@@ -869,8 +1004,10 @@ struct VulkanRenderer::Impl {
     const float top = destination.y - padding;
     const float bottom = destination.y + destination.height + padding;
     const float shear = italicShear * destination.height;
-    if (right + std::max(shear, 0.0f) <= clip.x || left + std::min(shear, 0.0f) >= clip.x + clip.width ||
-        bottom <= clip.y || top >= clip.y + clip.height) return;
+    if (right + std::max(shear, 0.0f) <= clip.x ||
+        left + std::min(shear, 0.0f) >= clip.x + clip.width || bottom <= clip.y ||
+        top >= clip.y + clip.height)
+      return;
 
     Instance quad{};
     const float positionRect[4]{left, top, right, bottom};
@@ -885,7 +1022,8 @@ struct VulkanRenderer::Impl {
     quad.shapeData[1] = shape.bandTexY;
     quad.shapeData[2] = shape.bandMaxX;
     quad.shapeData[3] = shape.bandMaxY;
-    const float first[4]{paintValue.start.r, paintValue.start.g, paintValue.start.b, paintValue.start.a};
+    const float first[4]{paintValue.start.r, paintValue.start.g, paintValue.start.b,
+                         paintValue.start.a};
     const float second[4]{paintValue.end.r, paintValue.end.g, paintValue.end.b, paintValue.end.a};
     std::copy(std::begin(first), std::end(first), quad.color0);
     std::copy(std::begin(second), std::end(second), quad.color1);
@@ -907,48 +1045,51 @@ struct VulkanRenderer::Impl {
   void appendShape(std::vector<Instance>& instances, ShapeId id, Rect destination,
                    const Paint& paintValue, Rect clip, float italicShear = 0.0f) const {
     const auto shape = vectorAtlas.native().getShape(slughorn::Key(id));
-    if (shape) appendResolvedShape(instances, *shape, destination, paintValue, clip, italicShear);
+    if (shape)
+      appendResolvedShape(instances, *shape, destination, paintValue, clip, italicShear);
   }
 
-  void appendRoundedRect(std::vector<Instance>& instances, const RoundedRectCommand& command) const {
+  void appendRoundedRect(std::vector<Instance>& instances,
+                         const RoundedRectCommand& command) const {
     const Rect destination = command.destination;
-    if (destination.width <= 0.0f || destination.height <= 0.0f) return;
+    if (destination.width <= 0.0f || destination.height <= 0.0f)
+      return;
     constexpr float padding = 1.25f;
     const float left = destination.x - padding;
     const float top = destination.y - padding;
     const float right = destination.x + destination.width + padding;
     const float bottom = destination.y + destination.height + padding;
     if (right <= command.clip.x || left >= command.clip.x + command.clip.width ||
-        bottom <= command.clip.y || top >= command.clip.y + command.clip.height) return;
+        bottom <= command.clip.y || top >= command.clip.y + command.clip.height)
+      return;
 
     Instance quad{};
     const float positionRect[4]{left, top, right, bottom};
-    const float emRect[4]{-padding, -padding, destination.width + padding, destination.height + padding};
+    const float emRect[4]{-padding, -padding, destination.width + padding,
+                          destination.height + padding};
     std::copy(std::begin(positionRect), std::end(positionRect), quad.positionRect);
     std::copy(std::begin(emRect), std::end(emRect), quad.emRect);
     std::array<float, 4> radii{
-      std::max(command.radiiPx.topLeft, 0.0f),
-      std::max(command.radiiPx.topRight, 0.0f),
-      std::max(command.radiiPx.bottomRight, 0.0f),
-      std::max(command.radiiPx.bottomLeft, 0.0f)
-    };
+        std::max(command.radiiPx.topLeft, 0.0f), std::max(command.radiiPx.topRight, 0.0f),
+        std::max(command.radiiPx.bottomRight, 0.0f), std::max(command.radiiPx.bottomLeft, 0.0f)};
     // CSS-compatible normalization is used only when requested absolute radii cannot physically
     // fit. Otherwise every corner remains the exact authored pixel radius.
     float radiusScale = 1.0f;
     const auto fit = [&radiusScale](float available, float sum) {
-      if (sum > 0.0f) radiusScale = std::min(radiusScale, available / sum);
+      if (sum > 0.0f)
+        radiusScale = std::min(radiusScale, available / sum);
     };
     fit(destination.width, radii[0] + radii[1]);
     fit(destination.width, radii[3] + radii[2]);
     fit(destination.height, radii[0] + radii[3]);
     fit(destination.height, radii[1] + radii[2]);
-    for (float& radius : radii) radius *= std::clamp(radiusScale, 0.0f, 1.0f);
+    for (float& radius : radii)
+      radius *= std::clamp(radiusScale, 0.0f, 1.0f);
     const std::array<float, 4> smoothing{
-      std::clamp(command.continuousCorners.topLeftPercent, 0.0f, 100.0f),
-      std::clamp(command.continuousCorners.topRightPercent, 0.0f, 100.0f),
-      std::clamp(command.continuousCorners.bottomRightPercent, 0.0f, 100.0f),
-      std::clamp(command.continuousCorners.bottomLeftPercent, 0.0f, 100.0f)
-    };
+        std::clamp(command.continuousCorners.topLeftPercent, 0.0f, 100.0f),
+        std::clamp(command.continuousCorners.topRightPercent, 0.0f, 100.0f),
+        std::clamp(command.continuousCorners.bottomRightPercent, 0.0f, 100.0f),
+        std::clamp(command.continuousCorners.bottomLeftPercent, 0.0f, 100.0f)};
     quad.bandTransform[0] = destination.width;
     quad.bandTransform[1] = destination.height;
     quad.shapeData[0] = analyticRoundedRectShape;
@@ -957,8 +1098,10 @@ struct VulkanRenderer::Impl {
     quad.shapeData[1] = packFixed16(radii[0], radii[1], 16.0f, 4095.9375f);
     quad.shapeData[2] = packFixed16(radii[2], radii[3], 16.0f, 4095.9375f);
     quad.shapeData[3] = packFixed16(smoothing[0], smoothing[1], 256.0f, 100.0f);
-    const float first[4]{command.paint.start.r, command.paint.start.g, command.paint.start.b, command.paint.start.a};
-    const float second[4]{command.paint.end.r, command.paint.end.g, command.paint.end.b, command.paint.end.a};
+    const float first[4]{command.paint.start.r, command.paint.start.g, command.paint.start.b,
+                         command.paint.start.a};
+    const float second[4]{command.paint.end.r, command.paint.end.g, command.paint.end.b,
+                          command.paint.end.a};
     std::copy(std::begin(first), std::end(first), quad.color0);
     std::copy(std::begin(second), std::end(second), quad.color1);
     quad.paint[0] = static_cast<float>(command.paint.kind);
@@ -976,11 +1119,95 @@ struct VulkanRenderer::Impl {
     instances.push_back(quad);
   }
 
+  void appendStrokeSegment(std::vector<Instance>& instances, Vec2 from, Vec2 to,
+                           const CubicBezierCommand& command, bool firstSegment,
+                           bool lastSegment) const {
+    const float dx = to.x - from.x;
+    const float dy = to.y - from.y;
+    if (dx * dx + dy * dy <= 1.0e-8f)
+      return;
+
+    const float halfWidth = command.style.width * 0.5f;
+    constexpr float aaPadding = 1.5f;
+    const float padding = halfWidth + aaPadding;
+    const float left = std::min(from.x, to.x) - padding;
+    const float top = std::min(from.y, to.y) - padding;
+    const float right = std::max(from.x, to.x) + padding;
+    const float bottom = std::max(from.y, to.y) + padding;
+    if (right <= command.clip.x || left >= command.clip.x + command.clip.width ||
+        bottom <= command.clip.y || top >= command.clip.y + command.clip.height)
+      return;
+
+    Instance quad{};
+    const float positionRect[4]{left, top, right, bottom};
+    const float emRect[4]{left, top, right, bottom};
+    std::copy(std::begin(positionRect), std::end(positionRect), quad.positionRect);
+    std::copy(std::begin(emRect), std::end(emRect), quad.emRect);
+    quad.bandTransform[0] = from.x;
+    quad.bandTransform[1] = from.y;
+    quad.bandTransform[2] = to.x;
+    quad.bandTransform[3] = to.y;
+    quad.shapeData[0] = analyticStrokeSegmentShape;
+    const bool roundJoin = command.style.join == LineJoin::Round;
+    const bool roundStart = !firstSegment || roundJoin || command.style.cap == LineCap::Round;
+    const bool roundEnd = !lastSegment || roundJoin || command.style.cap == LineCap::Round;
+    quad.shapeData[1] = (roundStart ? 1U : 0U) | (roundEnd ? 2U : 0U);
+    const float first[4]{command.style.paint.start.r, command.style.paint.start.g,
+                         command.style.paint.start.b, command.style.paint.start.a};
+    const float second[4]{command.style.paint.end.r, command.style.paint.end.g,
+                          command.style.paint.end.b, command.style.paint.end.a};
+    std::copy(std::begin(first), std::end(first), quad.color0);
+    std::copy(std::begin(second), std::end(second), quad.color1);
+    quad.paint[0] = static_cast<float>(command.style.paint.kind);
+    quad.paint[1] = command.style.paint.opacity;
+    quad.paint[2] = command.style.paint.shaderParameter;
+    quad.paint[3] = command.style.width;
+    quad.gradient[0] = command.style.paint.origin.x;
+    quad.gradient[1] = command.style.paint.origin.y;
+    quad.gradient[2] = command.style.paint.target.x;
+    quad.gradient[3] = command.style.paint.target.y;
+    quad.clip[0] = command.clip.x;
+    quad.clip[1] = command.clip.y;
+    quad.clip[2] = command.clip.width;
+    quad.clip[3] = command.clip.height;
+    instances.push_back(quad);
+  }
+
+  void appendCubicBezier(std::vector<Instance>& instances,
+                         const CubicBezierCommand& command) const {
+    const auto length = [](Vec2 a, Vec2 b) { return std::hypot(b.x - a.x, b.y - a.y); };
+    const float controlPolygon = length(command.from, command.control1) +
+                                 length(command.control1, command.control2) +
+                                 length(command.control2, command.to);
+    const float chord = length(command.from, command.to);
+    const float curvature = std::max(0.0f, controlPolygon - chord);
+    const int segmentCount =
+        std::clamp(static_cast<int>(std::ceil(controlPolygon / 14.0f + curvature / 6.0f)), 4, 64);
+    const auto pointAt = [&](float t) {
+      const float u = 1.0f - t;
+      const float uu = u * u;
+      const float tt = t * t;
+      return Vec2{uu * u * command.from.x + 3.0f * uu * t * command.control1.x +
+                      3.0f * u * tt * command.control2.x + tt * t * command.to.x,
+                  uu * u * command.from.y + 3.0f * uu * t * command.control1.y +
+                      3.0f * u * tt * command.control2.y + tt * t * command.to.y};
+    };
+
+    Vec2 previous = command.from;
+    for (int index = 1; index <= segmentCount; ++index) {
+      const Vec2 current = pointAt(static_cast<float>(index) / static_cast<float>(segmentCount));
+      appendStrokeSegment(instances, previous, current, command, index == 1, index == segmentCount);
+      previous = current;
+    }
+  }
+
   float textWidth(const std::vector<std::uint32_t>& codepoints, const TextStyle& style) const {
     float width = 0.0f;
     for (auto codepoint : codepoints) {
-      const auto glyph = vectorAtlas.native().getShape(slughorn::Key(vectorAtlas.glyph(codepoint, style.fontName)));
-      width += (glyph ? static_cast<float>(glyph->advance) : 0.6f) * style.size + style.letterSpacing;
+      const auto glyph = vectorAtlas.native().getShape(
+          slughorn::Key(vectorAtlas.glyph(codepoint, style.fontName)));
+      width +=
+          (glyph ? static_cast<float>(glyph->advance) : 0.6f) * style.size + style.letterSpacing;
     }
     return std::max(0.0f, width - style.letterSpacing);
   }
@@ -1000,11 +1227,15 @@ struct VulkanRenderer::Impl {
     while (lineStart <= text.size()) {
       const std::size_t lineEnd = text.find('\n', lineStart);
       const std::string_view line(text.data() + lineStart,
-        (lineEnd == std::string::npos ? text.size() : lineEnd) - lineStart);
-      const float top = command.bounds.y + static_cast<float>(lineNumber) * command.style.size * command.style.lineHeight;
+                                  (lineEnd == std::string::npos ? text.size() : lineEnd) -
+                                      lineStart);
+      const float top = command.bounds.y + static_cast<float>(lineNumber) * command.style.size *
+                                               command.style.lineHeight;
       const float lineBottom = top + command.style.size * std::max(command.style.lineHeight, 1.25f);
-      if (lineBottom < command.clip.y || top - command.style.size * 0.5f > command.clip.y + command.clip.height) {
-        if (lineEnd == std::string::npos) break;
+      if (lineBottom < command.clip.y ||
+          top - command.style.size * 0.5f > command.clip.y + command.clip.height) {
+        if (lineEnd == std::string::npos)
+          break;
         lineStart = lineEnd + 1;
         ++lineNumber;
         continue;
@@ -1014,22 +1245,25 @@ struct VulkanRenderer::Impl {
                               command.style.underline || command.style.strikethrough;
       const float width = needsWidth ? textWidth(codepoints, command.style) : 0.0f;
       float x = command.bounds.x + command.style.indent;
-      if (command.style.align == HorizontalAlign::Center) x += (command.bounds.width - width) * 0.5f;
-      else if (command.style.align == HorizontalAlign::Right) x += command.bounds.width - width;
+      if (command.style.align == HorizontalAlign::Center)
+        x += (command.bounds.width - width) * 0.5f;
+      else if (command.style.align == HorizontalAlign::Right)
+        x += command.bounds.width - width;
       const float baseline = top + command.style.size;
       const float lineX = x;
       for (auto codepoint : codepoints) {
         const ShapeId glyphId = vectorAtlas.glyph(codepoint, command.style.fontName);
         const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
-        if (!glyph) { x += command.style.size * 0.6f + command.style.letterSpacing; continue; }
+        if (!glyph) {
+          x += command.style.size * 0.6f + command.style.letterSpacing;
+          continue;
+        }
         const float advance = static_cast<float>(glyph->advance) * command.style.size;
         if (glyph->width > 0 && glyph->height > 0) {
-          Rect destination{
-            x + static_cast<float>(glyph->bearingX) * command.style.size,
-            baseline - static_cast<float>(glyph->bearingY) * command.style.size,
-            static_cast<float>(glyph->width) * command.style.size,
-            static_cast<float>(glyph->height) * command.style.size
-          };
+          Rect destination{x + static_cast<float>(glyph->bearingX) * command.style.size,
+                           baseline - static_cast<float>(glyph->bearingY) * command.style.size,
+                           static_cast<float>(glyph->width) * command.style.size,
+                           static_cast<float>(glyph->height) * command.style.size};
           appendResolvedShape(instances, *glyph, destination, command.style.paint, command.clip,
                               command.style.italic ? 0.18f : 0.0f);
           if (command.style.bold) {
@@ -1041,29 +1275,36 @@ struct VulkanRenderer::Impl {
         x += advance + command.style.letterSpacing;
       }
       if (width > 0.0f && command.style.underline) {
-        Rect decoration{lineX, baseline + command.style.size * 0.07f, width, std::max(1.0f, command.style.size * 0.065f)};
+        Rect decoration{lineX, baseline + command.style.size * 0.07f, width,
+                        std::max(1.0f, command.style.size * 0.065f)};
         appendShape(instances, vectorAtlas.glyph('_', command.style.fontName), decoration,
                     command.style.paint, command.clip);
       }
       if (width > 0.0f && command.style.strikethrough) {
-        Rect decoration{lineX, baseline - command.style.size * 0.32f, width, std::max(1.0f, command.style.size * 0.06f)};
+        Rect decoration{lineX, baseline - command.style.size * 0.32f, width,
+                        std::max(1.0f, command.style.size * 0.06f)};
         appendShape(instances, vectorAtlas.glyph('-', command.style.fontName), decoration,
                     command.style.paint, command.clip);
       }
-      if (lineEnd == std::string::npos) break;
+      if (lineEnd == std::string::npos)
+        break;
       lineStart = lineEnd + 1;
       ++lineNumber;
     }
   }
 
   RetainedTextId createRetainedText(std::string_view utf8, Rect layoutBounds, TextStyle style) {
-    if (utf8.empty() || style.size <= 0.0f || layoutBounds.width <= 0.0f) return 0;
+    if (utf8.empty() || style.size <= 0.0f || layoutBounds.width <= 0.0f)
+      return 0;
     std::vector<Instance> instances;
-    TextCommand command{{}, utf8, layoutBounds,
+    TextCommand command{{},
+                        utf8,
+                        layoutBounds,
                         {-10000000.0f, -10000000.0f, 20000000.0f, 20000000.0f},
                         std::move(style)};
     appendText(instances, command);
-    if (instances.empty()) return 0;
+    if (instances.empty())
+      return 0;
 
     Buffer staging{};
     const VkDeviceSize byteCount = instances.size() * sizeof(Instance);
@@ -1086,8 +1327,8 @@ struct VulkanRenderer::Impl {
     readyForVertexInput.buffer = retained.instances.buffer;
     readyForVertexInput.size = byteCount;
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0,
-                         0, nullptr, 1, &readyForVertexInput, 0, nullptr);
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, nullptr, 1, &readyForVertexInput,
+                         0, nullptr);
     endSingleUse(commandBuffer);
     destroyBuffer(staging);
     retained.instanceCount = static_cast<std::uint32_t>(instances.size());
@@ -1103,9 +1344,11 @@ struct VulkanRenderer::Impl {
     const auto appendCommands = [&](const auto& commands) {
       for (const auto& display : commands) {
         if (const auto* retainedCommand = std::get_if<RetainedTextCommand>(&display)) {
-          if (retainedCommand->text == 0 || retainedCommand->text > retainedTexts.size()) continue;
+          if (retainedCommand->text == 0 || retainedCommand->text > retainedTexts.size())
+            continue;
           const RetainedText& retained = retainedTexts[retainedCommand->text - 1U];
-          if (retained.instanceCount == 0) continue;
+          if (retained.instanceCount == 0)
+            continue;
           drawBatches.push_back({retainedCommand->text, 0, retained.instanceCount,
                                  retainedCommand->position, retainedCommand->scale,
                                  retainedCommand->clip});
@@ -1113,14 +1356,17 @@ struct VulkanRenderer::Impl {
         }
         const std::size_t first = instances.size();
         if (const auto* shapeCommand = std::get_if<DrawCommand>(&display))
-          appendShape(instances, shapeCommand->shape, shapeCommand->destination, shapeCommand->paint,
-                      shapeCommand->clip, shapeCommand->italicShear);
+          appendShape(instances, shapeCommand->shape, shapeCommand->destination,
+                      shapeCommand->paint, shapeCommand->clip, shapeCommand->italicShear);
         else if (const auto* textCommand = std::get_if<TextCommand>(&display))
           appendText(instances, *textCommand);
         else if (const auto* roundedCommand = std::get_if<RoundedRectCommand>(&display))
           appendRoundedRect(instances, *roundedCommand);
+        else if (const auto* cubicCommand = std::get_if<CubicBezierCommand>(&display))
+          appendCubicBezier(instances, *cubicCommand);
         const std::uint32_t count = static_cast<std::uint32_t>(instances.size() - first);
-        if (count == 0) continue;
+        if (count == 0)
+          continue;
         if (!drawBatches.empty() && drawBatches.back().retainedText == 0 &&
             drawBatches.back().firstInstance + drawBatches.back().instanceCount == first) {
           drawBatches.back().instanceCount += count;
@@ -1134,12 +1380,15 @@ struct VulkanRenderer::Impl {
   }
 
   void ensureCapacity(Buffer& buffer, VkDeviceSize required, VkBufferUsageFlags usage) {
-    if (required <= buffer.size) return;
+    if (required <= buffer.size)
+      return;
     VkDeviceSize newSize = std::max<VkDeviceSize>(buffer.size, 4);
-    while (newSize < required) newSize *= 2;
+    while (newSize < required)
+      newSize *= 2;
     destroyBuffer(buffer);
-    createBuffer(newSize, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 buffer, true);
+    createBuffer(newSize, usage,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, buffer,
+                 true);
   }
 
   void record(VkCommandBuffer command, std::uint32_t imageIndex, Frame& frame) {
@@ -1149,7 +1398,8 @@ struct VulkanRenderer::Impl {
       vkCmdResetQueryPool(command, frame.timestamps, 0, 2);
       vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame.timestamps, 0);
     }
-    VkClearValue clear{{{config.clearColor.r, config.clearColor.g, config.clearColor.b, config.clearColor.a}}};
+    VkClearValue clear{
+        {{config.clearColor.r, config.clearColor.g, config.clearColor.b, config.clearColor.a}}};
     VkRenderPassBeginInfo render{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     render.renderPass = renderPass;
     render.framebuffer = framebuffers[imageIndex];
@@ -1159,20 +1409,27 @@ struct VulkanRenderer::Impl {
     vkCmdBeginRenderPass(command, &render, VK_SUBPASS_CONTENTS_INLINE);
     if (!drawBatches.empty()) {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-      VkViewport viewport{0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
+      VkViewport viewport{
+          0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height),
+          0.0f, 1.0f};
       vkCmdSetViewport(command, 0, 1, &viewport);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
+                              &descriptorSet, 0, nullptr);
       const VkDeviceSize offset = 0;
       for (const DrawBatch& batch : drawBatches) {
         const bool retained = batch.retainedText != 0;
-        const Buffer& buffer = retained ? retainedTexts[batch.retainedText - 1U].instances : frame.instances;
+        const Buffer& buffer =
+            retained ? retainedTexts[batch.retainedText - 1U].instances : frame.instances;
         VkRect2D scissor{{0, 0}, extent};
         if (retained) {
           const float left = std::clamp(batch.clip.x, 0.0f, static_cast<float>(extent.width));
           const float top = std::clamp(batch.clip.y, 0.0f, static_cast<float>(extent.height));
-          const float right = std::clamp(batch.clip.x + batch.clip.width, left, static_cast<float>(extent.width));
-          const float bottom = std::clamp(batch.clip.y + batch.clip.height, top, static_cast<float>(extent.height));
-          if (right <= left || bottom <= top) continue;
+          const float right =
+              std::clamp(batch.clip.x + batch.clip.width, left, static_cast<float>(extent.width));
+          const float bottom =
+              std::clamp(batch.clip.y + batch.clip.height, top, static_cast<float>(extent.height));
+          if (right <= left || bottom <= top)
+            continue;
           scissor.offset = {static_cast<std::int32_t>(std::floor(left)),
                             static_cast<std::int32_t>(std::floor(top))};
           scissor.extent = {static_cast<std::uint32_t>(std::ceil(right) - std::floor(left)),
@@ -1185,7 +1442,8 @@ struct VulkanRenderer::Impl {
                            {retained ? batch.translation.x : 0.0f,
                             retained ? batch.translation.y : 0.0f, retained ? 1.0f : 0.0f, 0.0f},
                            {batch.clip.x, batch.clip.y, batch.clip.width, batch.clip.height}};
-        vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+        vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push),
+                           &push);
         vkCmdDraw(command, 6, batch.instanceCount, 0, retained ? 0 : batch.firstInstance);
       }
     }
@@ -1196,30 +1454,33 @@ struct VulkanRenderer::Impl {
   }
 
   void prepareFrame() {
-    if (framePrepared) return;
-    const Vec2 framebuffer = window.framebufferSize();
+    if (framePrepared)
+      return;
+    const Vec2 framebuffer = platformSurface.framebufferSize();
     if (framebuffer.x > 0.0f && framebuffer.y > 0.0f &&
         (static_cast<std::uint32_t>(framebuffer.x) != extent.width ||
          static_cast<std::uint32_t>(framebuffer.y) != extent.height))
       recreateSwapchain();
     while (!framePrepared) {
       Frame& frame = frames[currentFrame];
-      check(vkWaitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(frame)");
+      check(vkWaitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX),
+            "vkWaitForFences(frame)");
       if (frame.timestamps && frame.timestampsWritten) {
         std::uint64_t ticks[2]{};
         check(vkGetQueryPoolResults(device, frame.timestamps, 0, 2, sizeof(ticks), ticks,
-                                    sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+                                    sizeof(std::uint64_t),
+                                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
               "vkGetQueryPoolResults(timestamp)");
-        const std::uint64_t timestampMask = timestampValidBits >= 64 ? ~std::uint64_t{0} :
-          (std::uint64_t{1} << timestampValidBits) - 1;
+        const std::uint64_t timestampMask = timestampValidBits >= 64
+                                                ? ~std::uint64_t{0}
+                                                : (std::uint64_t{1} << timestampValidBits) - 1;
         const std::uint64_t elapsedTicks = (ticks[1] - ticks[0]) & timestampMask;
         statistics.gpuMilliseconds = static_cast<float>(elapsedTicks) *
-          deviceProperties.limits.timestampPeriod / 1'000'000.0f;
+                                     deviceProperties.limits.timestampPeriod / 1'000'000.0f;
         frame.timestampsWritten = false;
       }
-      preparedAcquireResult = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
-                                                     frame.imageAvailable, VK_NULL_HANDLE,
-                                                     &preparedImageIndex);
+      preparedAcquireResult = vkAcquireNextImageKHR(
+          device, swapchain, UINT64_MAX, frame.imageAvailable, VK_NULL_HANDLE, &preparedImageIndex);
       if (preparedAcquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
         recreateSwapchain();
         continue;
@@ -1239,13 +1500,15 @@ struct VulkanRenderer::Impl {
     stagingInstances.clear();
     buildMesh(list, stagingInstances);
     const auto cpuBuildEnd = std::chrono::steady_clock::now();
-    ensureCapacity(frame.instances, stagingInstances.size() * sizeof(Instance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    ensureCapacity(frame.instances, stagingInstances.size() * sizeof(Instance),
+                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     if (!stagingInstances.empty())
-      std::memcpy(frame.instances.mapped, stagingInstances.data(), stagingInstances.size() * sizeof(Instance));
+      std::memcpy(frame.instances.mapped, stagingInstances.data(),
+                  stagingInstances.size() * sizeof(Instance));
     const auto cpuUploadEnd = std::chrono::steady_clock::now();
 
     frame.writeTimestamps = config.gpuTimingInterval > 0 && frame.timestamps != VK_NULL_HANDLE &&
-      submittedFrameCount % config.gpuTimingInterval == 0;
+                            submittedFrameCount % config.gpuTimingInterval == 0;
     check(vkResetFences(device, 1, &frame.fence), "vkResetFences");
     check(vkResetCommandBuffer(commandBuffers[currentFrame], 0), "vkResetCommandBuffer");
     record(commandBuffers[currentFrame], imageIndex, frame);
@@ -1275,76 +1538,109 @@ struct VulkanRenderer::Impl {
 
     std::uint32_t retainedQuadCount = 0;
     for (const DrawBatch& batch : drawBatches)
-      if (batch.retainedText != 0) retainedQuadCount += batch.instanceCount;
+      if (batch.retainedText != 0)
+        retainedQuadCount += batch.instanceCount;
     statistics.quads = static_cast<std::uint32_t>(stagingInstances.size()) + retainedQuadCount;
     statistics.retainedQuads = retainedQuadCount;
     statistics.drawCalls = static_cast<std::uint32_t>(drawBatches.size());
     statistics.uploadedBytes = stagingInstances.size() * sizeof(Instance);
     statistics.cpuBuildMilliseconds =
-      std::chrono::duration<float, std::milli>(cpuBuildEnd - cpuBuildStart).count();
+        std::chrono::duration<float, std::milli>(cpuBuildEnd - cpuBuildStart).count();
     statistics.cpuUploadMilliseconds =
-      std::chrono::duration<float, std::milli>(cpuUploadEnd - cpuBuildEnd).count();
+        std::chrono::duration<float, std::milli>(cpuUploadEnd - cpuBuildEnd).count();
     statistics.cpuSubmitMilliseconds =
-      std::chrono::duration<float, std::milli>(cpuSubmitEnd - cpuUploadEnd).count();
+        std::chrono::duration<float, std::milli>(cpuSubmitEnd - cpuUploadEnd).count();
     ++submittedFrameCount;
     framePrepared = false;
     currentFrame = (currentFrame + 1) % framesInFlight;
-    if (needsRecreate) recreateSwapchain();
+    if (needsRecreate)
+      recreateSwapchain();
   }
 
   void destroy() noexcept {
-    if (device) vkDeviceWaitIdle(device);
+    if (device)
+      vkDeviceWaitIdle(device);
     if (device) {
-      for (auto& retained : retainedTexts) destroyBuffer(retained.instances);
+      for (auto& retained : retainedTexts)
+        destroyBuffer(retained.instances);
       retainedTexts.clear();
       for (auto& frame : frames) {
         destroyBuffer(frame.instances);
-        if (frame.timestamps) vkDestroyQueryPool(device, frame.timestamps, nullptr);
-        if (frame.imageAvailable) vkDestroySemaphore(device, frame.imageAvailable, nullptr);
-        if (frame.fence) vkDestroyFence(device, frame.fence, nullptr);
+        if (frame.timestamps)
+          vkDestroyQueryPool(device, frame.timestamps, nullptr);
+        if (frame.imageAvailable)
+          vkDestroySemaphore(device, frame.imageAvailable, nullptr);
+        if (frame.fence)
+          vkDestroyFence(device, frame.fence, nullptr);
         frame = {};
       }
       destroySwapchainResources();
-      if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-      if (descriptorSetLayout) vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
-      if (sampler) vkDestroySampler(device, sampler, nullptr);
+      if (descriptorPool)
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+      if (descriptorSetLayout)
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+      if (sampler)
+        vkDestroySampler(device, sampler, nullptr);
       destroyTexture(curveTexture);
       destroyTexture(bandTexture);
-      if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
+      if (commandPool)
+        vkDestroyCommandPool(device, commandPool, nullptr);
       vkDestroyDevice(device, nullptr);
       device = VK_NULL_HANDLE;
     }
-    if (surface && instance) vkDestroySurfaceKHR(instance, surface, nullptr);
+    if (surface && instance)
+      vkDestroySurfaceKHR(instance, surface, nullptr);
     surface = VK_NULL_HANDLE;
     if (debugMessenger && instance) {
       auto destroyDebug = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
-        vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
-      if (destroyDebug) destroyDebug(instance, debugMessenger, nullptr);
+          vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
+      if (destroyDebug)
+        destroyDebug(instance, debugMessenger, nullptr);
     }
     debugMessenger = VK_NULL_HANDLE;
-    if (instance) vkDestroyInstance(instance, nullptr);
+    if (instance)
+      vkDestroyInstance(instance, nullptr);
     instance = VK_NULL_HANDLE;
   }
 };
 
-VulkanRenderer::VulkanRenderer(Window& window, const VectorAtlas& atlas, const RendererConfig& config)
-  : impl_(std::make_unique<Impl>(window, atlas, config)) {}
+VulkanRenderer::VulkanRenderer(PlatformSurface& surface, const VectorAtlas& atlas,
+                               const RendererConfig& config)
+    : impl_(std::make_unique<Impl>(surface, atlas, config)) {}
+VulkanRenderer::VulkanRenderer(Window& window, const VectorAtlas& atlas,
+                               const RendererConfig& config)
+    : impl_(std::make_unique<Impl>(std::make_unique<GlfwPlatformSurface>(window), atlas, config)) {}
 VulkanRenderer::~VulkanRenderer() = default;
-void VulkanRenderer::prepareFrame() { impl_->prepareFrame(); }
+void VulkanRenderer::prepareFrame() {
+  impl_->prepareFrame();
+}
 RetainedTextId VulkanRenderer::createRetainedText(std::string_view utf8, Rect layoutBounds,
                                                   TextStyle style) {
   return impl_->createRetainedText(utf8, layoutBounds, std::move(style));
 }
-void VulkanRenderer::draw(const DrawList& list) { impl_->draw(list); }
-void VulkanRenderer::waitIdle() { if (impl_->device) vkDeviceWaitIdle(impl_->device); }
-RendererStats VulkanRenderer::stats() const { return impl_->statistics; }
-const char* VulkanRenderer::deviceName() const { return impl_->deviceProperties.deviceName; }
+void VulkanRenderer::draw(const DrawList& list) {
+  impl_->draw(list);
+}
+void VulkanRenderer::waitIdle() {
+  if (impl_->device)
+    vkDeviceWaitIdle(impl_->device);
+}
+RendererStats VulkanRenderer::stats() const {
+  return impl_->statistics;
+}
+const char* VulkanRenderer::deviceName() const {
+  return impl_->deviceProperties.deviceName;
+}
 const char* VulkanRenderer::presentModeName() const {
   switch (impl_->swapchainPresentMode) {
-    case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE";
-    case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
-    case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
-    default: return "FIFO";
+  case VK_PRESENT_MODE_IMMEDIATE_KHR:
+    return "IMMEDIATE";
+  case VK_PRESENT_MODE_MAILBOX_KHR:
+    return "MAILBOX";
+  case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+    return "FIFO_RELAXED";
+  default:
+    return "FIFO";
   }
 }
 

@@ -21,6 +21,7 @@ layout(location = 0) out vec4 outColor;
 
 const int indirectionSize = 32;
 const uint analyticRoundedRectShape = 0xFFFFFFFFu;
+const uint analyticStrokeSegmentShape = 0xFFFFFFFEu;
 
 vec2 unpackFixed16(uint packed, float scale) {
   return vec2(float(packed & 0xFFFFu), float(packed >> 16u)) / scale;
@@ -31,28 +32,58 @@ float roundedRectCoverage(vec2 point, vec4 metrics) {
   vec4 radii = vec4(unpackFixed16(shapeData.y, 16.0), unpackFixed16(shapeData.z, 16.0));
   vec4 smoothing = vec4(unpackFixed16(shapeData.w, 256.0),
                         unpackFixed16(floatBitsToUint(paintData.w), 256.0));
-  int cornerIndex = -1;
-  if (point.x < radii.x && point.y < radii.x) cornerIndex = 0;
-  else if (point.x > size.x - radii.y && point.y < radii.y) cornerIndex = 1;
-  else if (point.x > size.x - radii.z && point.y > size.y - radii.z) cornerIndex = 2;
-  else if (point.x < radii.w && point.y > size.y - radii.w) cornerIndex = 3;
-  if (cornerIndex < 0) {
-    vec2 halfSize = size * 0.5;
-    vec2 q = abs(point - halfSize) - halfSize;
-    float distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
-    float aa = max(fwidth(distance), 0.0001);
-    return 1.0 - smoothstep(-aa, aa, distance);
-  }
-  float radius = radii[cornerIndex];
-  vec2 center = cornerIndex == 0 ? vec2(radius, radius)
-    : cornerIndex == 1 ? vec2(size.x - radius, radius)
-    : cornerIndex == 2 ? vec2(size.x - radius, size.y - radius)
-    : vec2(radius, size.y - radius);
-  vec2 corner = abs(point - center) / max(radius, 0.0001);
+  vec2 halfSize = size * 0.5;
+  bool right = point.x >= halfSize.x;
+  bool bottom = point.y >= halfSize.y;
+  int cornerIndex = bottom ? (right ? 2 : 3) : (right ? 1 : 0);
+  float encodedRadius = radii[cornerIndex];
+  float radius = max(encodedRadius, 0.5);
+
+  // One continuous implicit curve covers both straight edges and corners. The
+  // previous corner/non-corner branch evaluated fwidth() in divergent control
+  // flow, which produced a visible AA seam at the exact edge/corner tangent.
+  vec2 corner = max(abs(point - halfSize) - (halfSize - vec2(radius)), 0.0) / radius;
   float exponent = mix(2.0, 5.0, clamp(smoothing[cornerIndex] * 0.01, 0.0, 1.0));
   float implicitCurve = pow(corner.x, exponent) + pow(corner.y, exponent) - 1.0;
-  float aa = max(fwidth(implicitCurve), 0.0001);
-  return 1.0 - smoothstep(-aa, aa, implicitCurve);
+  float roundedAA = max(fwidth(implicitCurve), 0.0001);
+  float roundedCoverage = 1.0 - smoothstep(-roundedAA, roundedAA, implicitCurve);
+
+  // Preserve exact zero-radius rectangles without evaluating a near-zero
+  // radius derivative. Both paths are derivative-safe and the flat radius
+  // selector changes only between quadrants, where their straight edges agree.
+  vec2 rectangleQ = abs(point - halfSize) - halfSize;
+  float rectangleDistance =
+    length(max(rectangleQ, 0.0)) + min(max(rectangleQ.x, rectangleQ.y), 0.0);
+  float rectangleAA = max(fwidth(rectangleDistance), 0.0001);
+  float rectangleCoverage =
+    1.0 - smoothstep(-rectangleAA, rectangleAA, rectangleDistance);
+  return mix(rectangleCoverage, roundedCoverage, step(0.5, encodedRadius));
+}
+
+float strokeSegmentCoverage(vec2 point, vec4 endpoints) {
+  vec2 from = endpoints.xy;
+  vec2 to = endpoints.zw;
+  vec2 axis = to - from;
+  float axisLength = max(length(axis), 0.0001);
+  vec2 tangent = axis / axisLength;
+  vec2 normal = vec2(-tangent.y, tangent.x);
+  vec2 local = vec2(dot(point - from, tangent), dot(point - from, normal));
+  float halfWidth = max(paintData.w * 0.5, 0.0001);
+  bool roundStart = (shapeData.y & 1u) != 0u;
+  bool roundEnd = (shapeData.y & 2u) != 0u;
+
+  float distance;
+  if (local.x < 0.0 && roundStart) {
+    distance = length(local) - halfWidth;
+  } else if (local.x > axisLength && roundEnd) {
+    distance = length(vec2(local.x - axisLength, local.y)) - halfWidth;
+  } else {
+    vec2 q = vec2(max(max(-local.x, local.x - axisLength), 0.0),
+                  abs(local.y) - halfWidth);
+    distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+  }
+  float aa = max(fwidth(distance), 0.0001);
+  return 1.0 - smoothstep(-aa, aa, distance);
 }
 
 uint calcRootCode(float y1, float y2, float y3) {
@@ -185,8 +216,12 @@ void main() {
   if (gl_FragCoord.x < clipRect.x || gl_FragCoord.y < clipRect.y ||
       gl_FragCoord.x >= clipRect.x + clipRect.z || gl_FragCoord.y >= clipRect.y + clipRect.w) discard;
   float coverage;
-  if (shapeData.x == analyticRoundedRectShape) coverage = roundedRectCoverage(emCoord, bandTransform);
-  else coverage = slugCoverage(emCoord);
+  if (shapeData.x == analyticRoundedRectShape)
+    coverage = roundedRectCoverage(emCoord, bandTransform);
+  else if (shapeData.x == analyticStrokeSegmentShape)
+    coverage = strokeSegmentCoverage(emCoord, bandTransform);
+  else
+    coverage = slugCoverage(emCoord);
   if (coverage <= 0.001) discard;
   vec4 color = evaluatePaint();
   color.a *= coverage * paintData.y;

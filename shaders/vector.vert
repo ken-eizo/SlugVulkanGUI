@@ -27,12 +27,14 @@ layout(location = 7) flat out vec4 gradientData;
 layout(location = 8) flat out vec4 clipRect;
 
 void main() {
+  const uint analyticStrokeSegmentShape = 0xFFFFFFFEu;
   const vec2 corners[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0),
     vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
   vec2 corner = corners[gl_VertexIndex];
   vec2 positionPx = mix(inPositionRect.xy, inPositionRect.zw, corner);
-  if (inShapeData.x != 0xFFFFFFFFu) positionPx.x += inPaint.w * (1.0 - corner.y);
+  if (inShapeData.x < analyticStrokeSegmentShape)
+    positionPx.x += inPaint.w * (1.0 - corner.y);
   positionPx = positionPx * pushConstants.viewportScale.zw + pushConstants.translationOverride.xy;
   vec2 ndc = vec2(
     positionPx.x * 2.0 / pushConstants.viewportScale.x - 1.0,

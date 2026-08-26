@@ -102,7 +102,7 @@ add_library(SlugVulkan::slugvk ALIAS slugvk)
 add_dependencies(slugvk slugvk_shaders)
 target_include_directories(slugvk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
                                   PRIVATE "${SLUGVK_GENERATED_DIR}")
-target_link_libraries(slugvk PUBLIC slughorn PRIVATE Vulkan::Vulkan glfw)
+target_link_libraries(slugvk PUBLIC slughorn Vulkan::Vulkan PRIVATE glfw)
 target_compile_definitions(slugvk PRIVATE
   $<$<BOOL:${SLUGVK_ENABLE_VALIDATION}>:SLUGVK_ENABLE_VALIDATION=1>
 )

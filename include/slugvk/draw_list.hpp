@@ -36,6 +36,19 @@ struct RoundedRectCommand {
   Paint paint = {};
 };
 
+// A screen-space cubic stroke. Unlike an atlas ShapeId, its control points stay in the
+// destination coordinate system, so resizing a panel never anisotropically stretches one
+// pre-rasterized curve. VulkanRenderer adaptively tessellates the cubic into analytic AA
+// segments at frame-build time.
+struct CubicBezierCommand {
+  Vec2 from = {};
+  Vec2 control1 = {};
+  Vec2 control2 = {};
+  Vec2 to = {};
+  Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
+  StrokeStyle style = {};
+};
+
 struct RetainedTextCommand {
   RetainedTextId text = 0;
   Vec2 position = {};
@@ -43,23 +56,38 @@ struct RetainedTextCommand {
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
 };
 
-using DisplayCommand = std::variant<DrawCommand, TextCommand, RoundedRectCommand, RetainedTextCommand>;
+using DisplayCommand = std::variant<DrawCommand, TextCommand, RoundedRectCommand,
+                                    CubicBezierCommand, RetainedTextCommand>;
 
 class DrawList {
 public:
   void clear();
-  void setClip(Rect clip) { clip_ = clip; }
-  [[nodiscard]] Rect clip() const { return clip_; }
+  void setClip(Rect clip) {
+    clip_ = clip;
+  }
+  [[nodiscard]] Rect clip() const {
+    return clip_;
+  }
 
   // Overlay commands are emitted after all regular commands while staying in the same GPU batch.
-  void beginOverlay() { overlayMode_ = true; }
-  void endOverlay() { overlayMode_ = false; }
-  [[nodiscard]] bool overlayMode() const { return overlayMode_; }
+  void beginOverlay() {
+    overlayMode_ = true;
+  }
+  void endOverlay() {
+    overlayMode_ = false;
+  }
+  [[nodiscard]] bool overlayMode() const {
+    return overlayMode_;
+  }
 
   void shape(ShapeId shape, Rect destination, Paint paint);
   void shape(ShapeId shape, Rect destination, Paint paint, Rect clip);
-  void fill(ShapeId shape, Rect destination, Paint paint) { this->shape(shape, destination, paint); }
-  void stroke(ShapeId shape, Rect destination, Paint paint) { this->shape(shape, destination, paint); }
+  void fill(ShapeId shape, Rect destination, Paint paint) {
+    this->shape(shape, destination, paint);
+  }
+  void stroke(ShapeId shape, Rect destination, Paint paint) {
+    this->shape(shape, destination, paint);
+  }
   void stroke(ShapeId shape, Rect destination, const StrokeStyle& style) {
     this->shape(shape, destination, style.paint);
   }
@@ -70,6 +98,7 @@ public:
   // differs. Radii remain absolute framebuffer pixels after destination sizing.
   void roundedRect(Rect destination, CornerRadii radiiPx, Paint paint,
                    CornerSmoothing continuousCorners = {});
+  void cubicBezier(Vec2 from, Vec2 control1, Vec2 control2, Vec2 to, StrokeStyle style);
   void text(std::string utf8, Rect bounds, TextStyle style);
   // The referenced bytes must remain alive until VulkanRenderer::draw() returns.
   void textStatic(std::string_view utf8, Rect bounds, TextStyle style);
@@ -77,8 +106,12 @@ public:
   // clip are dynamic, so zoom/pan does not relayout or upload the document.
   void retainedText(RetainedTextId text, Vec2 position, float scale);
 
-  [[nodiscard]] const std::vector<DisplayCommand>& commands() const { return commands_; }
-  [[nodiscard]] const std::vector<DisplayCommand>& overlayCommands() const { return overlayCommands_; }
+  [[nodiscard]] const std::vector<DisplayCommand>& commands() const {
+    return commands_;
+  }
+  [[nodiscard]] const std::vector<DisplayCommand>& overlayCommands() const {
+    return overlayCommands_;
+  }
 
 private:
   Rect clip_ = {0.0f, 0.0f, 100000.0f, 100000.0f};

@@ -10,6 +10,7 @@ namespace slugvk {
 
 class VectorAtlas;
 class Window;
+class PlatformSurface;
 
 struct RendererConfig {
   Color clearColor = Color::fromRgb8(0x0b1020);
@@ -37,6 +38,8 @@ struct RendererStats {
 
 class VulkanRenderer {
 public:
+  VulkanRenderer(PlatformSurface& surface, const VectorAtlas& atlas,
+                 const RendererConfig& config = {});
   VulkanRenderer(Window& window, const VectorAtlas& atlas, const RendererConfig& config = {});
   ~VulkanRenderer();
   VulkanRenderer(const VulkanRenderer&) = delete;
