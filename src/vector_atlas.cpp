@@ -4,7 +4,9 @@
 #include "slughorn/freetype.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -183,6 +185,228 @@ Path& Path::quadraticTo(float cx, float cy, float x, float y) {
 }
 Path& Path::cubicTo(float c1x, float c1y, float c2x, float c2y, float x, float y) {
   impl_->value.bezierTo(sv(c1x), sv(c1y), sv(c2x), sv(c2y), sv(x), sv(y)); return *this;
+}
+
+Path& Path::svgPath(std::string_view data, float viewBoxHeight) {
+  struct Parser {
+    Path& output;
+    std::string source;
+    const char* cursor = nullptr;
+    const char* end = nullptr;
+    Vec2 current{};
+    Vec2 subpath{};
+    Vec2 lastCubicControl{};
+    Vec2 lastQuadraticControl{};
+    char command = 0;
+    char previousCommand = 0;
+    float invertHeight = 0.0f;
+
+    explicit Parser(Path& target, std::string_view value, float height)
+        : output(target), source(value), cursor(source.c_str()), end(cursor + source.size()),
+          current{0.0f, height > 0.0f ? height : 0.0f},
+          subpath(current), invertHeight(height) {}
+
+    [[noreturn]] void fail() const { throw std::invalid_argument("Invalid SVG path data"); }
+    void separators() {
+      while (cursor < end && (std::isspace(static_cast<unsigned char>(*cursor)) || *cursor == ','))
+        ++cursor;
+    }
+    bool hasNumber() {
+      separators();
+      return cursor < end && (*cursor == '+' || *cursor == '-' || *cursor == '.' ||
+                              std::isdigit(static_cast<unsigned char>(*cursor)));
+    }
+    float number() {
+      separators();
+      if (cursor >= end) fail();
+      char* parsed = nullptr;
+      const float value = std::strtof(cursor, &parsed);
+      if (parsed == cursor || parsed > end || !std::isfinite(value)) fail();
+      cursor = parsed;
+      return value;
+    }
+    Vec2 point(bool relative) {
+      Vec2 value{number(), number()};
+      if (relative) {
+        value.x += current.x;
+        value.y = current.y + (invertHeight > 0.0f ? -value.y : value.y);
+      } else if (invertHeight > 0.0f) {
+        value.y = invertHeight - value.y;
+      }
+      return value;
+    }
+    static float vectorAngle(float ux, float uy, float vx, float vy) {
+      return std::atan2(ux * vy - uy * vx, ux * vx + uy * vy);
+    }
+    void arc(float rx, float ry, float rotationDegrees, bool largeArc, bool sweep, Vec2 target) {
+      rx = std::abs(rx);
+      ry = std::abs(ry);
+      if (rx <= 1.0e-6f || ry <= 1.0e-6f ||
+          (std::abs(target.x - current.x) <= 1.0e-6f &&
+           std::abs(target.y - current.y) <= 1.0e-6f)) {
+        output.lineTo(target.x, target.y);
+        current = target;
+        return;
+      }
+      const float phi = rotationDegrees * pi / 180.0f;
+      const float cosPhi = std::cos(phi);
+      const float sinPhi = std::sin(phi);
+      const float dx = (current.x - target.x) * 0.5f;
+      const float dy = (current.y - target.y) * 0.5f;
+      const float x1 = cosPhi * dx + sinPhi * dy;
+      const float y1 = -sinPhi * dx + cosPhi * dy;
+      float radiiScale = x1 * x1 / (rx * rx) + y1 * y1 / (ry * ry);
+      if (radiiScale > 1.0f) {
+        radiiScale = std::sqrt(radiiScale);
+        rx *= radiiScale;
+        ry *= radiiScale;
+      }
+      const float rx2 = rx * rx;
+      const float ry2 = ry * ry;
+      const float numerator =
+          std::max(0.0f, rx2 * ry2 - rx2 * y1 * y1 - ry2 * x1 * x1);
+      const float denominator =
+          std::max(1.0e-12f, rx2 * y1 * y1 + ry2 * x1 * x1);
+      const float coefficient =
+          (largeArc == sweep ? -1.0f : 1.0f) * std::sqrt(numerator / denominator);
+      const float cx1 = coefficient * (rx * y1 / ry);
+      const float cy1 = coefficient * (-ry * x1 / rx);
+      const float centerX =
+          cosPhi * cx1 - sinPhi * cy1 + (current.x + target.x) * 0.5f;
+      const float centerY =
+          sinPhi * cx1 + cosPhi * cy1 + (current.y + target.y) * 0.5f;
+      const float ux = (x1 - cx1) / rx;
+      const float uy = (y1 - cy1) / ry;
+      const float vx = (-x1 - cx1) / rx;
+      const float vy = (-y1 - cy1) / ry;
+      const float startAngle = vectorAngle(1.0f, 0.0f, ux, uy);
+      float sweepAngle = vectorAngle(ux, uy, vx, vy);
+      if (!sweep && sweepAngle > 0.0f) sweepAngle -= 2.0f * pi;
+      if (sweep && sweepAngle < 0.0f) sweepAngle += 2.0f * pi;
+      const int segments = std::max(
+          1, static_cast<int>(std::ceil(std::abs(sweepAngle) / (pi * 0.5f))));
+      const float step = sweepAngle / static_cast<float>(segments);
+      const auto mapped = [&](float x, float y) {
+        return Vec2{centerX + cosPhi * rx * x - sinPhi * ry * y,
+                    centerY + sinPhi * rx * x + cosPhi * ry * y};
+      };
+      for (int index = 0; index < segments; ++index) {
+        const float a0 = startAngle + step * static_cast<float>(index);
+        const float a1 = a0 + step;
+        const float alpha = 4.0f / 3.0f * std::tan((a1 - a0) * 0.25f);
+        const float x0 = std::cos(a0);
+        const float y0 = std::sin(a0);
+        const float x1Unit = std::cos(a1);
+        const float y1Unit = std::sin(a1);
+        const Vec2 c1 = mapped(x0 - alpha * y0, y0 + alpha * x0);
+        const Vec2 c2 = mapped(x1Unit + alpha * y1Unit, y1Unit - alpha * x1Unit);
+        const Vec2 endpoint =
+            index + 1 == segments ? target : mapped(x1Unit, y1Unit);
+        output.cubicTo(c1.x, c1.y, c2.x, c2.y, endpoint.x, endpoint.y);
+      }
+      current = target;
+    }
+    void parse() {
+      while (true) {
+        separators();
+        if (cursor >= end) return;
+        if (std::isalpha(static_cast<unsigned char>(*cursor))) command = *cursor++;
+        else if (command == 0) fail();
+        const bool relative =
+            std::islower(static_cast<unsigned char>(command)) != 0;
+        const char upper =
+            static_cast<char>(std::toupper(static_cast<unsigned char>(command)));
+        if (upper == 'Z') {
+          output.close();
+          current = subpath;
+          previousCommand = command;
+          command = 0;
+          continue;
+        }
+        bool first = true;
+        while (hasNumber()) {
+          if (upper == 'M') {
+            const Vec2 target = point(relative);
+            if (first) {
+              output.moveTo(target.x, target.y);
+              subpath = target;
+            } else {
+              output.lineTo(target.x, target.y);
+            }
+            current = target;
+          } else if (upper == 'L') {
+            current = point(relative);
+            output.lineTo(current.x, current.y);
+          } else if (upper == 'H') {
+            float x = number();
+            if (relative) x += current.x;
+            current.x = x;
+            output.lineTo(current.x, current.y);
+          } else if (upper == 'V') {
+            float y = number();
+            if (relative)
+              y = current.y + (invertHeight > 0.0f ? -y : y);
+            else if (invertHeight > 0.0f)
+              y = invertHeight - y;
+            current.y = y;
+            output.lineTo(current.x, current.y);
+          } else if (upper == 'C') {
+            const Vec2 c1 = point(relative);
+            const Vec2 c2 = point(relative);
+            const Vec2 target = point(relative);
+            output.cubicTo(c1.x, c1.y, c2.x, c2.y, target.x, target.y);
+            current = target;
+            lastCubicControl = c2;
+          } else if (upper == 'S') {
+            const bool smooth =
+                previousCommand == 'C' || previousCommand == 'c' ||
+                previousCommand == 'S' || previousCommand == 's';
+            const Vec2 c1 = smooth ? current * 2.0f - lastCubicControl : current;
+            const Vec2 c2 = point(relative);
+            const Vec2 target = point(relative);
+            output.cubicTo(c1.x, c1.y, c2.x, c2.y, target.x, target.y);
+            current = target;
+            lastCubicControl = c2;
+          } else if (upper == 'Q') {
+            const Vec2 control = point(relative);
+            const Vec2 target = point(relative);
+            output.quadraticTo(control.x, control.y, target.x, target.y);
+            current = target;
+            lastQuadraticControl = control;
+          } else if (upper == 'T') {
+            const bool smooth =
+                previousCommand == 'Q' || previousCommand == 'q' ||
+                previousCommand == 'T' || previousCommand == 't';
+            const Vec2 control =
+                smooth ? current * 2.0f - lastQuadraticControl : current;
+            const Vec2 target = point(relative);
+            output.quadraticTo(control.x, control.y, target.x, target.y);
+            current = target;
+            lastQuadraticControl = control;
+          } else if (upper == 'A') {
+            const float rx = number();
+            const float ry = number();
+            const float rotation = number();
+            const bool largeArc = number() != 0.0f;
+            const bool sweep = number() != 0.0f;
+            const Vec2 target = point(relative);
+            arc(rx, ry, invertHeight > 0.0f ? -rotation : rotation, largeArc,
+                invertHeight > 0.0f ? !sweep : sweep, target);
+          } else {
+            fail();
+          }
+          previousCommand = command;
+          first = false;
+          separators();
+          if (cursor < end &&
+              std::isalpha(static_cast<unsigned char>(*cursor))) break;
+        }
+        if (first) fail();
+      }
+    }
+  } parser(*this, data, viewBoxHeight);
+  parser.parse();
+  return *this;
 }
 Path& Path::close() { impl_->value.closePath(); return *this; }
 Path& Path::rect(float x, float y, float width, float height) {

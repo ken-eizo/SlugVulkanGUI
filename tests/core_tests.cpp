@@ -154,7 +154,20 @@ int main() try {
   tapered.endTaper = 1.0f;
   const ShapeId taperStroke =
       atlas.addStroke(Path{}.moveTo(0, 0).quadraticTo(50, 30, 100, 0), tapered);
-  require(rectangle && rounded && stroke && taperStroke, "shape registration");
+  StrokeStyle svgStroke;
+  svgStroke.width = 2;
+  svgStroke.cap = LineCap::Round;
+  svgStroke.join = LineJoin::Round;
+  const ShapeId relativeSvg =
+      atlas.addStroke(Path{}.svgPath("m15 14 5-5-5-5 M20 9H9.5a5.5 5.5 0 0 0 0 11H13",
+                                    24.0f),
+                      svgStroke);
+  require(rectangle && rounded && stroke && taperStroke && relativeSvg,
+          "shape registration");
+  const auto svgMetric = atlas.metrics(relativeSvg);
+  require(svgMetric && svgMetric->bearingY <= 25.1f &&
+              svgMetric->bearingY - svgMetric->height >= -1.1f,
+          "relative SVG path stays inside reflected viewBox");
   atlas.build();
   require(atlas.built(), "atlas build");
   const auto metric = atlas.metrics(rounded);

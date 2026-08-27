@@ -33,6 +33,10 @@ public:
   Path& lineTo(float x, float y);
   Path& quadraticTo(float cx, float cy, float x, float y);
   Path& cubicTo(float c1x, float c1y, float c2x, float c2y, float x, float y);
+  // Append SVG path-data commands in the SVG 1.1 coordinate system. This keeps
+  // icon sources (for example Lucide's 24x24 paths) as their canonical data
+  // instead of flattening them into disconnected runtime line segments.
+  Path& svgPath(std::string_view data, float viewBoxHeight = 0.0f);
   Path& close();
   Path& rect(float x, float y, float width, float height);
   Path& roundedRect(float x, float y, float width, float height, float radius,
