@@ -16,6 +16,22 @@ int main() try {
   using namespace slugvk;
   require(hashId("stable") == hashId("stable"), "stable widget ids");
   require(hashId("stable") != hashId("different"), "distinct widget ids");
+  const auto padded = inset({10, 20, 100, 60}, Insets::symmetric(4, 8));
+  require(padded.x == 18 && padded.y == 24 && padded.width == 84 && padded.height == 52,
+          "Insets define deterministic padding geometry");
+  const float columnSpecs[] = {24.0f, -1.0f, -2.0f};
+  const auto columns = gridColumns({0, 0, 100, 20}, columnSpecs, 2.0f);
+  require(columns.size() == 3 && columns[0].width == 24.0f &&
+              std::abs(columns[1].width * 2.0f - columns[2].width) < 0.0001f,
+          "fixed and flex columns share one geometry source");
+  LinearLayout rows({0, 0, 80, 100}, Axis::Vertical, 4.0f);
+  require(rows.take(20).height == 20 && rows.take(30).y == 24 && rows.remaining().y == 58,
+          "linear layout advances by extent and gap");
+  TextEditState editor;
+  editor.reset("12.5", true);
+  require(editor.insert("7") && editor.value == "7", "typing replaces a selected value");
+  editor.insert("\xE3\x81\x82");
+  require(editor.backspace() && editor.value == "7", "UTF-8 backspace erases one codepoint");
   require(std::abs(ease(Easing::Linear, 0.25f) - 0.25f) < 0.0001f, "linear easing");
   require(std::abs(ease(Easing::SmoothStep, 0.5f) - 0.5f) < 0.0001f, "smoothstep easing");
   auto decoded = decodeUtf8("A\xE3\x81\x82\xF0\x9F\x98\x80");
@@ -60,6 +76,11 @@ int main() try {
   require(sharedShader.kind == GradientKind::Shader &&
               std::abs(sharedShader.shaderParameter - 0.75f) < 0.0001f,
           "procedural paint factory");
+  const Paint conic = Paint::hsvConic(0.8f);
+  require(conic.kind == GradientKind::HsvConic && std::abs(conic.opacity - 0.8f) < 0.0001f &&
+              std::abs(conic.origin.x - 0.5f) < 0.0001f &&
+              std::abs(conic.origin.y - 0.5f) < 0.0001f,
+          "HSV conic paint factory");
   DrawList paintList;
   paintList.fill(1, {0, 0, 100, 40}, sharedShader);
   StrokeStyle paintedStroke;

@@ -209,6 +209,13 @@ vec4 evaluatePaint() {
     t = normalized.x + normalized.y;
   } else if (kind == 3) t = length(uv - origin) / max(length(direction), 0.0001);
   else if (kind == 4) t = 0.5 + 0.5 * sin((uv.x * 1.7 + uv.y + paintData.z) * 24.0);
+  else if (kind == 5) {
+    vec2 centered = uv - origin;
+    float hue = fract(atan(centered.x, -centered.y) / 6.28318530718 + 1.0);
+    vec3 rgb = clamp(abs(mod(hue * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0,
+                     0.0, 1.0);
+    return vec4(rgb, color0.a);
+  }
   return mix(color0, color1, clamp(t, 0.0, 1.0));
 }
 

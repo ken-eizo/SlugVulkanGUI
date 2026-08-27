@@ -33,6 +33,19 @@ std::string utf8(char32_t cp) {
 WidgetId childId(WidgetId parent, std::uint64_t child) {
   return parent ^ (child + 0x9e3779b97f4a7c15ULL + (parent << 6U) + (parent >> 2U));
 }
+
+std::size_t byteOffsetForCodepoint(std::string_view value, std::size_t target) {
+  std::size_t offset = 0;
+  std::size_t index = 0;
+  while (offset < value.size() && index < target) {
+    ++offset;
+    while (offset < value.size() &&
+           (static_cast<unsigned char>(value[offset]) & 0xc0U) == 0x80U)
+      ++offset;
+    ++index;
+  }
+  return offset;
+}
 }
 
 UiContext::UiContext(UiSkin skin) : skin_(std::move(skin)) {}
@@ -262,18 +275,48 @@ bool UiContext::radio(WidgetId id, std::string_view text, Rect bounds, bool sele
 bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::string_view placeholder) {
   const auto state = interaction(id, bounds);
   controlBackground(bounds, state, focused_ == id);
+  auto& edit = textEdits_[id];
+  if (state.pressed) {
+    edit.reset(value, false);
+    const float advance = std::max(1.0f, skin_.text.size * 0.52f);
+    const auto codepoints = decodeUtf8(value);
+    const auto clicked = static_cast<std::size_t>(std::clamp(
+        std::floor((state.cursor.x - bounds.x - 8.0f) / advance + 0.5f), 0.0f,
+        static_cast<float>(codepoints.size())));
+    edit.caret = edit.anchor = byteOffsetForCodepoint(value, clicked);
+  } else if (focused_ != id && edit.value != value) {
+    edit.reset(value, false);
+  }
   bool changed = false;
   if (focused_ == id && input_) {
-    for (char32_t cp : input_->textInput()) { value += utf8(cp); changed = true; }
-    if (input_->key(GLFW_KEY_BACKSPACE).pressed && !value.empty()) {
-      std::size_t eraseFrom = value.size() - 1U;
-      while (eraseFrom > 0U &&
-             (static_cast<unsigned char>(value[eraseFrom]) & 0xc0U) == 0x80U)
-        --eraseFrom;
-      value.erase(eraseFrom);
-      changed = true;
+    const bool shift = input_->key(GLFW_KEY_LEFT_SHIFT).down || input_->key(GLFW_KEY_RIGHT_SHIFT).down;
+    const bool command = input_->key(GLFW_KEY_LEFT_CONTROL).down ||
+                         input_->key(GLFW_KEY_RIGHT_CONTROL).down ||
+                         input_->key(GLFW_KEY_LEFT_SUPER).down || input_->key(GLFW_KEY_RIGHT_SUPER).down;
+    if (command && input_->key(GLFW_KEY_A).pressed) edit.selectAll();
+    if (input_->key(GLFW_KEY_LEFT).pressed) edit.moveLeft(shift);
+    if (input_->key(GLFW_KEY_RIGHT).pressed) edit.moveRight(shift);
+    if (input_->key(GLFW_KEY_HOME).pressed) edit.moveHome(shift);
+    if (input_->key(GLFW_KEY_END).pressed) edit.moveEnd(shift);
+    if (input_->key(GLFW_KEY_BACKSPACE).pressed) changed = edit.backspace() || changed;
+    if (input_->key(GLFW_KEY_DELETE).pressed) changed = edit.deleteForward() || changed;
+    if (!command) {
+      for (char32_t cp : input_->textInput()) {
+        if (cp >= 32) changed = edit.insert(utf8(cp)) || changed;
+      }
     }
+    if (changed) value = edit.value;
     if (input_->key(GLFW_KEY_ENTER).pressed || input_->key(GLFW_KEY_ESCAPE).pressed) focused_ = 0;
+  }
+  if (focused_ == id && edit.hasSelection()) {
+    const float advance = std::max(1.0f, skin_.text.size * 0.52f);
+    const float begin = static_cast<float>(decodeUtf8(value.substr(0, edit.selectionBegin())).size());
+    const float end = static_cast<float>(decodeUtf8(value.substr(0, edit.selectionEnd())).size());
+    Paint selection = skin_.accent;
+    selection.opacity *= 0.32f;
+    rounded({bounds.x + 8.0f + begin * advance, bounds.y + 4.0f,
+             std::max(1.0f, (end - begin) * advance), bounds.height - 8.0f},
+            selection, 2.0f);
   }
   if (value.empty()) {
     Paint faded = skin_.muted;
@@ -281,7 +324,7 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
   } else label(value, bounds);
   if (focused_ == id && (frame_ / 30U) % 2U == 0U) {
     const float approximateX = bounds.x + 9.0f +
-      static_cast<float>(decodeUtf8(value).size()) * skin_.text.size * 0.52f;
+      static_cast<float>(decodeUtf8(value.substr(0, edit.caret)).size()) * skin_.text.size * 0.52f;
     draw_->shape(skin_.rectangle, {std::min(approximateX, bounds.x + bounds.width - 5.0f), bounds.y + 6.0f,
                                    1.5f, bounds.height - 12.0f}, skin_.accent);
   }

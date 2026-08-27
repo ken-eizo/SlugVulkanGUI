@@ -60,7 +60,7 @@ using ShapeId = std::uint32_t;
 using RetainedTextId = std::uint32_t;
 using WidgetId = std::uint64_t;
 
-enum class GradientKind : std::uint32_t { Solid, Linear, Diamond, Radial, Shader };
+enum class GradientKind : std::uint32_t { Solid, Linear, Diamond, Radial, Shader, HsvConic };
 
 struct Paint {
   GradientKind kind = GradientKind::Solid;
@@ -98,6 +98,13 @@ struct Paint {
     Paint result = gradient(GradientKind::Shader, start, end, origin, target, opacity);
     result.shaderParameter = parameter;
     return result;
+  }
+
+  // Full-saturation/value HSV wheel, with hue 0 at the top and increasing clockwise.
+  // Useful for compact native colour pickers without a texture or per-frame tessellation.
+  static Paint hsvConic(float opacity = 1.0f) {
+    return gradient(GradientKind::HsvConic, Color::fromRgb8(0xff0000),
+                    Color::fromRgb8(0xff0000), {0.5f, 0.5f}, {0.5f, 0.0f}, opacity);
   }
 };
 

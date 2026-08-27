@@ -2,10 +2,12 @@
 
 #include "slugvk/draw_list.hpp"
 #include "slugvk/input.hpp"
+#include "slugvk/text_edit.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace slugvk {
@@ -109,6 +111,7 @@ private:
   Rect overlayRect_ = {};
   WidgetId overlayOwner_ = 0;
   bool overlayClaimed_ = false;
+  std::unordered_map<WidgetId, TextEditState> textEdits_;
 };
 
 } // namespace slugvk
