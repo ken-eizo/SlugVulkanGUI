@@ -9,6 +9,7 @@ layout(location = 5) in vec4 inColor1;
 layout(location = 6) in vec4 inPaint;
 layout(location = 7) in vec4 inGradient;
 layout(location = 8) in vec4 inClip;
+layout(location = 9) in vec4 inStrokeWidths;
 
 layout(push_constant) uniform PushConstants {
   vec4 viewportScale;
@@ -25,6 +26,7 @@ layout(location = 5) flat out vec4 color1;
 layout(location = 6) flat out vec4 paintData;
 layout(location = 7) flat out vec4 gradientData;
 layout(location = 8) flat out vec4 clipRect;
+layout(location = 9) flat out vec4 strokeWidths;
 
 void main() {
   const uint analyticStrokeSegmentShape = 0xFFFFFFFEu;
@@ -50,4 +52,5 @@ void main() {
   paintData = inPaint;
   gradientData = inGradient;
   clipRect = pushConstants.translationOverride.z > 0.5 ? pushConstants.overrideClip : inClip;
+  strokeWidths = inStrokeWidths;
 }

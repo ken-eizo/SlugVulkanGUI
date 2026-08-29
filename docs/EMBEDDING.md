@@ -5,16 +5,18 @@
 After Effectsのdockable panelのように、外部applicationが所有するnative UI領域へSlugVulkanGUIを描画する
 ことは重要な利用例です。ただし、SlugVulkanGUI本体をAfter Effects、AEGP、Panelator固有仕様にはしません。
 
-現在実装済みの`Window`と`VulkanRenderer`は次を一体で所有します。
+現在の所有境界は次の通りです。
 
-- GLFW top-level windowとinput callbacks
-- Vulkan instance、physical/logical device、queue
-- GLFW経由の`VkSurfaceKHR`
-- swapchain、pipeline、atlas GPU resource、frame synchronization
+- `Window`: GLFW top-level windowとinput callbacks
+- `PlatformSurface`: Vulkan surface作成、pixel size/scale、visibility、redrawの抽象契約
+- `InputWriter`: native eventからhost非依存`InputState`を作る書込API
+- `VulkanRenderer`: Vulkan instance、physical/logical device、queue、surface、swapchain、
+  pipeline、atlas GPU resource、frame synchronization
 
-したがって現バージョンはスタンドアロンwindow向けで、host所有の`HWND`/`NSView`へそのまま接続する公開APIは
-まだありません。この文書の後半は、そのadapterを追加するときの**汎用契約と実装計画**です。コアのPath、
-atlas、paint、DrawList、UI modelは現在のまま再利用できます。
+`VulkanRenderer(PlatformSurface&, ...)`は実装済みで、GLFWを使わない外部所有Viewも接続できます。
+ただし、`HWND`/`NSView`やAfter Effects等の具体adapterはこのrepositoryに含みません。また現時点では
+rendererごとにVulkan deviceを作り、device-level resourceとsurface-level resourceの共有分離も未実装です。
+後半は、実装済みの汎用契約と、残るadapter/device共有の計画を区別して記載します。
 
 ## 分離するべき所有単位
 
@@ -52,24 +54,29 @@ PlatformSurface contract
 
 panelごとに独立させます。1 panelのresizeや破棄でdevice/atlas全体を再作成しないことが目的です。
 
-### Platform contract（計画）
+### `PlatformSurface` contract（実装済み）
 
-Vulkan instance作成前に必要extensionが分かり、作成後にsurfaceを生成できる必要があります。具体的な公開APIを
-固定する前の契約イメージは次の通りです。
+Vulkan instance作成前に必要extensionが分かり、作成後にsurfaceを生成できる契約です。
 
 ```cpp
-struct PlatformSurfaceSource {
-  std::span<const char* const> requiredInstanceExtensions() const;
-  VkSurfaceKHR createSurface(VkInstance instance) const;
-  slugvk::Vec2 framebufferSize() const;
-  float contentScale() const;
-  bool visible() const;
-  void requestRedraw() const;
+class PlatformSurface {
+public:
+  virtual std::span<const char* const>
+  requiredInstanceExtensions() const noexcept = 0;
+  virtual VkResult createVulkanSurface(
+      VkInstance, const VkAllocationCallbacks*, VkSurfaceKHR*) const noexcept = 0;
+  virtual Vec2 framebufferSize() const noexcept = 0;
+  virtual float contentScale() const noexcept = 0;
+  virtual bool visible() const noexcept = 0;
+  virtual void requestRedraw() noexcept = 0;
+  virtual void waitForVisibleFramebuffer() {}
 };
 ```
 
-実APIでは`VkSurfaceKHR`の所有権、allocator、destroy順、extension stringの寿命、失敗型を明記します。Vulkan型を
-含むadapter headerと、Vulkanを知らないvector/UI core headerも分けます。
+実装はrendererより長く生存し、返すextension nameの文字列もrenderer構築中は有効に保ちます。
+`createVulkanSurface`の成功後、`VkSurfaceKHR`はrendererが所有・破棄します。埋め込みhostはevent loopを
+所有しないため、既定の`waitForVisibleFramebuffer()`をblockingさせません。standalone GLFW互換層だけが
+最小化解除までeventを待ちます。
 
 ## Windows adapter
 
@@ -108,8 +115,7 @@ host process全体の環境変数やloader search pathを書き換える方式�
 
 ## Input adapter
 
-現在`InputState`のframe更新methodは`Window`だけが呼べるため、外部host対応時は公開read APIを変えず、backend用の
-writerを分離します。
+`InputWriter`は実装済みで、`InputState`の公開read APIを変えずにnative host eventを投入できます。
 
 ```text
 Host event callbacks -> InputWriter/backend queue -> immutable frame snapshot -> UiContext
@@ -126,6 +132,10 @@ Host event callbacks -> InputWriter/backend queue -> immutable frame snapshot ->
 
 capture lost時はdown/activeを必ずcancelし、panel外でbuttonが離されてもstuck dragを残しません。IME composition、
 selection、candidate window位置は簡易`textField`ではなく、host/native text serviceと接続する上位editor層の責務です。
+
+実装では`focusLost()`が全mouse/key down stateを解除します。`beginFrame()`、event投入、
+`finishFrame(nowSeconds)`をframe境界として使い、`cursor()`へはpanel-local framebuffer pixelを渡します。
+`UiContext`が読むkey codeは現在GLFW key code互換の整数です。
 
 低遅延dragでは、event queueを全部処理した後に最新pointer positionを一度sampleし、UI declaration直前にsnapshotへ
 反映します。古いmove eventを順番に描画する必要はなく、press/release順だけは失いません。
@@ -216,15 +226,16 @@ host SDKのversionごとにnative handle取得方法やthread制約が異なる�
 
 ### Phase 1: 所有権分離
 
-- `VulkanRenderer`内部からdevice-levelとsurface-level resourceを抽出
-- 既存`VulkanRenderer(Window&, ...)`は互換facadeとして維持
-- surface factory、extent、visibilityのbackend contractとlifetime testを追加
+- 完了: `PlatformSurface`のsurface factory、extent、scale、visibility、redraw contract
+- 完了: 既存`VulkanRenderer(Window&, ...)`を互換facadeとして維持
+- 未完了: `VulkanRenderer`内部からdevice-levelとsurface-level resourceを共有可能な型へ抽出
 
 ### Phase 2: 外部surfaceとinput
 
+- 完了: backend専用`InputWriter`、focus loss、frame snapshot test
 - Win32 `HWND` adapterとhidden child-window smoke test
 - macOS `NSView/CAMetalLayer` adapterとMoltenVK smoke test
-- backend専用`InputWriter`、focus/capture loss、HiDPI test
+- 具体adapterでのcapture loss、HiDPI、live resize test
 
 ### Phase 3: 複数surface
 

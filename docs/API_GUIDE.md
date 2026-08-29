@@ -14,6 +14,9 @@ const auto panelShape = atlas.addPath(
 slugvk::Path curve;
 curve.moveTo(0, 30).cubicTo(80, -20, 160, 80, 240, 30);
 
+const auto icon = atlas.addPath(
+  slugvk::Path{}.svgPath("M4 12h16M12 4v16", 24));
+
 slugvk::StrokeStyle stroke;
 stroke.width = 4;
 stroke.join = slugvk::LineJoin::Round;
@@ -25,7 +28,11 @@ atlas.build();
 ```
 
 `Path`は`moveTo`、`lineTo`、quadratic/cubic Bézier、rect、rounded rect、circle、ellipse、polygon、
-starを連結可能です。`addPath()`と`addStroke()`の戻り値`0`は登録失敗です。`build()`後のshape/font追加は
+starを連結可能です。`svgPath(data, viewBoxHeight)`はSVGの`M/L/H/V/C/S/Q/T/A/Z`を
+absolute/relative双方で読み、arcはcubicへ変換します。`viewBoxHeight > 0`ならY座標とarc sweepを
+反転してSVGのY下向き表示を維持し、`0`なら入力座標をそのまま使います。不正dataは
+`std::invalid_argument`です。これはatlas構築APIであり、frame loopのSVG parserではありません。
+`addPath()`と`addStroke()`の戻り値`0`は登録失敗です。`build()`後のshape/font追加は
 `std::logic_error`になります。
 
 ### Strokeの既定値と明示override
@@ -54,6 +61,8 @@ s.dashCaps[2].end = slugvk::LineCap::Round; // 3本目だけ
 ## Paint
 
 `Paint`はfill、stroke、text、analytic rounded rectで共通です。
+`Color::fromRgb8()`と`.slugui`のhexはsRGB値です。fragment shaderがlinearへdecodeしてから
+sRGB swapchain上でblend/encodeするため、hex値を二重gamma変換しません。
 
 ```cpp
 const auto solid = slugvk::Paint::solid(
@@ -81,6 +90,7 @@ draw.clear();
 draw.setClip({0, 0, framebuffer.x, framebuffer.y});
 draw.fill(panelShape, {20, 20, 320, 100}, linear);
 draw.stroke(curveShape, {20, 150, 320, 80}, procedural);
+draw.cubicBezier({20, 180}, {100, 120}, {220, 240}, {320, 180}, stroke);
 
 draw.beginOverlay();
 draw.roundedRect({300, 60, 180, 120}, 12, solid, 100);
@@ -89,6 +99,10 @@ draw.endOverlay();
 
 `DrawList`は宣言順を保ちます。通常commandの後に全overlay commandを出すため、dropdownやtooltipを
 panelより前面にできます。`clear()`はcommandsとoverlay modeをresetしますが、vectorのcapacityは再利用します。
+
+`cubicBezier()`はatlas shapeと異なり、4点をframebuffer座標のまま保持します。rendererがframe構築時に
+screen-space誤差に応じて分割し、各区間を解析的AA strokeとしてGPUへ送ります。control pointが毎frame変わる
+editor handle等に向きます。静的curveは`Path::cubicTo()`をatlasへ一度登録する方がCPU処理を省けます。
 
 ### 絶対pixelの角丸
 
@@ -100,23 +114,43 @@ draw.roundedRect(
   {.topLeft = 4, .topRight = 12, .bottomRight = 20, .bottomLeft = 28},
   paint,
   {.topLeftPercent = 0, .topRightPercent = 25,
-   .bottomRightPercent = 50, .bottomLeftPercent = 100});
+   .bottomRightPercent = 50, .bottomLeftPercent = 100},
+  {.paint = borderPaint, .width = 2, .align = slugvk::StrokeAlign::Inside});
 ```
 
 矩形のwidth/heightを確定した後に各radiusを適用します。互いのradiusが物理的に収まらない場合だけ、
 CSS互換の比率で全radiusを縮小します。通常の範囲では指定pixel値を維持します。
+`BorderStyle::align`は`Inside` / `Center` / `Outside`です。外側量をそれぞれ0 / width÷2 /
+widthとして解析ringのboundsと半径へ適用し、fillの後にborderを描くためinside strokeも塗りに
+隠れません。直線と角丸は同じ連続距離式でAA評価されます。
+
+4辺を独立させる場合は均一値`width`ではなく`individualWidths`を設定します。順序はFigmaと同じ
+top/right/bottom/leftです。
+
+```cpp
+slugvk::BorderStyle border;
+border.paint = borderPaint;
+border.align = slugvk::StrokeAlign::Outside;
+border.individualWidths = slugvk::BorderWidths{1, 2, 3, 4};
+```
 
 ## Vector text
 
 ```cpp
-const auto fontPath = slugvk::findDefaultSystemFont();
 const auto needed = slugvk::decodeUtf8("日本語ABC");
-atlas.loadFont(fontPath, needed);
+atlas.loadFont(
+  "assets/fonts/Geist[wght].ttf",
+  {.family = "Geist", .weight = 400, .italic = false},
+  needed);
+atlas.loadFont(
+  "assets/fonts/Geist[wght].ttf",
+  {.family = "Geist", .weight = 700, .italic = false},
+  needed);
 
 slugvk::TextStyle style;
-style.fontName = "system-ui";
+style.fontName = "Geist";
+style.weight = 700;
 style.size = 18;
-style.bold = true;
 style.italic = false;
 style.underline = true;
 style.lineHeight = 1.4f;
@@ -129,22 +163,34 @@ style.paint = paint;
 draw.text("Vector text", {20, 20, 480, 120}, style);
 ```
 
-空のcodepoint listで`loadFont()`するとASCII 95 glyphを読みます。日本語等は必要codepointを明示して
-atlasへ含めてください。UTF-8 decoderは不正continuation、overlong、surrogate、Unicode範囲外をU+FFFDへ
-置換します。
+font pathはアプリケーションが明示します。libraryはfamily名からsystem directoryを走査せず、Figma importも
+fontを自動読込しません。`FontFace`を省略した互換overloadはFreeTypeのfamily/style名を使います。
+同一familyを複数登録すると、描画時にweight/italic一致を優先し、なければ最も近いweightを選びます。
+variable fontでは`weight`をFreeTypeの`wght` axisへ渡します。空のcodepoint listはASCII 95 glyph、
+日本語等は必要codepointを明示します。
 
 現在のlayoutは改行単位のcodepoint layoutです。Left/Center/Right、line height、letter spacing、indent、
-簡易bullet/number marker、synthetic bold/italic、underline/strikethroughを扱います。`Justify` enumは将来用で、
-現時点では語間展開を行いません。HarfBuzz shaping、bidi、IME composition、selection、locale line breakは
-別のtext layout/editor層が必要です。
+簡易bullet/number marker、weight/italic face選択、互換用synthetic bold、underline/strikethroughを扱います。`Justify` enumは将来用で、
+現時点では語間展開を行いません。UTF-8 caret/selectionと簡易選択表示はありますが、HarfBuzz shaping、
+bidi、IME composition、native candidate window、locale line breakは別のtext layout/editor層が必要です。
 
-### 3種類のtext宣言
+### 4種類のtext宣言
 
 - `text(std::string, ...)`: commandが文字列を所有。毎フレーム変化するlabel向け
 - `textStatic(std::string_view, ...)`: copyを省くが、参照bytesを`draw()`終了まで生存させる
+- `textRunsStatic(std::span<const TextRun>, ...)`: range別styleをcopyせず描画するAOT/static UI向け
 - `createRetainedText()` + `retainedText()`: layout/uploadを一度だけ行い、zoom/panはtransformのみ
 
 ```cpp
+std::array<slugvk::TextRun, 2> runs{{
+  {"red ", {.fontName = "Geist", .size = 16, .weight = 700,
+            .paint = slugvk::Paint::solid(slugvk::Color::fromRgb8(0xff0000))}},
+  {"blue", {.fontName = "Geist", .size = 14, .weight = 400,
+             .italic = true,
+             .paint = slugvk::Paint::solid(slugvk::Color::fromRgb8(0x0000ff))}},
+}};
+draw.textRunsStatic(runs, {20, 20, 480, 40}, style);
+
 const auto document = renderer.createRetainedText(longText, {0, 0, 900, 5000}, style);
 
 draw.setClip(viewport);
@@ -152,6 +198,7 @@ draw.retainedText(document, pan, zoom);
 ```
 
 保持IDは作成元rendererの寿命内だけ有効で、個別削除・更新APIはまだありません。
+`textRunsStatic`が参照する配列と各`TextRun::text`は`draw()`完了まで生存させます。
 
 ## Input
 
@@ -173,6 +220,30 @@ if (input.scroll().ended)   { /* timeoutしたframe */ }
 
 keyboard codeは現在GLFW key codeです。Unicode文字入力は`textInput()`、物理key状態は`key(code)`を使い分けます。
 raw mouse motionはplatformが対応する場合に`setRawMouseMotion(true)`でcursor captureと共に有効化します。
+
+外部hostは`InputWriter`で同じ`InputState`を作れます。frameにつき
+`beginFrame()` → host event変換 → `finishFrame(nowSeconds)`の順に呼びます。
+`cursor()`へ渡す座標はframebuffer pixelです。`focusLost()`は全down stateを解除するため、
+capture/focus喪失時に必ず呼びます。現行`UiContext`のkey codeはGLFW定数と同じ整数値を期待します。
+
+## 軽量layoutとtext edit
+
+`Insets`、`inset/outset`、`LinearLayout`、`gridColumns`は保持treeを作らない決定的な
+rectangle計算です。`gridColumns`の正値は固定pixel、負値の絶対値は残余幅のweightです。
+
+```cpp
+slugvk::LinearLayout rows(bounds, slugvk::Axis::Vertical, 8);
+const auto toolbar = rows.take(36);
+const auto body = rows.remaining();
+
+const std::array<float, 3> columns{180, -1, -2};
+const auto cells = slugvk::gridColumns(body, columns, 8);
+```
+
+`TextEditState`はUTF-8 codepoint境界を壊さず、caret/anchor、選択削除、insert、
+backspace/delete、left/right/home/endを扱います。grapheme cluster、IME composition、clipboard、
+undo stackは含みません。`UiContext::textField`はwidget IDごとにこの状態を保持し、Shift選択、
+Ctrl/Cmd+A、caretと選択範囲を描画します。
 
 ## UiContext
 
@@ -209,6 +280,31 @@ deltaをcustom widgetで取得できます。
 
 combo/dropdownとtooltipはoverlay commandへ送られます。同時に開けるcombo ownerは一つで、menu領域は下の
 通常widgetのhit testを遮断します。
+
+## SlugUI IR / AOT component
+
+`UiContext`は即時widget API、`slugvk::slugui`は再利用可能なcomponent treeです。後者はC++
+builderまたは`.slugui` AOT compilerで構築し、どちらも同じ`Runtime::render`から
+`DrawList`へloweringします。
+
+```cpp
+slugvk::example::SlugUiDemoGenerated generated;
+generated.component.on(
+  slugvk::example::SlugUiDemoGenerated::callback_increment,
+  [&](const slugvk::slugui::UiEvent& event) {
+    if (event.type == slugvk::slugui::EventType::Activated) {
+      auto& properties = generated.component.properties();
+      properties.set(generated.clicks, properties.get(generated.clicks) + 1);
+    }
+  });
+
+slugvk::slugui::Runtime runtime;
+runtime.render(generated.component, window.input(), draw, viewport, window.contentScale());
+```
+
+生成structは`component`、型付きproperty handle、stable callback IDを公開します。property名検索、
+DSL parse、式評価はframe loopで行いません。詳細なgrammar、layout規則、制限は
+[SlugUI宣言型IR](SLUGUI.md)を参照してください。
 
 ## Animation
 

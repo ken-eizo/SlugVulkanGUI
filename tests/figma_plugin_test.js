@@ -1,0 +1,530 @@
+"use strict";
+
+const assert = require("assert");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const childProcess = require("child_process");
+const vm = require("vm");
+
+const repository = path.resolve(__dirname, "..");
+const pluginPath = path.join(repository, "tools", "figma-slugui", "code.js");
+const pluginCode = fs.readFileSync(pluginPath, "utf8");
+const manifest = JSON.parse(fs.readFileSync(
+  path.join(repository, "tools", "figma-slugui", "manifest.json"), "utf8"));
+assert.strictEqual(manifest.documentAccess, "dynamic-page");
+assert.deepStrictEqual(manifest.networkAccess.allowedDomains, ["none"]);
+const ui = fs.readFileSync(path.join(repository, "tools", "figma-slugui", "ui.html"), "utf8");
+const uiScript = ui.match(/<script>([\s\S]*?)<\/script>/);
+assert.ok(uiScript, "plugin UI script should exist");
+new Function(uiScript[1]);
+const messages = [];
+const listeners = {};
+
+const solid = (r, g, b, opacity = 1) => ({
+  type: "SOLID", visible: true, opacity, color: { r, g, b },
+});
+const base = (overrides) => Object.assign({
+  visible: true,
+  opacity: 1,
+  x: 0,
+  y: 0,
+  width: 100,
+  height: 40,
+  fills: [],
+  strokes: [],
+  effects: [],
+  layoutSizingHorizontal: "FIXED",
+  layoutSizingVertical: "FIXED",
+  clone() { return Object.assign({}, this, { remove() {} }); },
+  outlineStroke() {
+    return base({
+      type: "VECTOR",
+      id: String(this.id || "") + ":outline",
+      name: String(this.name || "") + " outline",
+      x: this.x, y: this.y, width: this.width, height: this.height,
+      fills: this.strokes,
+      fillGeometry: this.outlinedStrokeGeometry || this.strokeGeometry || [],
+      absoluteBoundingBox: this.outlinedAbsoluteBoundingBox ||
+        this.absoluteRenderBounds || this.absoluteBoundingBox,
+      remove() {},
+    });
+  },
+  remove() {},
+}, overrides);
+
+const selection = [
+  base({
+    type: "FRAME",
+    id: "12:1",
+    name: "Settings Panel",
+    width: 640,
+    height: 420,
+    layoutMode: "VERTICAL",
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+    paddingLeft: 24,
+    paddingTop: 20,
+    paddingRight: 24,
+    paddingBottom: 20,
+    itemSpacing: 12,
+    primaryAxisAlignItems: "MIN",
+    counterAxisAlignItems: "MIN",
+    clipsContent: true,
+    cornerRadius: 16,
+    cornerSmoothing: 0.8,
+    fills: [solid(0.06, 0.09, 0.16)],
+    children: [
+      base({
+        type: "RECTANGLE",
+        id: "12:2",
+        name: "Accent Card",
+        width: 592,
+        height: 90,
+        layoutSizingHorizontal: "FILL",
+        layoutSizingVertical: "FIXED",
+        cornerRadius: Symbol("mixed-corner"),
+        topLeftRadius: 4,
+        topRightRadius: 8,
+        bottomRightRadius: 12,
+        bottomLeftRadius: 16,
+        cornerSmoothing: 0.5,
+        fills: [{
+          type: "GRADIENT_LINEAR",
+          visible: true,
+          opacity: 1,
+          gradientTransform: [[1, 0, 0], [0, 1, 0]],
+          gradientStops: [
+            { position: 0, color: { r: 0.2, g: 0.5, b: 1, a: 1 } },
+            { position: 1, color: { r: 0.7, g: 0.3, b: 1, a: 1 } },
+          ],
+        }],
+        strokes: [solid(0.1, 0.9, 0.7)],
+        strokeWeight: 2.5,
+        strokeAlign: "INSIDE",
+      }),
+      base({
+        type: "TEXT",
+        id: "12:3",
+        name: "Heading",
+        width: 592,
+        height: 48,
+        layoutSizingHorizontal: "FILL",
+        layoutSizingVertical: "FIXED",
+        characters: "Figma → SlugUI",
+        fontSize: 24,
+        fontWeight: 700,
+        fontName: { family: "Inter", style: "Bold" },
+        textDecoration: "NONE",
+        textAlignHorizontal: "CENTER",
+        lineHeight: { unit: "PERCENT", value: 125 },
+        letterSpacing: { unit: "PIXELS", value: 0.5 },
+        paragraphIndent: 0,
+        fills: [solid(0.94, 0.97, 1)],
+      }),
+      base({
+        type: "VECTOR",
+        id: "12:4",
+        name: "Logo Mark",
+        x: 120,
+        y: 80,
+        width: 64,
+        height: 64,
+        absoluteBoundingBox: { x: 120, y: 80, width: 64, height: 64 },
+        absoluteRenderBounds: { x: 119, y: 79, width: 66, height: 66 },
+        outlinedAbsoluteBoundingBox: { x: -420, y: 380, width: 66, height: 66 },
+        layoutSizingHorizontal: "FIXED",
+        layoutSizingVertical: "FIXED",
+        fills: [solid(0.2, 0.9, 0.7)],
+        fillGeometry: [{
+          windingRule: "NONZERO",
+          data: "M 2 2 L 62 2 L 32 60 Z",
+        }],
+        strokes: [solid(1, 0.25, 0.5)],
+        strokeWeight: 2,
+        strokeAlign: "CENTER",
+        strokeGeometry: [{
+          windingRule: "NONZERO",
+          data: "M 1 1 L 63 1 L 32 62 Z M 4 4 L 32 57 L 60 4 Z",
+        }],
+      }),
+      base({
+        type: "VECTOR",
+        id: "12:5",
+        name: "Inside Stroke",
+        x: 210,
+        y: 80,
+        width: 24,
+        height: 24,
+        absoluteBoundingBox: { x: 210, y: 80, width: 24, height: 24 },
+        absoluteRenderBounds: { x: 210, y: 80, width: 24, height: 24 },
+        layoutSizingHorizontal: "FIXED",
+        layoutSizingVertical: "FIXED",
+        fills: [],
+        strokes: [solid(0.4, 0.7, 1)],
+        strokeWeight: 2,
+        strokeAlign: "INSIDE",
+        strokeGeometry: [{
+          windingRule: "NONZERO",
+          data: "M 1 1 L 23 1 L 23 23 L 1 23 Z M 3 3 L 3 21 L 21 21 L 21 3 Z",
+        }],
+      }),
+    ],
+  }),
+];
+selection[0].children[0].cornerRadius = Symbol.for("figma.mixed");
+
+let flattenCalls = 0;
+const figma = {
+  mixed: Symbol.for("figma.mixed"),
+  fileKey: "fixture-file",
+  root: { documentColorProfile: "SRGB" },
+  flatten(nodes) { ++flattenCalls; return nodes[0]; },
+  currentPage: { selection },
+  ui: {
+    postMessage(message) { messages.push(message); },
+    onmessage: null,
+  },
+  showUI(_html, options) {
+    assert.strictEqual(options.themeColors, true);
+  },
+  on(event, callback) { listeners[event] = callback; },
+  closePlugin() {},
+};
+selection[0].children[0].cornerRadius = figma.mixed;
+
+vm.runInNewContext(pluginCode, {
+  figma,
+  __html__: "<html></html>",
+  console,
+}, { filename: pluginPath });
+
+assert.ok(messages.length > 0, "plugin should post an initial export");
+const exported = messages[messages.length - 1];
+assert.strictEqual(exported.type, "export-result");
+assert.strictEqual(exported.formatVersion, 3);
+assert.strictEqual(exported.component, "Settings_PanelGenerated");
+assert.match(exported.source, /component Settings_PanelGenerated/);
+assert.match(exported.source, /layout: column;/);
+assert.match(exported.source, /padding: \[24px, 20px, 24px, 20px\];/);
+assert.match(exported.source, /linear\(#3380ff, #b34dff\)/);
+assert.match(exported.source, /radius: \[4, 8, 12, 16\];/);
+assert.match(exported.source, /stroke: #1ae6b3;/);
+assert.match(exported.source, /stroke-width: 2.5;/);
+assert.match(exported.source, /stroke-align: inside;/);
+assert.match(exported.source, /text: "Figma → SlugUI";/);
+assert.match(exported.source, /font-weight: 700;/);
+assert.doesNotMatch(exported.source, /bold: true;/);
+assert.match(exported.source, /path-data: "M 2 2 L 62 2 L 32 60 Z";/);
+assert.match(exported.source, /stroke-path-data:/);
+assert.match(exported.source, /path-placement: \[0px, 0px, 64px, 64px\];/);
+assert.match(exported.source, /stroke-placement: \[-1px, -1px, 66px, 66px\];/);
+assert.doesNotMatch(exported.source, /stroke-placement: \[-(?:1\d\d|[2-9]\d{2,})/);
+assert.strictEqual(flattenCalls, 0, "exporting must not reparent vector geometry through flatten");
+assert.match(exported.source, /fidelity: baked-vector;/);
+assert.strictEqual(exported.fidelityCounts.bakedVector, 2);
+assert.strictEqual(exported.fidelityCounts.unsupported, 0);
+assert.ok(exported.fidelityCounts.approximated >= 1);
+assert.ok(!exported.diagnostics.some((item) => item.code === "E_VECTOR_GEOMETRY_MISSING"));
+assert.ok(exported.diagnostics.some((item) => item.code === "W_GRADIENT_TRANSFORM"));
+assert.ok(!exported.diagnostics.some((item) => item.code === "W_VECTOR_STROKE_ALIGN"));
+assert.ok(!exported.diagnostics.some((item) => item.code === "E_VECTOR_STROKE_OUTLINE"));
+
+figma.currentPage.selection = [base({
+  type: "LINE",
+  id: "20:1",
+  name: "Zero Height Divider",
+  x: 40,
+  y: 80,
+  width: 23,
+  height: 0,
+  absoluteBoundingBox: { x: 40, y: 80, width: 23, height: 0 },
+  absoluteRenderBounds: { x: 40, y: 77, width: 23, height: 6 },
+  strokes: [solid(0.5, 0.5, 0.5)],
+  strokeWeight: 6,
+  strokeAlign: "CENTER",
+  outlinedStrokeGeometry: [{
+    windingRule: "NONZERO",
+    data: "M23 0 L23 6 L0 6 L0 0 L23 0 Z",
+  }],
+})];
+figma.ui.onmessage({ type: "refresh" });
+const zeroHeightLine = messages[messages.length - 1];
+assert.match(zeroHeightLine.source, /width: 23px;/);
+assert.match(zeroHeightLine.source, /height: 6px;/);
+assert.match(zeroHeightLine.source, /stroke-placement: \[0px, 0px, 23px, 6px\];/);
+assert.doesNotMatch(zeroHeightLine.source, /height: 0px;/);
+
+const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "slugui-figma-test-"));
+const sourcePath = path.join(temporary, exported.filename);
+fs.writeFileSync(sourcePath, exported.source, "utf8");
+const python = process.env.SLUGUI_PYTHON || (process.platform === "win32" ? "python" : "python3");
+const compile = childProcess.spawnSync(python, [
+  path.join(repository, "tools", "slugui_compiler.py"),
+  sourcePath,
+  "--check",
+  "--namespace",
+  "slugvk::figma_fixture",
+], { cwd: repository, encoding: "utf8" });
+fs.rmSync(temporary, { recursive: true, force: true });
+assert.strictEqual(compile.status, 0, compile.stderr || compile.stdout);
+
+figma.currentPage.selection = [base({
+  type: "GROUP",
+  id: "31:1",
+  name: "Absolute Group",
+  x: 100,
+  y: 50,
+  width: 220,
+  height: 140,
+  absoluteBoundingBox: { x: 100, y: 50, width: 220, height: 140 },
+  children: [
+    base({
+      type: "RECTANGLE",
+      id: "31:2",
+      name: "Local Card",
+      x: 12,
+      y: 14,
+      width: 80,
+      height: 30,
+      absoluteBoundingBox: { x: 112, y: 64, width: 80, height: 30 },
+      fills: [solid(0.2, 0.4, 0.8)],
+    }),
+    base({
+      type: "GROUP",
+      id: "31:3",
+      name: "Nested Group",
+      x: 40,
+      y: 30,
+      width: 90,
+      height: 40,
+      absoluteBoundingBox: { x: 140, y: 80, width: 90, height: 40 },
+      children: [base({
+        type: "TEXT",
+        id: "31:4",
+        name: "Nested Text",
+        x: 5,
+        y: 5,
+        width: 70,
+        height: 20,
+        absoluteBoundingBox: { x: 145, y: 85, width: 70, height: 20 },
+        characters: "Nested",
+        fontSize: 14,
+        fontWeight: 400,
+        fontName: { family: "Inter", style: "Regular" },
+        textDecoration: "NONE",
+        textAlignHorizontal: "LEFT",
+        lineHeight: { unit: "AUTO" },
+        letterSpacing: { unit: "PIXELS", value: 0 },
+        paragraphIndent: 0,
+        fills: [solid(1, 1, 1)],
+      })],
+    }),
+  ],
+})];
+figma.ui.onmessage({ type: "refresh" });
+const grouped = messages[messages.length - 1];
+assert.match(grouped.source, /Rectangle Local_Card_31_2 \{\n\s+x: 12px;\n\s+y: 14px;\n\s+width: 80px;\n\s+height: 30px;/);
+assert.match(grouped.source, /Absolute Nested_Group_31_3 \{\n\s+x: 40px;\n\s+y: 30px;\n\s+width: 90px;\n\s+height: 40px;/);
+assert.match(grouped.source, /Text Nested_Text_31_4 \{\n\s+x: 5px;\n\s+y: 5px;\n\s+width: 70px;\n\s+height: 20px;/);
+
+figma.currentPage.selection = [base({
+  type: "RECTANGLE",
+  id: "40:1",
+  name: "Per Side Border",
+  width: 120,
+  height: 50,
+  cornerRadius: 8,
+  fills: [solid(0.1, 0.1, 0.1)],
+  strokes: [solid(0.9, 0.4, 0.2)],
+  strokeWeight: figma.mixed,
+  strokeTopWeight: 1,
+  strokeRightWeight: 2,
+  strokeBottomWeight: 3,
+  strokeLeftWeight: 4,
+  strokeAlign: "OUTSIDE",
+})];
+figma.ui.onmessage({ type: "refresh" });
+const perSide = messages[messages.length - 1];
+assert.match(perSide.source, /stroke-width: \[1, 2, 3, 4\];/);
+assert.match(perSide.source, /stroke-align: outside;/);
+assert.ok(!perSide.diagnostics.some((item) => item.code === "W_INDIVIDUAL_STROKE_WIDTH"));
+
+const multipleNodes = [
+  base({
+    type: "GROUP", id: "50:1", name: "Left Group",
+    x: 100, y: 40, width: 80, height: 60,
+    absoluteBoundingBox: { x: 100, y: 40, width: 80, height: 60 },
+    children: [base({
+      type: "RECTANGLE", id: "50:2", name: "Left Card",
+      x: 100, y: 40, width: 80, height: 60,
+      absoluteBoundingBox: { x: 100, y: 40, width: 80, height: 60 },
+      fills: [solid(1, 0, 0)],
+    })],
+  }),
+  base({
+    type: "GROUP", id: "51:1", name: "Right Group",
+    x: 240, y: 70, width: 100, height: 50,
+    absoluteBoundingBox: { x: 240, y: 70, width: 100, height: 50 },
+    children: [base({
+      type: "RECTANGLE", id: "51:2", name: "Right Card",
+      x: 240, y: 70, width: 100, height: 50,
+      absoluteBoundingBox: { x: 240, y: 70, width: 100, height: 50 },
+      fills: [solid(0, 0, 1)],
+    })],
+  }),
+];
+const painterParent = { children: multipleNodes };
+for (const node of multipleNodes) node.parent = painterParent;
+// Selection order is intentionally reversed; exporter must recover document painter order.
+figma.currentPage.selection = [multipleNodes[1], multipleNodes[0]];
+figma.ui.onmessage({ type: "refresh" });
+const multiple = messages[messages.length - 1];
+assert.strictEqual(multiple.component, "FigmaSelectionGenerated");
+assert.match(multiple.source, /^\/\/ SlugUI exchange format 3,/);
+assert.match(multiple.source, /Absolute selection_root \{\n    width: 240px;\n    height: 80px;/);
+assert.match(multiple.source, /Absolute Left_Group_50_1 \{\n      x: 0px;\n      y: 0px;/);
+assert.match(multiple.source, /Absolute Right_Group_51_1 \{\n      x: 140px;\n      y: 30px;/);
+assert.match(multiple.source, /Left_Card_50_2/);
+assert.match(multiple.source, /Right_Card_51_2/);
+assert.ok(multiple.source.indexOf("Left_Group_50_1") <
+          multiple.source.indexOf("Right_Group_51_1"));
+const multiDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "slugui-figma-multi-"));
+const multiPath = path.join(multiDirectory, multiple.filename);
+fs.writeFileSync(multiPath, multiple.source, "utf8");
+const multiCompile = childProcess.spawnSync(python, [
+  path.join(repository, "tools", "slugui_compiler.py"),
+  multiPath, "--check", "--class-name", "ImportedFigmaPanel",
+], { cwd: repository, encoding: "utf8" });
+fs.rmSync(multiDirectory, { recursive: true, force: true });
+assert.strictEqual(multiCompile.status, 0, multiCompile.stderr || multiCompile.stdout);
+
+const manyNodes = Array.from({ length: 48 }, (_, index) => base({
+  type: "RECTANGLE",
+  id: "60:" + index,
+  name: "Cell " + index,
+  x: 100 + (index % 12) * 20,
+  y: 50 + Math.floor(index / 12) * 20,
+  width: 10,
+  height: 10,
+  absoluteBoundingBox: {
+    x: 100 + (index % 12) * 20,
+    y: 50 + Math.floor(index / 12) * 20,
+    width: 10,
+    height: 10,
+  },
+  fills: [solid(index / 48, 0.4, 0.8)],
+}));
+const manyParent = { children: manyNodes, parent: null };
+for (const node of manyNodes) node.parent = manyParent;
+figma.currentPage.selection = manyNodes.slice().reverse();
+figma.ui.onmessage({ type: "refresh" });
+const many = messages[messages.length - 1];
+assert.strictEqual(many.selectionCount, 48);
+assert.match(many.source, /Absolute selection_root \{\n    width: 230px;\n    height: 70px;/);
+assert.strictEqual((many.source.match(/Rectangle Cell_/g) || []).length, 48);
+
+const ancestor = base({
+  type: "GROUP",
+  id: "70:1",
+  name: "Selected Parent",
+  x: 10,
+  y: 10,
+  width: 100,
+  height: 100,
+  absoluteBoundingBox: { x: 10, y: 10, width: 100, height: 100 },
+  children: [base({
+    type: "RECTANGLE",
+    id: "70:2",
+    name: "Selected Child",
+    x: 20,
+    y: 20,
+    width: 20,
+    height: 20,
+    absoluteBoundingBox: { x: 20, y: 20, width: 20, height: 20 },
+    fills: [solid(1, 0, 0)],
+  })],
+});
+ancestor.children[0].parent = ancestor;
+figma.currentPage.selection = [ancestor.children[0], ancestor];
+figma.ui.onmessage({ type: "refresh" });
+const nestedSelection = messages[messages.length - 1];
+assert.strictEqual((nestedSelection.source.match(/Rectangle Selected_Child_/g) || []).length, 1);
+
+figma.currentPage.selection = [base({
+  type: "TEXT",
+  id: "80:1",
+  name: "Mixed Style Label",
+  width: 180,
+  height: 30,
+  characters: "Red blue",
+  fontName: figma.mixed,
+  fontSize: figma.mixed,
+  fontWeight: figma.mixed,
+  textDecoration: figma.mixed,
+  fills: figma.mixed,
+  textAlignHorizontal: "CENTER",
+  textAlignVertical: "BOTTOM",
+  listOptions: { type: "UNORDERED" },
+  getStyledTextSegments(fields) {
+    assert.ok(fields.includes("fills"));
+    assert.ok(fields.includes("fontWeight"));
+    return [
+      {
+        characters: "Red",
+        start: 0,
+        end: 3,
+        fontSize: 16,
+        fontName: { family: "Geist", style: "Bold" },
+        fontWeight: 700,
+        fontStyle: "REGULAR",
+        textDecoration: "UNDERLINE",
+        textCase: "UPPER",
+        lineHeight: { unit: "PERCENT", value: 125 },
+        letterSpacing: { unit: "PIXELS", value: 0 },
+        fills: [solid(1, 0, 0)],
+      },
+      {
+        characters: " blue",
+        start: 3,
+        end: 8,
+        fontSize: 14,
+        fontName: { family: "Geist", style: "Regular Italic" },
+        fontWeight: 400,
+        fontStyle: "ITALIC",
+        textDecoration: "NONE",
+        textCase: "ORIGINAL",
+        lineHeight: { unit: "PERCENT", value: 140 },
+        letterSpacing: { unit: "PIXELS", value: 0.5 },
+        fills: [solid(0, 0, 1)],
+      },
+    ];
+  },
+})];
+figma.ui.onmessage({ type: "refresh" });
+const richText = messages[messages.length - 1];
+assert.match(richText.source, /text-align-vertical: bottom;/);
+assert.match(richText.source, /list-marker: bullet;/);
+assert.match(richText.source, /text: "RED blue";/);
+assert.match(richText.source, /text-runs: \[text-run\("RED", "Geist", 16, 700, false, true, false, 0, 1\.25, #ff0000\), text-run\(" blue", "Geist", 14, 400, true, false, false, 0\.5, 1\.4, #0000ff\)\];/);
+assert.doesNotMatch(richText.source, /W_MIXED_FILL/);
+assert.ok(!richText.diagnostics.some((item) => item.code.startsWith("W_MIXED_")),
+  JSON.stringify(richText.diagnostics));
+
+const richDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "slugui-figma-rich-"));
+const richPath = path.join(richDirectory, richText.filename);
+fs.writeFileSync(richPath, richText.source, "utf8");
+const richCompile = childProcess.spawnSync(python, [
+  path.join(repository, "tools", "slugui_compiler.py"),
+  richPath, "--check", "--namespace", "slugvk::figma_fixture",
+], { cwd: repository, encoding: "utf8" });
+fs.rmSync(richDirectory, { recursive: true, force: true });
+assert.strictEqual(richCompile.status, 0, richCompile.stderr || richCompile.stdout);
+
+figma.currentPage.selection = [];
+figma.ui.onmessage({ type: "refresh" });
+const empty = messages[messages.length - 1];
+assert.strictEqual(empty.source, "");
+assert.ok(empty.diagnostics.some((item) => item.code === "E_NO_SELECTION"));
+
+console.log("Figma exporter -> .slugui -> AOT compiler integration passed");

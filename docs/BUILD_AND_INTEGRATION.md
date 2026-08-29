@@ -4,8 +4,12 @@
 
 - CMake 3.24以上
 - C++20 compiler
+- Python 3（Exampleの`.slugui` AOT生成とtoolchain test。library-only subprojectでは不要）
 - Vulkan SDK（headers、loader、`glslc`）
 - repositoryのGit submodule: GLFW、FreeType、Slug、slughorn
+
+Node.jsが見つかる場合はFigma exporter→AOT compiler integration testもCTestへ登録します。
+Node.jsはlibrary、Example、Figma pluginの実行には不要です。
 
 WindowsはVisual Studio 2022、macOSはClang + MoltenVKを基準に継続的ビルドします。依存版はroot
 `README.md`に固定revisionを記載しています。
@@ -126,8 +130,8 @@ slugvk::Window window({.manageGlfwLifetime = false});
 int main() {
   slugvk::VectorAtlas atlas;
   const auto rectangle = atlas.addPath(slugvk::Path{}.rect(0, 0, 1, 1));
-  const auto font = slugvk::findDefaultSystemFont();
-  if (!font.empty()) atlas.loadFont(font);
+  atlas.loadFont("assets/fonts/MyFont.ttf",
+                 {.family = "MyFont", .weight = 400, .italic = false});
   atlas.build();
 
   slugvk::Window window({.width = 1280, .height = 800, .title = "My UI"});
@@ -163,6 +167,32 @@ int main() {
 
 `prepareFrame()`はfence waitとimage acquireを入力sampleより前へ移します。呼ばなくても`draw()`が内部で
 実行するため正しく動作しますが、低遅延用途では明示呼出しを推奨します。
+
+## 外部所有surface
+
+`VulkanRenderer`はGLFW `Window`のほか、利用側が実装する`PlatformSurface`を受け取れます。
+
+```cpp
+class HostSurface final : public slugvk::PlatformSurface {
+public:
+  std::span<const char* const> requiredInstanceExtensions() const noexcept override;
+  VkResult createVulkanSurface(
+      VkInstance, const VkAllocationCallbacks*, VkSurfaceKHR*) const noexcept override;
+  slugvk::Vec2 framebufferSize() const noexcept override;
+  float contentScale() const noexcept override;
+  bool visible() const noexcept override;
+  void requestRedraw() noexcept override;
+};
+
+HostSurface surface;
+slugvk::VulkanRenderer renderer(surface, atlas);
+```
+
+adapterはrendererより長く生存させ、`VkSurfaceKHR`を作れるnative viewをrenderer破棄まで保持します。
+rendererがsurfaceのVulkan handleを所有して破棄します。host event loopを待ってはいけない埋め込み実装では
+`waitForVisibleFramebuffer()`を即時returnのままにし、hidden/0×0中はhost側の次回draw通知を待ちます。
+入力は`InputWriter`でpanel-local framebuffer座標へ正規化します。具体的なWin32/macOS/製品SDK
+adapterとその配布設定はlibrary本体には含まれません。
 
 ## Resize callback
 

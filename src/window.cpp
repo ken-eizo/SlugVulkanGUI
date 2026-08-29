@@ -72,6 +72,20 @@ Window::Window(const WindowConfig& config) {
   glfwSetCharCallback(window_, [](GLFWwindow* w, unsigned int codepoint) {
     windowFrom(w)->input_.onCodepoint(codepoint);
   });
+  glfwSetDropCallback(window_, [](GLFWwindow* w, int count, const char** paths) {
+    auto* owner = windowFrom(w);
+    if (!owner->dropCallback_) return;
+    std::vector<std::string> copied;
+    copied.reserve(static_cast<std::size_t>(std::max(count, 0)));
+    for (int index = 0; index < count; ++index) {
+      if (paths[index]) copied.emplace_back(paths[index]);
+    }
+    try {
+      owner->dropCallback_(copied);
+    } catch (...) {
+      owner->callbackException_ = std::current_exception();
+    }
+  });
   glfwSetWindowRefreshCallback(window_, [](GLFWwindow* w) {
     windowFrom(w)->invokeRefreshCallback();
   });
@@ -105,6 +119,10 @@ void Window::setSize(int width, int height) {
 }
 void Window::setRefreshCallback(std::function<void()> callback) {
   refreshCallback_ = std::move(callback);
+}
+void Window::setDropCallback(
+    std::function<void(const std::vector<std::string>&)> callback) {
+  dropCallback_ = std::move(callback);
 }
 
 void Window::invokeRefreshCallback() noexcept {

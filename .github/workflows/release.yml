@@ -47,7 +47,7 @@ jobs:
       - name: Package single executable
         shell: pwsh
         run: |
-          Compress-Archive -LiteralPath "build\Release\slugvk_example.exe" -DestinationPath "SlugVulkanGUI-Windows-x64.zip"
+          Compress-Archive -LiteralPath "build\Release\slugvk_example.exe","assets\fonts\OFL-Geist.txt" -DestinationPath "SlugVulkanGUI-Windows-x64.zip"
 
       - uses: actions/upload-artifact@v4
         with:

@@ -1,12 +1,32 @@
 #include "slugvk/slugvk.hpp"
+#include "figma_group_31.generated.hpp"
+#include "geist_font.generated.hpp"
+#include "slugui_demo.generated.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 using namespace slugvk;
 
@@ -56,15 +76,22 @@ Shapes buildAtlas(VectorAtlas& atlas) {
   tapered.endTaper = 1.35f;
   shapes.taperStroke = atlas.addStroke(wave, tapered);
 
-  const std::string font = findDefaultSystemFont();
-  if (font.empty() || !atlas.loadFont(font))
-    throw std::runtime_error("No usable system font was found");
+  constexpr std::array<std::uint16_t, 9> geistWeights{
+    400, 100, 200, 300, 500, 600, 700, 800, 900,
+  };
+  for (const auto weight : geistWeights) {
+    if (!atlas.loadFontMemory(
+          slugvk::example::assets::geistFont, FontFace{"Geist", weight, false})) {
+      throw std::runtime_error("Embedded Geist variable font could not be loaded");
+    }
+  }
   atlas.build();
   return shapes;
 }
 
 TextStyle textStyle(float size = 14.0f) {
   TextStyle style;
+  style.fontName = "Geist";
   style.size = size;
   style.paint = Paint::solid(Color::fromRgb8(0xe9efff));
   return style;
@@ -112,7 +139,237 @@ LineCap nextCap(LineCap cap) {
        : cap == LineCap::Round ? LineCap::Square : LineCap::Butt;
 }
 
-enum class DemoPage { Components, TextZoom };
+const char* alignName(StrokeAlign align) {
+  switch (align) {
+    case StrokeAlign::Inside: return "Inside";
+    case StrokeAlign::Outside: return "Outside";
+    default: return "Center";
+  }
+}
+
+StrokeAlign nextAlign(StrokeAlign align) {
+  return align == StrokeAlign::Inside ? StrokeAlign::Center
+       : align == StrokeAlign::Center ? StrokeAlign::Outside : StrokeAlign::Inside;
+}
+
+std::string lowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+    return static_cast<char>(std::tolower(character));
+  });
+  return value;
+}
+
+#ifdef _WIN32
+std::wstring quoteWindowsArgument(const std::wstring& value) {
+  std::wstring result = L"\"";
+  std::size_t backslashes = 0;
+  for (const wchar_t character : value) {
+    if (character == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (character == L'\"') {
+      result.append(backslashes * 2 + 1, L'\\');
+      result.push_back(character);
+    } else {
+      result.append(backslashes, L'\\');
+      result.push_back(character);
+    }
+    backslashes = 0;
+  }
+  result.append(backslashes * 2, L'\\');
+  result.push_back(L'\"');
+  return result;
+}
+#endif
+
+bool spawnDetached(const std::filesystem::path& executable,
+                   const std::vector<std::string>& arguments) {
+#ifdef _WIN32
+  std::wstring commandLine = quoteWindowsArgument(executable.wstring());
+  for (const auto& argument : arguments) {
+    commandLine.push_back(L' ');
+    commandLine += quoteWindowsArgument(std::filesystem::path(argument).wstring());
+  }
+  std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+  mutableCommand.push_back(L'\0');
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  const BOOL started = CreateProcessW(
+    executable.wstring().c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
+    CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+  if (!started) return false;
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return true;
+#elif defined(__APPLE__)
+  std::vector<std::string> owned;
+  owned.reserve(arguments.size() + 1);
+  owned.push_back(executable.string());
+  owned.insert(owned.end(), arguments.begin(), arguments.end());
+  std::vector<char*> pointers;
+  pointers.reserve(owned.size() + 1);
+  for (auto& argument : owned) pointers.push_back(argument.data());
+  pointers.push_back(nullptr);
+  pid_t process = 0;
+  return posix_spawn(&process, executable.c_str(), nullptr, nullptr,
+                     pointers.data(), environ) == 0;
+#else
+  (void)executable;
+  (void)arguments;
+  return false;
+#endif
+}
+
+int runProcess(const std::filesystem::path& executable,
+               const std::vector<std::string>& arguments) {
+#ifdef _WIN32
+  std::wstring commandLine = quoteWindowsArgument(executable.wstring());
+  for (const auto& argument : arguments) {
+    commandLine.push_back(L' ');
+    commandLine += quoteWindowsArgument(std::filesystem::path(argument).wstring());
+  }
+  std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+  mutableCommand.push_back(L'\0');
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(executable.wstring().c_str(), mutableCommand.data(), nullptr, nullptr,
+                      FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+    return -1;
+  }
+  CloseHandle(process.hThread);
+  WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exitCode = 1;
+  GetExitCodeProcess(process.hProcess, &exitCode);
+  CloseHandle(process.hProcess);
+  return static_cast<int>(exitCode);
+#elif defined(__APPLE__)
+  std::vector<std::string> owned;
+  owned.reserve(arguments.size() + 1);
+  owned.push_back(executable.string());
+  owned.insert(owned.end(), arguments.begin(), arguments.end());
+  std::vector<char*> pointers;
+  pointers.reserve(owned.size() + 1);
+  for (auto& argument : owned) pointers.push_back(argument.data());
+  pointers.push_back(nullptr);
+  pid_t process = 0;
+  if (posix_spawn(&process, executable.c_str(), nullptr, nullptr,
+                  pointers.data(), environ) != 0) {
+    return -1;
+  }
+  int status = 0;
+  if (waitpid(process, &status, 0) < 0 || !WIFEXITED(status)) return -1;
+  return WEXITSTATUS(status);
+#else
+  (void)executable;
+  (void)arguments;
+  return -1;
+#endif
+}
+
+bool sameFileContents(const std::filesystem::path& first,
+                      const std::filesystem::path& second) {
+  std::error_code error;
+  if (!std::filesystem::exists(first, error) || !std::filesystem::exists(second, error) ||
+      std::filesystem::file_size(first, error) != std::filesystem::file_size(second, error)) {
+    return false;
+  }
+  std::ifstream left(first, std::ios::binary);
+  std::ifstream right(second, std::ios::binary);
+  if (!left || !right) return false;
+  std::array<char, 65536> leftBytes{};
+  std::array<char, 65536> rightBytes{};
+  do {
+    left.read(leftBytes.data(), static_cast<std::streamsize>(leftBytes.size()));
+    right.read(rightBytes.data(), static_cast<std::streamsize>(rightBytes.size()));
+    const auto count = left.gcount();
+    if (count != right.gcount() ||
+        !std::equal(leftBytes.begin(), leftBytes.begin() + count, rightBytes.begin())) {
+      return false;
+    }
+  } while (left);
+  return left.eof() && right.eof();
+}
+
+bool stageFigmaSource(const std::filesystem::path& source, std::string& status) {
+  if (lowerAscii(source.extension().string()) != ".slugui") {
+    status = "Drop rejected: expected a .slugui file";
+    return false;
+  }
+  std::error_code sourceError;
+  if (!std::filesystem::is_regular_file(source, sourceError)) {
+    status = "Drop rejected: file could not be opened";
+    return false;
+  }
+  const std::filesystem::path destination =
+    std::filesystem::path(SLUGVK_DEVELOPMENT_SOURCE_DIR) /
+    "examples" / "figma_group_31.slugui";
+  const std::filesystem::path backup = destination.string() + ".drop-backup";
+  std::error_code equivalentError;
+  if (std::filesystem::equivalent(source, destination, equivalentError) ||
+      sameFileContents(source, destination)) {
+    status = "Already loaded: the dropped .slugui is identical";
+    return false;
+  }
+  const std::filesystem::path compiler =
+    std::filesystem::path(SLUGVK_DEVELOPMENT_SOURCE_DIR) /
+    "tools" / "slugui_compiler.py";
+  const int validation = runProcess(SLUGVK_PYTHON_EXECUTABLE, {
+    compiler.string(), source.string(), "--check",
+    "--namespace", "slugvk::example",
+    "--class-name", "Group_31Generated",
+  });
+  if (validation != 0) {
+    status = validation < 0
+      ? "Drop rejected: the AOT validator could not be started"
+      : "Drop rejected: .slugui syntax or types are invalid";
+    return false;
+  }
+  {
+    std::error_code cleanupError;
+    std::filesystem::remove(backup, cleanupError);
+    std::filesystem::copy_file(
+      destination, backup, std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(
+      source, destination, std::filesystem::copy_options::overwrite_existing);
+  }
+  std::filesystem::last_write_time(
+    destination, std::filesystem::file_time_type::clock::now());
+  status = "Import staged: AOT rebuilding, then replacing this window...";
+  return true;
+}
+
+bool launchExampleRebuild(const std::filesystem::path& currentExecutable) {
+  const std::filesystem::path cmake = SLUGVK_CMAKE_COMMAND;
+  const std::filesystem::path script =
+    std::filesystem::path(SLUGVK_DEVELOPMENT_SOURCE_DIR) /
+    "tools" / "rebuild_example.cmake";
+  return spawnDetached(cmake, {
+    std::string("-DBUILD_DIR=") + SLUGVK_DEVELOPMENT_BUILD_DIR,
+    std::string("-DSOURCE_DIR=") + SLUGVK_DEVELOPMENT_SOURCE_DIR,
+    std::string("-DCONFIG=") + SLUGVK_DEVELOPMENT_CONFIG,
+    std::string("-DEXECUTABLE_PATH=") + currentExecutable.string(),
+    "-P", script.string(),
+  });
+}
+
+Vec2 componentSize(const slugui::Component& component, Vec2 fallback) {
+  const auto width = component.root().layout.width.resolve(component.properties());
+  const auto height = component.root().layout.height.resolve(component.properties());
+  if ((width.unit == slugui::LengthUnit::LogicalPixels ||
+       width.unit == slugui::LengthUnit::PhysicalPixels) && width.value > 0.0f) {
+    fallback.x = width.value;
+  }
+  if ((height.unit == slugui::LengthUnit::LogicalPixels ||
+       height.unit == slugui::LengthUnit::PhysicalPixels) && height.value > 0.0f) {
+    fallback.y = height.value;
+  }
+  return fallback;
+}
+
+enum class DemoPage { Components, TextZoom, SlugUi, FigmaImport };
 
 constexpr std::string_view longText =
   "SLUG VECTOR TEXT - CONTINUOUS SCALE DEMONSTRATION\n"
@@ -155,8 +412,14 @@ int main(int argc, char** argv) try {
     return false;
   };
   const bool smokeTest = hasArgument("--smoke");
+  const bool figmaPreview = hasArgument("--figma");
+  const bool importSucceeded = hasArgument("--import-success");
+  const bool importFailed = hasArgument("--import-failed");
   const bool lowestLatency = !hasArgument("--mailbox");
   VectorAtlas atlas;
+  slugvk::example::SlugUiDemoGenerated slugUiDemo(atlas);
+  slugvk::example::Group_31Generated figmaImportDemo(atlas);
+  const Vec2 figmaDesignSize = componentSize(figmaImportDemo.component, {236.0f, 339.0f});
   const Shapes shapes = buildAtlas(atlas);
 
   Window window({1500, 950, "SlugVulkan - Vector Renderer + Declarative GUI", true, !smokeTest});
@@ -170,7 +433,7 @@ int main(int argc, char** argv) try {
     .validation = smokeTest && validationEnabled,
     .vsync = false,
     .allowTearing = lowestLatency,
-    .gpuTimingInterval = 16
+    .gpuTimingInterval = smokeTest ? 1U : 0U
   });
   std::cout << "SlugVulkan device: " << renderer.deviceName() << '\n';
   std::cout << "Present mode: " << renderer.presentModeName() << " | frames in flight: 1\n";
@@ -183,6 +446,18 @@ int main(int argc, char** argv) try {
   skin.text = textStyle(14);
   UiContext ui(skin);
   DrawList draw;
+  std::array<TextRun, 3> mixedTextRuns;
+  mixedTextRuns[0] = {"Geist 300  ", textStyle(18)};
+  mixedTextRuns[0].style.weight = 300;
+  mixedTextRuns[0].style.paint = Paint::solid(Color::fromRgb8(0x70e1ff));
+  mixedTextRuns[1] = {"700 red  ", textStyle(18)};
+  mixedTextRuns[1].style.weight = 700;
+  mixedTextRuns[1].style.underline = true;
+  mixedTextRuns[1].style.paint = Paint::solid(Color::fromRgb8(0xff5f76));
+  mixedTextRuns[2] = {"900 blue", textStyle(18)};
+  mixedTextRuns[2].style.weight = 900;
+  mixedTextRuns[2].style.strikethrough = true;
+  mixedTextRuns[2].style.paint = Paint::solid(Color::fromRgb8(0x687dff));
   TextStyle retainedDocumentStyle = textStyle(16.0f);
   retainedDocumentStyle.lineHeight = 1.42f;
   retainedDocumentStyle.letterSpacing = 0.1f;
@@ -192,9 +467,11 @@ int main(int argc, char** argv) try {
     longText, {0.0f, 0.0f, 1400.0f, 5000.0f}, retainedDocumentStyle);
   if (retainedDocument == 0) throw std::runtime_error("Could not retain the long text document");
 
-  DemoPage page = DemoPage::Components;
+  DemoPage page = figmaPreview ? DemoPage::FigmaImport : DemoPage::Components;
   float textZoom = 1.0f;
   Vec2 textPan = {};
+  float figmaZoom = 1.0f;
+  Vec2 figmaPan = {};
   int spinValue = 12;
   float sliderValue = 0.42f;
   float continuousCorners = 50.0f;
@@ -203,6 +480,7 @@ int main(int argc, char** argv) try {
   float dashOffset = 4.0f;
   LineCap dashStartCap = LineCap::Butt;
   LineCap dashEndCap = LineCap::Butt;
+  StrokeAlign borderAlign = StrokeAlign::Inside;
   ListBoxModel list{{"Alpha", "Beta", "Gamma", "Delta"}, 1};
   bool checked = true;
   ComboBoxModel combo{{"Vulkan", "Metal via MoltenVK", "DirectX (future)"}, 0, false};
@@ -220,6 +498,32 @@ int main(int argc, char** argv) try {
     {{"Button", "Interactive", "Slug"}, {"Slider", "0.42", "Slug"},
      {"Text", "Vector", "FreeType"}, {"Present", "Synced", "Vulkan"}}, 1, 0};
 
+  namespace sui = slugui;
+  auto& slugUiComponent = slugUiDemo.component;
+  slugUiComponent.properties().bind<std::string>(
+    slugUiDemo.counter_label, {slugUiDemo.clicks.id},
+    [&slugUiDemo](const sui::PropertyStore& values) {
+      return "Immediate clicks: " + std::to_string(values.get(slugUiDemo.clicks));
+    });
+  slugUiComponent.on(slugvk::example::SlugUiDemoGenerated::callback_increment,
+    [&slugUiDemo](const sui::UiEvent& event) {
+      if (event.type == sui::EventType::Activated) {
+        slugUiDemo.component.properties().set(
+          slugUiDemo.clicks,
+          slugUiDemo.component.properties().get(slugUiDemo.clicks) + 1);
+      }
+    });
+  slugUiComponent.on(slugvk::example::SlugUiDemoGenerated::callback_toggle_popup,
+    [&slugUiDemo](const sui::UiEvent& event) {
+      if (event.type == sui::EventType::Activated) {
+        slugUiDemo.component.properties().set(
+          slugUiDemo.popup_visible,
+          !slugUiDemo.component.properties().get(slugUiDemo.popup_visible));
+      }
+    });
+  sui::Runtime slugUiRuntime;
+  sui::Runtime figmaRuntime;
+
   Tween<float> motion = tween(0.0f, 1.0f, 1800.0f, Easing::Spring);
   bool reverseMotion = false;
   int smokeFrames = 0;
@@ -228,6 +532,24 @@ int main(int argc, char** argv) try {
   bool refreshRendered = false;
   Vec2 lastRefreshSize = {};
   std::uint32_t liveRefreshCount = 0;
+  std::optional<std::filesystem::path> pendingDrop;
+  bool rebuildAfterExit = false;
+  std::string dropStatus = importSucceeded
+    ? "Drop import succeeded: generated C++ and Slug atlas were rebuilt"
+    : importFailed
+      ? "Drop import failed: see build/slugui_drop_rebuild.log"
+      : "Drop any exported .slugui anywhere on this window to rebuild and reopen";
+
+  window.setDropCallback([&](const std::vector<std::string>& paths) {
+    const auto found = std::find_if(paths.rbegin(), paths.rend(), [](const std::string& path) {
+      return lowerAscii(std::filesystem::path(path).extension().string()) == ".slugui";
+    });
+    if (found == paths.rend()) {
+      dropStatus = "Drop rejected: expected a .slugui file";
+      return;
+    }
+    pendingDrop = std::filesystem::path(*found);
+  });
 
   const auto drawFrame = [&] {
     const auto now = std::chrono::steady_clock::now();
@@ -240,7 +562,11 @@ int main(int argc, char** argv) try {
       motion.restart(reverseMotion ? 1.0f : 0.0f, reverseMotion ? 0.0f : 1.0f, 1800.0f, Easing::Spring);
     }
     const float animated = motion.update(deltaMs);
-    if (smokeTest && smokeFrames >= 6) page = DemoPage::TextZoom;
+    if (smokeTest) {
+      if (smokeFrames >= 9) page = DemoPage::TextZoom;
+      else if (smokeFrames >= 6) page = DemoPage::FigmaImport;
+      else if (smokeFrames >= 3) page = DemoPage::SlugUi;
+    }
 
     draw.clear();
     const Vec2 framebuffer = window.framebufferSize();
@@ -260,15 +586,23 @@ int main(int argc, char** argv) try {
     // Sample after the static header is declared, immediately before latency-critical interactions.
     window.resampleCursor();
     ui.beginFrame(window.input(), draw);
-    const float navigationX = std::max(700.0f, framebuffer.x - 426.0f);
+    const float navigationX = std::max(430.0f, framebuffer.x - 628.0f);
     if (ui.button(hashId("page-components"),
                   page == DemoPage::Components ? "[ Components ]" : "Components",
-                  {navigationX, 34, 190, 34}))
+                  {navigationX, 34, 145, 34}))
       page = DemoPage::Components;
     if (ui.button(hashId("page-text-zoom"),
-                  page == DemoPage::TextZoom ? "[ Slug Text Zoom ]" : "Slug Text Zoom",
-                  {navigationX + 202.0f, 34, 190, 34}))
+                  page == DemoPage::TextZoom ? "[ Text Zoom ]" : "Text Zoom",
+                  {navigationX + 153.0f, 34, 145, 34}))
       page = DemoPage::TextZoom;
+    if (ui.button(hashId("page-slugui"),
+                  page == DemoPage::SlugUi ? "[ SlugUI IR ]" : "SlugUI IR",
+                  {navigationX + 306.0f, 34, 145, 34}))
+      page = DemoPage::SlugUi;
+    if (ui.button(hashId("page-figma-import"),
+                  page == DemoPage::FigmaImport ? "[ Figma Import ]" : "Figma Import",
+                  {navigationX + 459.0f, 34, 145, 34}))
+      page = DemoPage::FigmaImport;
 
     if (page == DemoPage::Components) {
 
@@ -279,9 +613,18 @@ int main(int argc, char** argv) try {
       Paint::solid(Color::fromRgb8(0x4f67ff), 0.84f), {0.0f, 35.0f, 70.0f, 100.0f});
     ui.slider(hashId("continuous-corners"), "Corner %", {235, 184, 180, 20},
               continuousCorners, 0.0f, 100.0f);
+    BorderStyle alignedBorder;
+    alignedBorder.paint = Paint::gradient(
+      GradientKind::Linear, Color::fromRgb8(0x70e1ff),
+      Color::fromRgb8(0x8cff81), {0, 0}, {1, 0});
+    alignedBorder.align = borderAlign;
+    alignedBorder.individualWidths = BorderWidths{1.0f, 3.0f, 5.0f, 7.0f};
     draw.roundedRect({235, 149, 180, 37}, 10.0f,
       Paint::gradient(GradientKind::Linear, Color::fromRgb8(0xff4d8d), Color::fromRgb8(0xffca55), {0, 0}, {1, 0}),
-      continuousCorners);
+      continuousCorners, alignedBorder);
+    if (ui.button(hashId("stroke-align"), std::string("Stroke: ") + alignName(borderAlign),
+                  {275, 112, 140, 26}))
+      borderAlign = nextAlign(borderAlign);
     draw.shape(shapes.polygon, {38, 204, 72, 72},
       Paint::gradient(GradientKind::Diamond, Color::fromRgb8(0x86f7d4), Color::fromRgb8(0x116a9c), {.5f, .5f}, {1, 1}));
     draw.shape(shapes.circle, {130, 204, 72, 72},
@@ -307,7 +650,8 @@ int main(int argc, char** argv) try {
                   {165, 282, 120, 24}))
       dashEndCap = nextCap(dashEndCap);
     draw.text("per-corner / opacity", {42, 155, 165, 20}, textStyle(12));
-    draw.text("Continuous Corners " + std::to_string(static_cast<int>(continuousCorners + 0.5f)) + "%",
+    draw.text("Corners " + std::to_string(static_cast<int>(continuousCorners + 0.5f)) +
+              "% / T1 R3 B5 L7",
               {242, 155, 165, 20}, textStyle(12));
     draw.text("mixed per-dash overrides", {292, 294, 125, 18}, textStyle(10));
 
@@ -318,12 +662,7 @@ int main(int argc, char** argv) try {
     display.bold = true;
     display.paint = Paint::gradient(GradientKind::Linear, Color::fromRgb8(0x70e1ff), Color::fromRgb8(0xb777ff));
     draw.text("Crisp at every scale", {35, 390, 385, 42}, display);
-    TextStyle decorated = textStyle(18);
-    decorated.italic = true;
-    decorated.underline = true;
-    decorated.strikethrough = true;
-    decorated.letterSpacing = 1.3f;
-    draw.text("Bold  Italic  Underline  Strike", {35, 443, 385, 30}, decorated);
+    draw.textRunsStatic(mixedTextRuns, {35, 443, 385, 30}, textStyle(18));
     TextStyle centered = textStyle(15);
     centered.align = HorizontalAlign::Center;
     centered.lineHeight = 1.55f;
@@ -383,7 +722,7 @@ int main(int argc, char** argv) try {
     ui.scrollBar(hashId("scroll-v"), {framebuffer.x - 55, 600, 20, 125}, scrollValue, 0.32f);
     draw.shape(shapes.circle, {1042 + animated * std::max(0.0f, framebuffer.x - 1165), 625, 56, 56}, skin.accent);
     draw.text("Tween: 0 -> 1 / 1800 ms / spring easing", {1042, 690, framebuffer.x - 1100, 28}, textStyle(13));
-    } else {
+    } else if (page == DemoPage::TextZoom) {
       const Rect document{42.0f, 190.0f, framebuffer.x - 84.0f, std::max(120.0f, framebuffer.y - 254.0f)};
       const auto& zoomInput = window.input();
       const Interaction documentDrag = ui.interaction(hashId("text-document-pan"), document);
@@ -435,6 +774,62 @@ int main(int argc, char** argv) try {
                         {document.x + 24.0f + textPan.x, document.y + 38.0f + textPan.y},
                         textZoom);
       draw.setClip(oldClip);
+    } else if (page == DemoPage::SlugUi) {
+      const Rect slugUiViewport{
+        18.0f, 105.0f, framebuffer.x - 36.0f,
+        std::max(160.0f, framebuffer.y - 167.0f)};
+      slugUiRuntime.render(slugUiDemo.component, window.input(), draw, slugUiViewport,
+                           window.contentScale());
+    } else {
+      draw.roundedRect({18, 105, framebuffer.x - 36, framebuffer.y - 167},
+                       14.0f, skin.panel, 100.0f);
+      draw.text("FIGMA -> SLUGUI -> AOT -> SLUG/VULKAN",
+                {38, 119, 520, 27}, textStyle(15));
+      TextStyle help = textStyle(12);
+      help.paint = skin.muted;
+      draw.text("Figma .slugui | wheel to zoom | left-drag to pan | SVG fill/stroke geometry uses Slug",
+                {38, 145, framebuffer.x - 280, 22}, help);
+      TextStyle dropHelp = textStyle(11);
+      dropHelp.paint = importFailed ? Paint::solid(Color::fromRgb8(0xff6b7a)) : skin.muted;
+      draw.text(dropStatus, {38, 163, framebuffer.x - 280, 18}, dropHelp);
+      if (ui.button(hashId("figma-reset"), "Reset view",
+                    {framebuffer.x - 150, 126, 112, 36})) {
+        figmaZoom = 1.0f;
+        figmaPan = {};
+      }
+
+      const Rect canvas{38.0f, 178.0f, framebuffer.x - 76.0f,
+                        std::max(100.0f, framebuffer.y - 242.0f)};
+      const Interaction drag = ui.interaction(hashId("figma-import-pan"), canvas);
+      if (drag.held) figmaPan = figmaPan + drag.cursorDelta;
+      const Vec2 canvasCenter{canvas.x + canvas.width * 0.5f,
+                              canvas.y + canvas.height * 0.5f};
+      const Vec2 designSize = figmaDesignSize;
+      const float fitScale = std::max(0.1f, std::min(
+        (canvas.width - 40.0f) / designSize.x,
+        (canvas.height - 40.0f) / designSize.y));
+      const float previousZoom = figmaZoom;
+      const Vec2 cursor = window.input().cursorPosition();
+      if (canvas.contains(cursor) && std::abs(window.input().scroll().delta.y) > 0.0001f)
+        figmaZoom *= std::exp(window.input().scroll().delta.y * 0.13f);
+      figmaZoom = std::clamp(figmaZoom, 0.2f, 8.0f);
+      if (std::abs(figmaZoom - previousZoom) > 0.000001f) {
+        const float oldScale = fitScale * previousZoom;
+        const float newScale = fitScale * figmaZoom;
+        const Vec2 oldOrigin = canvasCenter + figmaPan - designSize * (oldScale * 0.5f);
+        const Vec2 localAnchor = (cursor - oldOrigin) * (1.0f / oldScale);
+        figmaPan = cursor - canvasCenter + designSize * (newScale * 0.5f) -
+                   localAnchor * newScale;
+      }
+
+      draw.roundedRect(canvas, 12.0f,
+        drag.held ? Paint::solid(Color::fromRgb8(0x151d31))
+                  : Paint::solid(Color::fromRgb8(0x0d1323)), 100.0f);
+      const float renderScale = fitScale * figmaZoom;
+      const Vec2 origin = canvasCenter + figmaPan - designSize * (renderScale * 0.5f);
+      figmaRuntime.render(figmaImportDemo.component, window.input(), draw,
+                          {origin.x, origin.y, designSize.x * renderScale,
+                           designSize.y * renderScale}, renderScale);
     }
 
     ui.endFrame();
@@ -477,6 +872,17 @@ int main(int argc, char** argv) try {
     refreshRendered = false;
     renderer.prepareFrame();
     window.pollEvents();
+    if (pendingDrop) {
+      try {
+        if (stageFigmaSource(*pendingDrop, dropStatus)) {
+          rebuildAfterExit = true;
+          window.requestClose();
+        }
+      } catch (const std::exception& error) {
+        dropStatus = std::string("Drop import failed: ") + error.what();
+      }
+      pendingDrop.reset();
+    }
     if (!refreshRendered) drawFrame();
     if (smokeTest) {
       ++smokeFrames;
@@ -485,7 +891,13 @@ int main(int argc, char** argv) try {
     }
   }
   window.setRefreshCallback({});
+  window.setDropCallback({});
   renderer.waitIdle();
+  if (rebuildAfterExit) {
+    const auto executable = std::filesystem::absolute(argv[0]);
+    if (!launchExampleRebuild(executable))
+      throw std::runtime_error("Could not start the detached .slugui rebuild helper");
+  }
   if (smokeTest) {
     const auto finalStats = renderer.stats();
     std::cout << "Smoke batch: " << finalStats.drawCalls << " draw, " << finalStats.quads << " quads, "

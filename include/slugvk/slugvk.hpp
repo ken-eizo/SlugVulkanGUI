@@ -5,6 +5,7 @@
 #include "slugvk/input.hpp"
 #include "slugvk/layout.hpp"
 #include "slugvk/platform_surface.hpp"
+#include "slugvk/slugui.hpp"
 #include "slugvk/text_edit.hpp"
 #include "slugvk/types.hpp"
 #include "slugvk/ui.hpp"

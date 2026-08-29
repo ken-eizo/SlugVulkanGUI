@@ -79,12 +79,156 @@ private:
   Window& window_;
   std::vector<const char*> extensions_;
 };
+constexpr float roundedRectFillCoverage = 0.0f;
+constexpr float roundedRectStrokeRingCoverage = 1.0f;
+constexpr float roundedRectOpaqueBorderCoverage = 2.0f;
+constexpr float roundedRectInnerFillCoverage = -1.0f;
+constexpr float paintAlphaEpsilon = 1.0f / 65535.0f;
 
 std::uint32_t packFixed16(float first, float second, float scale, float maximum) {
   const auto quantize = [scale, maximum](float value) {
     return static_cast<std::uint32_t>(std::lround(std::clamp(value, 0.0f, maximum) * scale));
   };
   return quantize(first) | (quantize(second) << 16U);
+}
+
+bool isSrgbFormat(VkFormat format) {
+  return format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_R8G8B8A8_SRGB;
+}
+
+float srgbToLinear(float value) {
+  value = std::clamp(value, 0.0f, 1.0f);
+  return value <= 0.04045f ? value / 12.92f :
+    std::pow((value + 0.055f) / 1.055f, 2.4f);
+}
+
+bool paintFullyOpaque(const Paint& paint) {
+  return paint.opacity * std::min(paint.start.a, paint.end.a) >= 1.0f - paintAlphaEpsilon;
+}
+
+bool paintFullyTransparent(const Paint& paint) {
+  return paint.opacity <= paintAlphaEpsilon ||
+    std::max(paint.start.a, paint.end.a) <= paintAlphaEpsilon;
+}
+
+BorderWidths resolvedBorderWidths(const BorderStyle& border) {
+  BorderWidths widths = border.resolvedWidths();
+  widths.top = std::max(widths.top, 0.0f);
+  widths.right = std::max(widths.right, 0.0f);
+  widths.bottom = std::max(widths.bottom, 0.0f);
+  widths.left = std::max(widths.left, 0.0f);
+  return widths;
+}
+
+float strokeOutsideFactor(StrokeAlign align) {
+  if (align == StrokeAlign::Center) return 0.5f;
+  if (align == StrokeAlign::Outside) return 1.0f;
+  return 0.0f;
+}
+
+Rect strokeBounds(Rect destination, BorderWidths widths, float outsideFactor) {
+  const float outsideTop = widths.top * outsideFactor;
+  const float outsideRight = widths.right * outsideFactor;
+  const float outsideBottom = widths.bottom * outsideFactor;
+  const float outsideLeft = widths.left * outsideFactor;
+  return {
+    destination.x - outsideLeft,
+    destination.y - outsideTop,
+    destination.width + outsideLeft + outsideRight,
+    destination.height + outsideTop + outsideBottom
+  };
+}
+
+bool sameRoundedRectGeometry(const RoundedRectCommand& first, const RoundedRectCommand& second) {
+  const auto close = [](float a, float b) { return std::abs(a - b) <= 0.0001f; };
+  const auto sameRect = [&close](Rect a, Rect b) {
+    return close(a.x, b.x) && close(a.y, b.y) &&
+      close(a.width, b.width) && close(a.height, b.height);
+  };
+  return sameRect(first.destination, second.destination) && sameRect(first.clip, second.clip) &&
+    close(first.radiiPx.topLeft, second.radiiPx.topLeft) &&
+    close(first.radiiPx.topRight, second.radiiPx.topRight) &&
+    close(first.radiiPx.bottomRight, second.radiiPx.bottomRight) &&
+    close(first.radiiPx.bottomLeft, second.radiiPx.bottomLeft) &&
+    close(first.continuousCorners.topLeftPercent,
+          second.continuousCorners.topLeftPercent) &&
+    close(first.continuousCorners.topRightPercent,
+          second.continuousCorners.topRightPercent) &&
+    close(first.continuousCorners.bottomRightPercent,
+          second.continuousCorners.bottomRightPercent) &&
+    close(first.continuousCorners.bottomLeftPercent,
+          second.continuousCorners.bottomLeftPercent) &&
+    first.border.align == second.border.align;
+}
+
+Rect intersectRects(Rect first, Rect second) {
+  const float left = std::max(first.x, second.x);
+  const float top = std::max(first.y, second.y);
+  const float right = std::min(first.x + first.width, second.x + second.width);
+  const float bottom = std::min(first.y + first.height, second.y + second.height);
+  return {left, top, std::max(0.0f, right - left), std::max(0.0f, bottom - top)};
+}
+
+bool sameSolidPaint(const Paint& first, const Paint& second) {
+  const auto close = [](float a, float b) { return std::abs(a - b) <= 0.0001f; };
+  return first.kind == GradientKind::Solid && second.kind == GradientKind::Solid &&
+    close(first.start.r, second.start.r) && close(first.start.g, second.start.g) &&
+    close(first.start.b, second.start.b) && close(first.start.a, second.start.a) &&
+    close(first.opacity, second.opacity);
+}
+
+bool opaqueInsideBorderCovers(const RoundedRectCommand& earlier,
+                              const RoundedRectCommand& later) {
+  if (earlier.border.align != StrokeAlign::Inside ||
+      later.border.align != StrokeAlign::Inside ||
+      !paintFullyOpaque(earlier.border.paint) ||
+      !sameSolidPaint(earlier.border.paint, later.border.paint)) return false;
+  const BorderWidths first = resolvedBorderWidths(earlier.border);
+  const BorderWidths second = resolvedBorderWidths(later.border);
+  const auto close = [](float a, float b) { return std::abs(a - b) <= 0.0001f; };
+  const auto greaterOrEqual = [&close](float a, float b) { return a > b || close(a, b); };
+  const float firstRight = earlier.destination.x + earlier.destination.width;
+  const float firstBottom = earlier.destination.y + earlier.destination.height;
+  const float secondRight = later.destination.x + later.destination.width;
+  const float secondBottom = later.destination.y + later.destination.height;
+
+  if (second.top > 0.0f &&
+      (!greaterOrEqual(first.top, second.top) ||
+       !close(earlier.destination.x, later.destination.x) ||
+       !close(firstRight, secondRight) ||
+       !close(earlier.destination.y, later.destination.y) ||
+       !close(earlier.radiiPx.topLeft, later.radiiPx.topLeft) ||
+       !close(earlier.radiiPx.topRight, later.radiiPx.topRight))) return false;
+  if (second.bottom > 0.0f &&
+      (!greaterOrEqual(first.bottom, second.bottom) ||
+       !close(earlier.destination.x, later.destination.x) ||
+       !close(firstRight, secondRight) || !close(firstBottom, secondBottom) ||
+       !close(earlier.radiiPx.bottomLeft, later.radiiPx.bottomLeft) ||
+       !close(earlier.radiiPx.bottomRight, later.radiiPx.bottomRight))) return false;
+  if (second.left > 0.0f) {
+    if (!greaterOrEqual(first.left, second.left) ||
+        !close(earlier.destination.x, later.destination.x) ||
+        earlier.destination.y > later.destination.y + 0.0001f ||
+        firstBottom + 0.0001f < secondBottom) return false;
+    if (close(earlier.destination.y, later.destination.y)) {
+      if (!close(earlier.radiiPx.topLeft, later.radiiPx.topLeft)) return false;
+    } else if (later.radiiPx.topLeft > 0.0001f) return false;
+    if (close(firstBottom, secondBottom)) {
+      if (!close(earlier.radiiPx.bottomLeft, later.radiiPx.bottomLeft)) return false;
+    } else if (later.radiiPx.bottomLeft > 0.0001f) return false;
+  }
+  if (second.right > 0.0f) {
+    if (!greaterOrEqual(first.right, second.right) || !close(firstRight, secondRight) ||
+        earlier.destination.y > later.destination.y + 0.0001f ||
+        firstBottom + 0.0001f < secondBottom) return false;
+    if (close(earlier.destination.y, later.destination.y)) {
+      if (!close(earlier.radiiPx.topRight, later.radiiPx.topRight)) return false;
+    } else if (later.radiiPx.topRight > 0.0001f) return false;
+    if (close(firstBottom, secondBottom)) {
+      if (!close(earlier.radiiPx.bottomRight, later.radiiPx.bottomRight)) return false;
+    } else if (later.radiiPx.bottomRight > 0.0001f) return false;
+  }
+  return second.maximum() > 0.0f;
 }
 
 void check(VkResult result, const char* operation) {
@@ -190,6 +334,7 @@ struct Instance {
   float paint[4];
   float gradient[4];
   float clip[4];
+  float strokeWidths[4];
 };
 
 struct Buffer {
@@ -745,18 +890,19 @@ struct VulkanRenderer::Impl {
     const std::array stages{vertexStage, fragmentStage};
 
     VkVertexInputBindingDescription binding{0, sizeof(Instance), VK_VERTEX_INPUT_RATE_INSTANCE};
-    std::array<VkVertexInputAttributeDescription, 9> attributes{
-        {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, positionRect)},
-         {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, emRect)},
-         {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, bandTransform)},
-         {3, 0, VK_FORMAT_R32G32B32A32_UINT, offsetof(Instance, shapeData)},
-         {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color0)},
-         {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color1)},
-         {6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, paint)},
-         {7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, gradient)},
-         {8, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, clip)}}};
-    VkPipelineVertexInputStateCreateInfo vertexInput{
-        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    std::array<VkVertexInputAttributeDescription, 10> attributes{{
+      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, positionRect)},
+      {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, emRect)},
+      {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, bandTransform)},
+      {3, 0, VK_FORMAT_R32G32B32A32_UINT, offsetof(Instance, shapeData)},
+      {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color0)},
+      {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, color1)},
+      {6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, paint)},
+      {7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, gradient)},
+      {8, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, clip)},
+      {9, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, strokeWidths)}
+    }};
+    VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vertexInput.vertexBindingDescriptionCount = 1;
     vertexInput.pVertexBindingDescriptions = &binding;
     vertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());
@@ -796,7 +942,7 @@ struct VulkanRenderer::Impl {
     dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
     dynamic.pDynamicStates = dynamicStates.data();
     VkPushConstantRange push{};
-    push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     push.size = sizeof(PushConstants);
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout.setLayoutCount = 1;
@@ -1049,11 +1195,11 @@ struct VulkanRenderer::Impl {
       appendResolvedShape(instances, *shape, destination, paintValue, clip, italicShear);
   }
 
-  void appendRoundedRect(std::vector<Instance>& instances,
-                         const RoundedRectCommand& command) const {
-    const Rect destination = command.destination;
-    if (destination.width <= 0.0f || destination.height <= 0.0f)
-      return;
+  void appendRoundedRectInstance(std::vector<Instance>& instances,
+                                 const RoundedRectCommand& command, Rect destination,
+                                 const Paint& paintValue, BorderWidths strokeWidths,
+                                 float outsetFactor, float coverageMode) const {
+    if (destination.width <= 0.0f || destination.height <= 0.0f) return;
     constexpr float padding = 1.25f;
     const float left = destination.x - padding;
     const float top = destination.y - padding;
@@ -1079,12 +1225,11 @@ struct VulkanRenderer::Impl {
       if (sum > 0.0f)
         radiusScale = std::min(radiusScale, available / sum);
     };
-    fit(destination.width, radii[0] + radii[1]);
-    fit(destination.width, radii[3] + radii[2]);
-    fit(destination.height, radii[0] + radii[3]);
-    fit(destination.height, radii[1] + radii[2]);
-    for (float& radius : radii)
-      radius *= std::clamp(radiusScale, 0.0f, 1.0f);
+    fit(command.destination.width, radii[0] + radii[1]);
+    fit(command.destination.width, radii[3] + radii[2]);
+    fit(command.destination.height, radii[0] + radii[3]);
+    fit(command.destination.height, radii[1] + radii[2]);
+    for (float& radius : radii) radius *= std::clamp(radiusScale, 0.0f, 1.0f);
     const std::array<float, 4> smoothing{
         std::clamp(command.continuousCorners.topLeftPercent, 0.0f, 100.0f),
         std::clamp(command.continuousCorners.topRightPercent, 0.0f, 100.0f),
@@ -1092,31 +1237,132 @@ struct VulkanRenderer::Impl {
         std::clamp(command.continuousCorners.bottomLeftPercent, 0.0f, 100.0f)};
     quad.bandTransform[0] = destination.width;
     quad.bandTransform[1] = destination.height;
+    quad.bandTransform[2] = coverageMode;
+    quad.bandTransform[3] = std::clamp(outsetFactor, 0.0f, 1.0f);
     quad.shapeData[0] = analyticRoundedRectShape;
-    // Four radii (1/16 px) and four smoothing percentages (1/256%) fit unused analytic-instance
-    // words. Ordinary Slug glyph/shape instances therefore do not grow by a single byte.
+    // Four radii and four smoothing percentages remain compactly packed. The separate side-width
+    // vector is zero for ordinary Slug glyph/shape instances and avoids extra draw calls.
     quad.shapeData[1] = packFixed16(radii[0], radii[1], 16.0f, 4095.9375f);
     quad.shapeData[2] = packFixed16(radii[2], radii[3], 16.0f, 4095.9375f);
     quad.shapeData[3] = packFixed16(smoothing[0], smoothing[1], 256.0f, 100.0f);
-    const float first[4]{command.paint.start.r, command.paint.start.g, command.paint.start.b,
-                         command.paint.start.a};
-    const float second[4]{command.paint.end.r, command.paint.end.g, command.paint.end.b,
-                          command.paint.end.a};
+    const float first[4]{paintValue.start.r, paintValue.start.g,
+                         paintValue.start.b, paintValue.start.a};
+    const float second[4]{paintValue.end.r, paintValue.end.g,
+                          paintValue.end.b, paintValue.end.a};
     std::copy(std::begin(first), std::end(first), quad.color0);
     std::copy(std::begin(second), std::end(second), quad.color1);
-    quad.paint[0] = static_cast<float>(command.paint.kind);
-    quad.paint[1] = command.paint.opacity;
-    quad.paint[2] = command.paint.shaderParameter;
-    quad.paint[3] = std::bit_cast<float>(packFixed16(smoothing[2], smoothing[3], 256.0f, 100.0f));
-    quad.gradient[0] = command.paint.origin.x;
-    quad.gradient[1] = command.paint.origin.y;
-    quad.gradient[2] = command.paint.target.x;
-    quad.gradient[3] = command.paint.target.y;
+    quad.paint[0] = static_cast<float>(paintValue.kind);
+    quad.paint[1] = paintValue.opacity;
+    quad.paint[2] = paintValue.shaderParameter;
+    quad.paint[3] =
+      std::bit_cast<float>(packFixed16(smoothing[2], smoothing[3], 256.0f, 100.0f));
+    quad.gradient[0] = paintValue.origin.x;
+    quad.gradient[1] = paintValue.origin.y;
+    quad.gradient[2] = paintValue.target.x;
+    quad.gradient[3] = paintValue.target.y;
     quad.clip[0] = command.clip.x;
     quad.clip[1] = command.clip.y;
     quad.clip[2] = command.clip.width;
     quad.clip[3] = command.clip.height;
+    quad.strokeWidths[0] = std::max(strokeWidths.top, 0.0f);
+    quad.strokeWidths[1] = std::max(strokeWidths.right, 0.0f);
+    quad.strokeWidths[2] = std::max(strokeWidths.bottom, 0.0f);
+    quad.strokeWidths[3] = std::max(strokeWidths.left, 0.0f);
     instances.push_back(quad);
+  }
+
+  void appendOpaqueBorder(std::vector<Instance>& instances,
+                          const RoundedRectCommand& command,
+                          BorderWidths widths, float outsideFactor) const {
+    if (widths.maximum() <= 0.0f || !paintFullyOpaque(command.border.paint)) return;
+    appendRoundedRectInstance(instances, command,
+                              strokeBounds(command.destination, widths, outsideFactor),
+                              command.border.paint, widths, outsideFactor,
+                              roundedRectOpaqueBorderCoverage);
+  }
+
+  void appendRoundedRect(std::vector<Instance>& instances,
+                         const RoundedRectCommand& command) const {
+    const BorderWidths widths = resolvedBorderWidths(command.border);
+    if (widths.maximum() <= 0.0f || paintFullyTransparent(command.border.paint)) {
+      if (!paintFullyTransparent(command.paint))
+        appendRoundedRectInstance(instances, command, command.destination, command.paint, {},
+                                  0.0f, roundedRectFillCoverage);
+      return;
+    }
+
+    const float outsideFactor = strokeOutsideFactor(command.border.align);
+    const Rect borderBounds = strokeBounds(command.destination, widths, outsideFactor);
+    if (paintFullyOpaque(command.border.paint)) {
+      // Opaque vector paints share one outside coverage domain: border first, then an inner fill.
+      // This prevents the full-size fill from leaking through the border's AA pixels.
+      appendOpaqueBorder(instances, command, widths, outsideFactor);
+      if (!paintFullyTransparent(command.paint))
+        appendRoundedRectInstance(instances, command, command.destination, command.paint, widths,
+                                  outsideFactor, roundedRectInnerFillCoverage);
+    } else {
+      // A translucent stroke intentionally reveals the fill below and retains source-over order.
+      if (!paintFullyTransparent(command.paint))
+        appendRoundedRectInstance(instances, command, command.destination, command.paint, {},
+                                  0.0f, roundedRectFillCoverage);
+      appendRoundedRectInstance(instances, command, borderBounds, command.border.paint, widths,
+                                outsideFactor, roundedRectStrokeRingCoverage);
+    }
+  }
+
+  void appendOpaqueRoundedRectStack(std::vector<Instance>& instances,
+                                    const std::vector<DisplayCommand>& commands,
+                                    std::size_t begin, std::size_t end) const {
+    const auto& base = std::get<RoundedRectCommand>(commands[begin]);
+    const float outsideFactor = strokeOutsideFactor(base.border.align);
+    BorderWidths combined{};
+    for (std::size_t index = begin; index < end; ++index) {
+      const auto& command = std::get<RoundedRectCommand>(commands[index]);
+      const BorderWidths widths = resolvedBorderWidths(command.border);
+      if (!paintFullyOpaque(command.border.paint) || widths.maximum() <= 0.0f) continue;
+      combined.top = std::max(combined.top, widths.top);
+      combined.right = std::max(combined.right, widths.right);
+      combined.bottom = std::max(combined.bottom, widths.bottom);
+      combined.left = std::max(combined.left, widths.left);
+
+      bool coveredByEarlierEdge = false;
+      for (std::size_t earlierIndex = 0; earlierIndex < index; ++earlierIndex) {
+        const auto* earlier = std::get_if<RoundedRectCommand>(&commands[earlierIndex]);
+        if (earlier && opaqueInsideBorderCovers(*earlier, command)) {
+          coveredByEarlierEdge = true;
+          break;
+        }
+      }
+      if (coveredByEarlierEdge) continue;
+
+      RoundedRectCommand visible = command;
+      if (command.border.align == StrokeAlign::Inside) {
+        BorderWidths later{};
+        for (std::size_t laterIndex = index + 1; laterIndex < end; ++laterIndex) {
+          const auto& overlay = std::get<RoundedRectCommand>(commands[laterIndex]);
+          if (!paintFullyOpaque(overlay.border.paint)) continue;
+          const BorderWidths overlayWidths = resolvedBorderWidths(overlay.border);
+          later.top = std::max(later.top, overlayWidths.top);
+          later.right = std::max(later.right, overlayWidths.right);
+          later.bottom = std::max(later.bottom, overlayWidths.bottom);
+          later.left = std::max(later.left, overlayWidths.left);
+        }
+        const Rect owner{
+          command.destination.x + later.left,
+          command.destination.y + later.top,
+          std::max(0.0f, command.destination.width - later.left - later.right),
+          std::max(0.0f, command.destination.height - later.top - later.bottom)
+        };
+        visible.clip = intersectRects(command.clip, owner);
+      }
+      appendOpaqueBorder(instances, visible, widths, outsideFactor);
+    }
+    // Figma commonly represents different side paints as coincident rectangles. Their opaque
+    // border masks are emitted in painter order, while the one visible fill is inset by the union
+    // of all four side widths and emitted once. The outer AA therefore cannot double-composite.
+    if (!paintFullyTransparent(base.paint))
+      appendRoundedRectInstance(instances, base, base.destination, base.paint, combined,
+                                outsideFactor, roundedRectInnerFillCoverage);
   }
 
   void appendStrokeSegment(std::vector<Instance>& instances, Vec2 from, Vec2 to,
@@ -1124,25 +1370,20 @@ struct VulkanRenderer::Impl {
                            bool lastSegment) const {
     const float dx = to.x - from.x;
     const float dy = to.y - from.y;
-    if (dx * dx + dy * dy <= 1.0e-8f)
-      return;
+    if (dx * dx + dy * dy <= 1.0e-8f) return;
 
-    const float halfWidth = command.style.width * 0.5f;
-    constexpr float aaPadding = 1.5f;
-    const float padding = halfWidth + aaPadding;
+    const float padding = command.style.width * 0.5f + 1.5f;
     const float left = std::min(from.x, to.x) - padding;
     const float top = std::min(from.y, to.y) - padding;
     const float right = std::max(from.x, to.x) + padding;
     const float bottom = std::max(from.y, to.y) + padding;
     if (right <= command.clip.x || left >= command.clip.x + command.clip.width ||
-        bottom <= command.clip.y || top >= command.clip.y + command.clip.height)
-      return;
+        bottom <= command.clip.y || top >= command.clip.y + command.clip.height) return;
 
     Instance quad{};
-    const float positionRect[4]{left, top, right, bottom};
-    const float emRect[4]{left, top, right, bottom};
-    std::copy(std::begin(positionRect), std::end(positionRect), quad.positionRect);
-    std::copy(std::begin(emRect), std::end(emRect), quad.emRect);
+    const float bounds[4]{left, top, right, bottom};
+    std::copy(std::begin(bounds), std::end(bounds), quad.positionRect);
+    std::copy(std::begin(bounds), std::end(bounds), quad.emRect);
     quad.bandTransform[0] = from.x;
     quad.bandTransform[1] = from.y;
     quad.bandTransform[2] = to.x;
@@ -1152,20 +1393,19 @@ struct VulkanRenderer::Impl {
     const bool roundStart = !firstSegment || roundJoin || command.style.cap == LineCap::Round;
     const bool roundEnd = !lastSegment || roundJoin || command.style.cap == LineCap::Round;
     quad.shapeData[1] = (roundStart ? 1U : 0U) | (roundEnd ? 2U : 0U);
-    const float first[4]{command.style.paint.start.r, command.style.paint.start.g,
-                         command.style.paint.start.b, command.style.paint.start.a};
-    const float second[4]{command.style.paint.end.r, command.style.paint.end.g,
-                          command.style.paint.end.b, command.style.paint.end.a};
+    const auto& paint = command.style.paint;
+    const float first[4]{paint.start.r, paint.start.g, paint.start.b, paint.start.a};
+    const float second[4]{paint.end.r, paint.end.g, paint.end.b, paint.end.a};
     std::copy(std::begin(first), std::end(first), quad.color0);
     std::copy(std::begin(second), std::end(second), quad.color1);
-    quad.paint[0] = static_cast<float>(command.style.paint.kind);
-    quad.paint[1] = command.style.paint.opacity;
-    quad.paint[2] = command.style.paint.shaderParameter;
+    quad.paint[0] = static_cast<float>(paint.kind);
+    quad.paint[1] = paint.opacity;
+    quad.paint[2] = paint.shaderParameter;
     quad.paint[3] = command.style.width;
-    quad.gradient[0] = command.style.paint.origin.x;
-    quad.gradient[1] = command.style.paint.origin.y;
-    quad.gradient[2] = command.style.paint.target.x;
-    quad.gradient[3] = command.style.paint.target.y;
+    quad.gradient[0] = paint.origin.x;
+    quad.gradient[1] = paint.origin.y;
+    quad.gradient[2] = paint.target.x;
+    quad.gradient[3] = paint.target.y;
     quad.clip[0] = command.clip.x;
     quad.clip[1] = command.clip.y;
     quad.clip[2] = command.clip.width;
@@ -1181,22 +1421,22 @@ struct VulkanRenderer::Impl {
                                  length(command.control2, command.to);
     const float chord = length(command.from, command.to);
     const float curvature = std::max(0.0f, controlPolygon - chord);
-    const int segmentCount =
-        std::clamp(static_cast<int>(std::ceil(controlPolygon / 14.0f + curvature / 6.0f)), 4, 64);
+    const int segments =
+      std::clamp(static_cast<int>(std::ceil(controlPolygon / 14.0f + curvature / 6.0f)), 4, 64);
     const auto pointAt = [&](float t) {
       const float u = 1.0f - t;
       const float uu = u * u;
       const float tt = t * t;
       return Vec2{uu * u * command.from.x + 3.0f * uu * t * command.control1.x +
-                      3.0f * u * tt * command.control2.x + tt * t * command.to.x,
+                    3.0f * u * tt * command.control2.x + tt * t * command.to.x,
                   uu * u * command.from.y + 3.0f * uu * t * command.control1.y +
-                      3.0f * u * tt * command.control2.y + tt * t * command.to.y};
+                    3.0f * u * tt * command.control2.y + tt * t * command.to.y};
     };
 
     Vec2 previous = command.from;
-    for (int index = 1; index <= segmentCount; ++index) {
-      const Vec2 current = pointAt(static_cast<float>(index) / static_cast<float>(segmentCount));
-      appendStrokeSegment(instances, previous, current, command, index == 1, index == segmentCount);
+    for (int index = 1; index <= segments; ++index) {
+      const Vec2 current = pointAt(static_cast<float>(index) / static_cast<float>(segments));
+      appendStrokeSegment(instances, previous, current, command, index == 1, index == segments);
       previous = current;
     }
   }
@@ -1204,15 +1444,163 @@ struct VulkanRenderer::Impl {
   float textWidth(const std::vector<std::uint32_t>& codepoints, const TextStyle& style) const {
     float width = 0.0f;
     for (auto codepoint : codepoints) {
-      const auto glyph = vectorAtlas.native().getShape(
-          slughorn::Key(vectorAtlas.glyph(codepoint, style.fontName)));
-      width +=
-          (glyph ? static_cast<float>(glyph->advance) : 0.6f) * style.size + style.letterSpacing;
+      const auto glyph = vectorAtlas.native().getShape(slughorn::Key(
+        vectorAtlas.glyph(codepoint, style.fontName, style.weight, style.italic)));
+      width += (glyph ? static_cast<float>(glyph->advance) : 0.6f) * style.size + style.letterSpacing;
     }
     return std::max(0.0f, width - style.letterSpacing);
   }
 
+  float textWidth(std::string_view text, const TextStyle& style, float scale) const {
+    auto scaled = style;
+    scaled.size *= scale;
+    scaled.letterSpacing *= scale;
+    return textWidth(decodeUtf8(text), scaled);
+  }
+
+  void appendRichText(std::vector<Instance>& instances, const TextCommand& command) const {
+    struct Fragment {
+      std::string_view text;
+      const TextStyle* style = nullptr;
+    };
+    struct Line {
+      std::size_t first = 0;
+      std::size_t count = 0;
+      float width = 0.0f;
+      float height = 0.0f;
+      float maximumSize = 0.0f;
+      float trailingSpacing = 0.0f;
+    };
+
+    const float runScale = std::max(command.runScale, 0.01f);
+    std::vector<Fragment> fragments;
+    fragments.reserve(command.runs.size() + 1);
+    std::vector<Line> lines(1);
+    lines.reserve(command.runs.size() + 1);
+    std::string marker;
+    if (command.style.listMarker != ListMarker::None) {
+      marker = command.style.listMarker == ListMarker::Bullet ? "* " : "1. ";
+      fragments.push_back({marker, &command.style});
+      auto& first = lines.front();
+      first.count = 1;
+      first.width = textWidth(marker, command.style, 1.0f);
+      first.height = command.style.size * std::max(command.style.lineHeight, 0.01f);
+      first.maximumSize = command.style.size;
+      first.trailingSpacing = command.style.letterSpacing;
+    }
+    for (const auto& run : command.runs) {
+      std::size_t start = 0;
+      while (start <= run.text.size()) {
+        const std::size_t end = run.text.find('\n', start);
+        const std::string_view fragment(
+          run.text.data() + start,
+          (end == std::string::npos ? run.text.size() : end) - start);
+        auto& line = lines.back();
+        if (!fragment.empty()) {
+          if (line.count != 0) line.width += line.trailingSpacing;
+          fragments.push_back({fragment, &run.style});
+          ++line.count;
+          line.width += textWidth(fragment, run.style, runScale);
+          line.trailingSpacing = run.style.letterSpacing * runScale;
+          line.maximumSize = std::max(line.maximumSize, run.style.size * runScale);
+          line.height = std::max(
+            line.height, run.style.size * runScale * std::max(run.style.lineHeight, 0.01f));
+        }
+        if (end == std::string::npos) break;
+        lines.push_back(Line{.first = fragments.size()});
+        start = end + 1;
+      }
+    }
+
+    const float fallbackHeight = command.style.size * std::max(command.style.lineHeight, 0.01f);
+    float totalHeight = 0.0f;
+    for (auto& line : lines) {
+      if (line.height <= 0.0f) line.height = fallbackHeight;
+      if (line.maximumSize <= 0.0f) line.maximumSize = command.style.size;
+      totalHeight += line.height;
+    }
+    float top = command.bounds.y;
+    if (command.style.verticalAlign == VerticalAlign::Center)
+      top += (command.bounds.height - totalHeight) * 0.5f;
+    else if (command.style.verticalAlign == VerticalAlign::Bottom)
+      top += command.bounds.height - totalHeight;
+
+    for (std::size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
+      const auto& line = lines[lineIndex];
+      if (top + line.height >= command.clip.y &&
+          top <= command.clip.y + command.clip.height) {
+        const float indent = lineIndex == 0 ? std::max(command.style.indent, 0.0f) : 0.0f;
+        const float availableWidth = std::max(0.0f, command.bounds.width - indent);
+        float x = command.bounds.x + indent;
+        if (command.style.align == HorizontalAlign::Center)
+          x += (availableWidth - line.width) * 0.5f;
+        else if (command.style.align == HorizontalAlign::Right)
+          x += availableWidth - line.width;
+        const float baseline = top + line.maximumSize;
+        for (std::size_t index = 0; index < line.count; ++index) {
+          const auto& fragment = fragments[line.first + index];
+          const auto& authored = *fragment.style;
+          const float size = authored.size * runScale;
+          const float spacing = authored.letterSpacing * runScale;
+          const float fragmentStart = x;
+          const float fragmentWidth = textWidth(fragment.text, authored, runScale);
+          const float slant = authored.italic &&
+            !vectorAtlas.hasFontFace(authored.fontName, true) ? 0.18f : 0.0f;
+          for (const auto codepoint : decodeUtf8(fragment.text)) {
+            const ShapeId glyphId = vectorAtlas.glyph(
+              codepoint, authored.fontName, authored.weight, authored.italic);
+            const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
+            if (!glyph) {
+              x += size * 0.6f + spacing;
+              continue;
+            }
+            const float advance = static_cast<float>(glyph->advance) * size;
+            if (glyph->width > 0 && glyph->height > 0) {
+              Rect destination{
+                x + static_cast<float>(glyph->bearingX) * size,
+                baseline - static_cast<float>(glyph->bearingY) * size,
+                static_cast<float>(glyph->width) * size,
+                static_cast<float>(glyph->height) * size,
+              };
+              appendResolvedShape(
+                instances, *glyph, destination, authored.paint, command.clip, slant);
+              if (authored.bold) {
+                destination.x += std::max(0.55f, size * 0.035f);
+                appendResolvedShape(
+                  instances, *glyph, destination, authored.paint, command.clip, slant);
+              }
+            }
+            x += advance + spacing;
+          }
+          x = fragmentStart + fragmentWidth;
+          if (authored.underline && fragmentWidth > 0.0f) {
+            appendShape(
+              instances, vectorAtlas.glyph(
+                '_', authored.fontName, authored.weight, authored.italic),
+              {fragmentStart, baseline + size * 0.07f, fragmentWidth,
+               std::max(1.0f, size * 0.065f)},
+              authored.paint, command.clip);
+          }
+          if (authored.strikethrough && fragmentWidth > 0.0f) {
+            appendShape(
+              instances, vectorAtlas.glyph(
+                '-', authored.fontName, authored.weight, authored.italic),
+              {fragmentStart, baseline - size * 0.32f, fragmentWidth,
+               std::max(1.0f, size * 0.06f)},
+              authored.paint, command.clip);
+          }
+          if (index + 1 < line.count) x += spacing;
+        }
+      }
+      top += line.height;
+    }
+  }
+
   void appendText(std::vector<Instance>& instances, const TextCommand& command) const {
+    if (!command.runs.empty()) {
+      appendRichText(instances, command);
+      return;
+    }
     std::string prefixed;
     std::string_view text = command.text();
     if (command.style.listMarker != ListMarker::None) {
@@ -1224,6 +1612,8 @@ struct VulkanRenderer::Impl {
     }
     std::size_t lineStart = 0;
     std::size_t lineNumber = 0;
+    const float slant = command.style.italic &&
+      !vectorAtlas.hasFontFace(command.style.fontName, true) ? 0.18f : 0.0f;
     while (lineStart <= text.size()) {
       const std::size_t lineEnd = text.find('\n', lineStart);
       const std::string_view line(text.data() + lineStart,
@@ -1244,15 +1634,16 @@ struct VulkanRenderer::Impl {
       const bool needsWidth = command.style.align != HorizontalAlign::Left ||
                               command.style.underline || command.style.strikethrough;
       const float width = needsWidth ? textWidth(codepoints, command.style) : 0.0f;
-      float x = command.bounds.x + command.style.indent;
-      if (command.style.align == HorizontalAlign::Center)
-        x += (command.bounds.width - width) * 0.5f;
-      else if (command.style.align == HorizontalAlign::Right)
-        x += command.bounds.width - width;
+      const float indent = lineNumber == 0 ? std::max(command.style.indent, 0.0f) : 0.0f;
+      const float availableWidth = std::max(0.0f, command.bounds.width - indent);
+      float x = command.bounds.x + indent;
+      if (command.style.align == HorizontalAlign::Center) x += (availableWidth - width) * 0.5f;
+      else if (command.style.align == HorizontalAlign::Right) x += availableWidth - width;
       const float baseline = top + command.style.size;
       const float lineX = x;
       for (auto codepoint : codepoints) {
-        const ShapeId glyphId = vectorAtlas.glyph(codepoint, command.style.fontName);
+        const ShapeId glyphId = vectorAtlas.glyph(
+          codepoint, command.style.fontName, command.style.weight, command.style.italic);
         const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
         if (!glyph) {
           x += command.style.size * 0.6f + command.style.letterSpacing;
@@ -1265,25 +1656,25 @@ struct VulkanRenderer::Impl {
                            static_cast<float>(glyph->width) * command.style.size,
                            static_cast<float>(glyph->height) * command.style.size};
           appendResolvedShape(instances, *glyph, destination, command.style.paint, command.clip,
-                              command.style.italic ? 0.18f : 0.0f);
+                              slant);
           if (command.style.bold) {
             destination.x += std::max(0.55f, command.style.size * 0.035f);
             appendResolvedShape(instances, *glyph, destination, command.style.paint, command.clip,
-                                command.style.italic ? 0.18f : 0.0f);
+                                slant);
           }
         }
         x += advance + command.style.letterSpacing;
       }
       if (width > 0.0f && command.style.underline) {
-        Rect decoration{lineX, baseline + command.style.size * 0.07f, width,
-                        std::max(1.0f, command.style.size * 0.065f)};
-        appendShape(instances, vectorAtlas.glyph('_', command.style.fontName), decoration,
+        Rect decoration{lineX, baseline + command.style.size * 0.07f, width, std::max(1.0f, command.style.size * 0.065f)};
+        appendShape(instances, vectorAtlas.glyph(
+                      '_', command.style.fontName, command.style.weight, command.style.italic), decoration,
                     command.style.paint, command.clip);
       }
       if (width > 0.0f && command.style.strikethrough) {
-        Rect decoration{lineX, baseline - command.style.size * 0.32f, width,
-                        std::max(1.0f, command.style.size * 0.06f)};
-        appendShape(instances, vectorAtlas.glyph('-', command.style.fontName), decoration,
+        Rect decoration{lineX, baseline - command.style.size * 0.32f, width, std::max(1.0f, command.style.size * 0.06f)};
+        appendShape(instances, vectorAtlas.glyph(
+                      '-', command.style.fontName, command.style.weight, command.style.italic), decoration,
                     command.style.paint, command.clip);
       }
       if (lineEnd == std::string::npos)
@@ -1297,9 +1688,7 @@ struct VulkanRenderer::Impl {
     if (utf8.empty() || style.size <= 0.0f || layoutBounds.width <= 0.0f)
       return 0;
     std::vector<Instance> instances;
-    TextCommand command{{},
-                        utf8,
-                        layoutBounds,
+    TextCommand command{{}, utf8, {}, layoutBounds,
                         {-10000000.0f, -10000000.0f, 20000000.0f, 20000000.0f},
                         std::move(style)};
     appendText(instances, command);
@@ -1342,7 +1731,8 @@ struct VulkanRenderer::Impl {
     drawBatches.clear();
     drawBatches.reserve(commandCount);
     const auto appendCommands = [&](const auto& commands) {
-      for (const auto& display : commands) {
+      for (std::size_t commandIndex = 0; commandIndex < commands.size(); ++commandIndex) {
+        const auto& display = commands[commandIndex];
         if (const auto* retainedCommand = std::get_if<RetainedTextCommand>(&display)) {
           if (retainedCommand->text == 0 || retainedCommand->text > retainedTexts.size())
             continue;
@@ -1360,8 +1750,31 @@ struct VulkanRenderer::Impl {
                       shapeCommand->paint, shapeCommand->clip, shapeCommand->italicShear);
         else if (const auto* textCommand = std::get_if<TextCommand>(&display))
           appendText(instances, *textCommand);
-        else if (const auto* roundedCommand = std::get_if<RoundedRectCommand>(&display))
-          appendRoundedRect(instances, *roundedCommand);
+        else if (const auto* roundedCommand = std::get_if<RoundedRectCommand>(&display)) {
+          std::size_t stackEnd = commandIndex + 1;
+          const BorderWidths baseWidths = resolvedBorderWidths(roundedCommand->border);
+          const bool baseCanStack = roundedCommand->border.align == StrokeAlign::Inside &&
+            (baseWidths.maximum() <= 0.0f ||
+             paintFullyOpaque(roundedCommand->border.paint) ||
+             paintFullyTransparent(roundedCommand->border.paint));
+          if (baseCanStack) {
+            while (stackEnd < commands.size()) {
+              const auto* overlay = std::get_if<RoundedRectCommand>(&commands[stackEnd]);
+              if (!overlay || !sameRoundedRectGeometry(*roundedCommand, *overlay)) break;
+              const BorderWidths overlayWidths = resolvedBorderWidths(overlay->border);
+              if (!paintFullyTransparent(overlay->paint) ||
+                  overlayWidths.maximum() <= 0.0f ||
+                  !paintFullyOpaque(overlay->border.paint)) break;
+              ++stackEnd;
+            }
+          }
+          if (stackEnd > commandIndex + 1) {
+            appendOpaqueRoundedRectStack(instances, commands, commandIndex, stackEnd);
+            commandIndex = stackEnd - 1;
+          } else {
+            appendRoundedRect(instances, *roundedCommand);
+          }
+        }
         else if (const auto* cubicCommand = std::get_if<CubicBezierCommand>(&display))
           appendCubicBezier(instances, *cubicCommand);
         const std::uint32_t count = static_cast<std::uint32_t>(instances.size() - first);
@@ -1398,8 +1811,13 @@ struct VulkanRenderer::Impl {
       vkCmdResetQueryPool(command, frame.timestamps, 0, 2);
       vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame.timestamps, 0);
     }
-    VkClearValue clear{
-        {{config.clearColor.r, config.clearColor.g, config.clearColor.b, config.clearColor.a}}};
+    Color clearColor = config.clearColor;
+    if (isSrgbFormat(swapchainFormat)) {
+      clearColor.r = srgbToLinear(clearColor.r);
+      clearColor.g = srgbToLinear(clearColor.g);
+      clearColor.b = srgbToLinear(clearColor.b);
+    }
+    VkClearValue clear{{{clearColor.r, clearColor.g, clearColor.b, clearColor.a}}};
     VkRenderPassBeginInfo render{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     render.renderPass = renderPass;
     render.framebuffer = framebuffers[imageIndex];
@@ -1439,8 +1857,9 @@ struct VulkanRenderer::Impl {
         vkCmdBindVertexBuffers(command, 0, 1, &buffer.buffer, &offset);
         PushConstants push{{static_cast<float>(extent.width), static_cast<float>(extent.height),
                             retained ? batch.scale : 1.0f, retained ? batch.scale : 1.0f},
-                           {retained ? batch.translation.x : 0.0f,
-                            retained ? batch.translation.y : 0.0f, retained ? 1.0f : 0.0f, 0.0f},
+                            {retained ? batch.translation.x : 0.0f,
+                             retained ? batch.translation.y : 0.0f, retained ? 1.0f : 0.0f,
+                             isSrgbFormat(swapchainFormat) ? 1.0f : 0.0f},
                            {batch.clip.x, batch.clip.y, batch.clip.width, batch.clip.height}};
         vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push),
                            &push);

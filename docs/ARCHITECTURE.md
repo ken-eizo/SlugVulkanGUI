@@ -6,10 +6,12 @@ SlugVulkanGUIは、動的なUIを毎フレーム宣言し直せる扱いやす�
 両立させます。コア方針は次の通りです。
 
 - パスの曲線分解とフォントoutline読込はatlas構築時に一度だけ行う
-- フレーム中はgeometryをtessellateせず、小さなquad instanceだけを更新する
+- atlas pathはフレーム中にtessellateせず、小さなquad instanceだけを更新する
+- 明示的な動的`DrawList::cubicBezier`だけはCPUでscreen-space分割し、解析的AA segmentをGPU評価する
 - 大きく不変な文書はdevice-local bufferに保持し、zoom/panではtransformだけを変更する
 - UIのhit testと状態遷移はCPU上で即座に確定し、GPU readbackを入力経路へ入れない
-- Window、Vulkan、UIを分離し、将来の外部ホストadapterがベクターコアを変更せず接続できるようにする
+- `PlatformSurface`/`InputWriter`、Vulkan、UIを分離し、外部ホストadapterがベクターコアを
+  変更せず接続できるようにする
 
 「世界最速」は目標であって現在の保証ではありません。性能は同一コンテンツ、解像度、GPU、present
 mode、計測点を固定した再現可能な比較でのみ判断します。
@@ -18,10 +20,11 @@ mode、計測点を固定した再現可能な比較でのみ判断します。
 
 | モジュール | 責務 | 主な所有物 |
 |---|---|---|
-| `Path` / `VectorAtlas` | path作成、stroke outline化、font読込、Slug atlas構築 | CPU atlasデータ |
+| `Path` / `VectorAtlas` | path/SVG取込、stroke outline化、font読込、Slug atlas構築 | CPU atlasデータ |
 | `DrawList` | 1フレームの宣言順、clip、overlay、動的/保持コマンド | CPU command vector |
 | `UiContext` | hit test、hover/active/focus、標準widget宣言 | UIの一時状態 |
-| `InputState` / `Window` | OS eventをframe単位の入力へ変換 | GLFW window、入力snapshot |
+| `InputState` / `InputWriter` | host eventをframe単位の入力へ変換 | 入力snapshot |
+| `PlatformSurface` / `Window` | Vulkan surface契約 / GLFW standalone実装 | native surface / GLFW window |
 | `VulkanRenderer` | GPU resource、instance解決、submit、present | instance ring、atlas texture、swapchain |
 | `Tween<T>` | 時間に基づく任意値の補間 | 小さなCPU状態 |
 
@@ -109,8 +112,9 @@ framebuffer scaleで変換します。`DrawList::roundedRect()`のradiusもframe
 
 ## 所有権と寿命
 
-現在の構築順は`VectorAtlas` → `Window` → `VulkanRenderer`です。rendererはatlasとwindowを参照するため、
-両者はrendererより長く生存させます。保持テキストIDは作成したrendererだけで有効です。終了時はrendererを
+standaloneの構築順は`VectorAtlas` → `Window` → `VulkanRenderer`です。埋め込みでは
+`Window`の代わりに利用側`PlatformSurface`を作ります。rendererが参照するatlasとsurfaceはrendererより
+長く生存させます。保持テキストIDは作成したrendererだけで有効です。終了時はrendererを
 先に破棄するか、明示的に`waitIdle()`してから所有スコープを抜けます。
 
 複数`Window`はプロセス内GLFW参照を共有し、最後の`Window`破棄時だけ`glfwTerminate()`します。GLFWの
@@ -123,7 +127,8 @@ thread safetyを保証しません。
 - programmer error（build後のatlas変更等）は`std::logic_error`
 - GLFW/Vulkan resource作成、acquire、submit、present、device loss等は説明付き例外
 - `addPath()`等のupstream定義失敗とfont読込失敗は`0`/`false`
-- 最小化中の0×0 framebufferは`waitForVisibleFramebuffer()`でeventを待つ
+- standalone `Window`の最小化中は`waitForVisibleFramebuffer()`でeventを待つ。埋め込み
+  `PlatformSurface`はhost loopをblockせず、hostが描画を再通知する
 - resize/out-of-date/suboptimal swapchainはrenderer内で再生成する
 
 refresh callback内の例外はcallback境界を越えて投げず保存し、次の`pollEvents()`で再送出します。

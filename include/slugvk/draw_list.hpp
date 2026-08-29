@@ -2,6 +2,7 @@
 
 #include "slugvk/types.hpp"
 
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -19,9 +20,11 @@ struct DrawCommand {
 struct TextCommand {
   std::string utf8;
   std::string_view borrowedUtf8 = {};
+  std::span<const TextRun> runs = {};
   Rect bounds = {};
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
   TextStyle style = {};
+  float runScale = 1.0f;
 
   [[nodiscard]] std::string_view text() const {
     return borrowedUtf8.data() ? borrowedUtf8 : std::string_view(utf8);
@@ -34,6 +37,7 @@ struct RoundedRectCommand {
   CornerRadii radiiPx = {};
   CornerSmoothing continuousCorners = {};
   Paint paint = {};
+  BorderStyle border = {};
 };
 
 // A screen-space cubic stroke. Unlike an atlas ShapeId, its control points stay in the
@@ -93,15 +97,18 @@ public:
   }
   // Applies radius after destination sizing. radiusPx is absolute framebuffer pixels.
   void roundedRect(Rect destination, float radiusPx, Paint paint,
-                   float continuousCornersPercent = 0.0f);
+                   float continuousCornersPercent = 0.0f, BorderStyle border = {});
   // Individual values are optional at the API level: use this overload only where a corner
   // differs. Radii remain absolute framebuffer pixels after destination sizing.
   void roundedRect(Rect destination, CornerRadii radiiPx, Paint paint,
-                   CornerSmoothing continuousCorners = {});
+                   CornerSmoothing continuousCorners = {}, BorderStyle border = {});
   void cubicBezier(Vec2 from, Vec2 control1, Vec2 control2, Vec2 to, StrokeStyle style);
   void text(std::string utf8, Rect bounds, TextStyle style);
   // The referenced bytes must remain alive until VulkanRenderer::draw() returns.
   void textStatic(std::string_view utf8, Rect bounds, TextStyle style);
+  // The referenced runs and their strings must remain alive until VulkanRenderer::draw() returns.
+  void textRunsStatic(std::span<const TextRun> runs, Rect bounds, TextStyle paragraphStyle,
+                      float runScale = 1.0f);
   // Draws text whose glyph instances were retained by VulkanRenderer. Only this transform and
   // clip are dynamic, so zoom/pan does not relayout or upload the document.
   void retainedText(RetainedTextId text, Vec2 position, float scale);

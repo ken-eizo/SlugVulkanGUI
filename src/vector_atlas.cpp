@@ -3,6 +3,8 @@
 #include "slughorn/canvas.hpp"
 #include "slughorn/freetype.hpp"
 
+#include FT_MULTIPLE_MASTERS_H
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -10,7 +12,6 @@
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace slugvk {
 
@@ -18,13 +19,67 @@ namespace {
 constexpr float pi = 3.14159265358979323846f;
 slughorn::slug_t sv(float value) { return static_cast<slughorn::slug_t>(value); }
 
-struct TransparentStringHash {
-  using is_transparent = void;
-  std::size_t operator()(std::string_view value) const noexcept {
-    return std::hash<std::string_view>{}(value);
+std::string normalizedFamily(std::string_view value) {
+  std::string result;
+  result.reserve(value.size());
+  for (const unsigned char character : value)
+    if (std::isalnum(character)) result.push_back(static_cast<char>(std::tolower(character)));
+  return result;
+}
+
+std::uint16_t inferredWeight(std::string_view style) {
+  const std::string value = normalizedFamily(style);
+  if (value.find("thin") != std::string::npos) return 100;
+  if (value.find("extralight") != std::string::npos ||
+      value.find("ultralight") != std::string::npos) return 200;
+  if (value.find("light") != std::string::npos) return 300;
+  if (value.find("medium") != std::string::npos) return 500;
+  if (value.find("semibold") != std::string::npos ||
+      value.find("demibold") != std::string::npos) return 600;
+  if (value.find("extrabold") != std::string::npos ||
+      value.find("ultrabold") != std::string::npos) return 800;
+  if (value.find("black") != std::string::npos ||
+      value.find("heavy") != std::string::npos) return 900;
+  if (value.find("bold") != std::string::npos) return 700;
+  return 400;
+}
+
+struct FreeTypeFace {
+  FT_Library library = nullptr;
+  FT_Face face = nullptr;
+
+  ~FreeTypeFace() {
+    if (face) FT_Done_Face(face);
+    if (library) FT_Done_FreeType(library);
   }
-  std::size_t operator()(const std::string& value) const noexcept {
-    return (*this)(std::string_view(value));
+
+  bool open(const std::string& path) {
+    return FT_Init_FreeType(&library) == 0 &&
+           FT_New_Face(library, path.c_str(), 0, &face) == 0;
+  }
+
+  bool open(std::span<const std::uint8_t> data) {
+    return !data.empty() && FT_Init_FreeType(&library) == 0 &&
+      FT_New_Memory_Face(
+        library, reinterpret_cast<const FT_Byte*>(data.data()),
+        static_cast<FT_Long>(data.size()), 0, &face) == 0;
+  }
+
+  void setWeight(std::uint16_t weight) {
+    if (!weight || !FT_HAS_MULTIPLE_MASTERS(face)) return;
+    FT_MM_Var* variation = nullptr;
+    if (FT_Get_MM_Var(face, &variation) != 0 || !variation) return;
+    std::vector<FT_Fixed> coordinates(variation->num_axis);
+    for (FT_UInt i = 0; i < variation->num_axis; ++i) {
+      const FT_Var_Axis& axis = variation->axis[i];
+      coordinates[i] = axis.def;
+      if (axis.tag == FT_MAKE_TAG('w', 'g', 'h', 't')) {
+        const FT_Fixed requested = static_cast<FT_Fixed>(weight) * 65536L;
+        coordinates[i] = std::clamp(requested, axis.minimum, axis.maximum);
+      }
+    }
+    FT_Set_Var_Design_Coordinates(face, variation->num_axis, coordinates.data());
+    FT_Done_MM_Var(library, variation);
   }
 };
 
@@ -471,12 +526,19 @@ Path& Path::star(Vec2 center, float outerRadius, float innerRadius,
 }
 
 struct VectorAtlas::Impl {
+  struct RegisteredFont {
+    std::string family;
+    std::uint16_t weight;
+    bool italic;
+    std::uint8_t mask;
+  };
+
   slughorn::Atlas atlas;
   ShapeId nextId = slughorn::KeyIterator::AUTO_KEY_START;
   std::string family;
   std::string style;
   std::uint16_t nextFontMask = 0;
-  std::unordered_map<std::string, std::uint8_t, TransparentStringHash, std::equal_to<>> fontMasks;
+  std::vector<RegisteredFont> fonts;
 
   Impl() : atlas(1024) {}
 };
@@ -607,24 +669,69 @@ ShapeId VectorAtlas::addStroke(const Path& path, const StrokeStyle& style) {
 }
 
 bool VectorAtlas::loadFont(const std::string& fontPath, const std::vector<std::uint32_t>& codepoints) {
+  return loadFont(fontPath, FontFace{}, codepoints);
+}
+
+bool VectorAtlas::loadFont(const std::string& fontPath, FontFace face,
+                           const std::vector<std::uint32_t>& codepoints) {
   if (impl_->atlas.isBuilt()) throw std::logic_error("VectorAtlas is already built");
+  FreeTypeFace source;
+  if (!source.open(fontPath)) return false;
+  if (face.family.empty()) face.family = std::filesystem::path(fontPath).stem().string();
+  source.setWeight(face.weight);
+  return loadFontFace(source.face, std::move(face), codepoints);
+}
+
+bool VectorAtlas::loadFontMemory(std::span<const std::uint8_t> fontData, FontFace face,
+                                 const std::vector<std::uint32_t>& codepoints) {
+  if (impl_->atlas.isBuilt()) throw std::logic_error("VectorAtlas is already built");
+  FreeTypeFace source;
+  if (!source.open(fontData)) return false;
+  source.setWeight(face.weight);
+  return loadFontFace(source.face, std::move(face), codepoints);
+}
+
+bool VectorAtlas::loadFontFace(void* nativeFace, FontFace face,
+                               const std::vector<std::uint32_t>& codepoints) {
   if (impl_->nextFontMask > std::numeric_limits<std::uint8_t>::max()) return false;
+  auto* sourceFace = static_cast<FT_Face>(nativeFace);
   slughorn::freetype::LoadConfig config;
   config.mask = static_cast<std::uint8_t>(impl_->nextFontMask);
+  config.metrics = slughorn::freetype::readFontMetrics(sourceFace);
+  if (sourceFace->family_name) config.familyName = sourceFace->family_name;
+  if (sourceFace->style_name) config.styleName = sourceFace->style_name;
   std::size_t count = 0;
   if (codepoints.empty()) {
-    count = slughorn::freetype::loadAsciiFont(fontPath, impl_->atlas, &config) ? 95U : 0U;
+    count = slughorn::freetype::loadGlyphRange(
+      sourceFace, 32, 126, impl_->atlas, &config);
   } else {
-    count = slughorn::freetype::loadFontGlyphs(fontPath, codepoints, impl_->atlas, &config);
+    count = slughorn::freetype::loadGlyphs(
+      sourceFace, codepoints, impl_->atlas, &config);
   }
   if (count > 0) {
-    if (impl_->fontMasks.empty()) {
+    const std::uint16_t weight = face.weight ? face.weight : inferredWeight(config.styleName);
+    const bool italic = face.italic ||
+      normalizedFamily(config.styleName).find("italic") != std::string::npos ||
+      normalizedFamily(config.styleName).find("oblique") != std::string::npos;
+    const auto addFamily = [&](std::string_view family) {
+      const std::string normalized = normalizedFamily(family);
+      if (normalized.empty()) return;
+      const auto same = [&](const Impl::RegisteredFont& entry) {
+        return entry.family == normalized && entry.weight == weight && entry.italic == italic;
+      };
+      auto found = std::find_if(impl_->fonts.begin(), impl_->fonts.end(), same);
+      if (found == impl_->fonts.end())
+        impl_->fonts.push_back({normalized, weight, italic, config.mask});
+      else
+        found->mask = config.mask;
+    };
+    if (impl_->fonts.empty()) {
       impl_->family = config.familyName;
       impl_->style = config.styleName;
-      impl_->fontMasks.emplace("system-ui", config.mask);
+      addFamily("system-ui");
     }
-    if (!config.familyName.empty()) impl_->fontMasks[config.familyName] = config.mask;
-    impl_->fontMasks[std::filesystem::path(fontPath).stem().string()] = config.mask;
+    addFamily(face.family);
+    addFamily(config.familyName);
     ++impl_->nextFontMask;
   }
   return count > 0;
@@ -645,11 +752,29 @@ std::optional<ShapeMetrics> VectorAtlas::metrics(ShapeId id) const {
 
 std::string VectorAtlas::fontFamily() const { return impl_->family; }
 std::string VectorAtlas::fontStyle() const { return impl_->style; }
-ShapeId VectorAtlas::glyph(std::uint32_t codepoint, std::string_view fontName) const {
+ShapeId VectorAtlas::glyph(std::uint32_t codepoint, std::string_view fontName,
+                           std::uint16_t weight, bool italic) const {
   std::uint8_t mask = 0;
-  const auto found = impl_->fontMasks.find(fontName);
-  if (found != impl_->fontMasks.end()) mask = found->second;
+  const std::string family = normalizedFamily(fontName);
+  unsigned best = std::numeric_limits<unsigned>::max();
+  for (const auto& entry : impl_->fonts) {
+    if (entry.family != family) continue;
+    const unsigned distance = static_cast<unsigned>(
+      std::abs(static_cast<int>(entry.weight) - static_cast<int>(weight)));
+    const unsigned score = distance + (entry.italic == italic ? 0U : 2000U);
+    if (score < best) {
+      best = score;
+      mask = entry.mask;
+    }
+  }
   return slughorn::Key(codepoint, mask).codepoint();
+}
+bool VectorAtlas::hasFontFace(std::string_view fontName, bool italic) const {
+  const std::string family = normalizedFamily(fontName);
+  return std::any_of(impl_->fonts.begin(), impl_->fonts.end(),
+    [&](const Impl::RegisteredFont& entry) {
+      return entry.family == family && entry.italic == italic;
+    });
 }
 const slughorn::Atlas& VectorAtlas::native() const { return impl_->atlas; }
 

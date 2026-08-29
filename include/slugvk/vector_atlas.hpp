@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -18,6 +19,12 @@ struct ShapeMetrics {
   float width = 0.0f;
   float height = 0.0f;
   float advance = 0.0f;
+};
+
+struct FontFace {
+  std::string family;
+  std::uint16_t weight = 0;
+  bool italic = false;
 };
 
 class Path {
@@ -65,16 +72,26 @@ public:
   ShapeId addPath(const Path& path);
   ShapeId addStroke(const Path& path, const StrokeStyle& style);
   bool loadFont(const std::string& fontPath, const std::vector<std::uint32_t>& codepoints = {});
+  bool loadFont(const std::string& fontPath, FontFace face,
+                const std::vector<std::uint32_t>& codepoints = {});
+  bool loadFontMemory(std::span<const std::uint8_t> fontData, FontFace face = {},
+                      const std::vector<std::uint32_t>& codepoints = {});
   void build();
 
   [[nodiscard]] bool built() const;
   [[nodiscard]] std::optional<ShapeMetrics> metrics(ShapeId id) const;
   [[nodiscard]] std::string fontFamily() const;
   [[nodiscard]] std::string fontStyle() const;
-  [[nodiscard]] ShapeId glyph(std::uint32_t codepoint, std::string_view fontName = "system-ui") const;
+  [[nodiscard]] ShapeId glyph(std::uint32_t codepoint,
+                              std::string_view fontName = "system-ui",
+                              std::uint16_t weight = 400,
+                              bool italic = false) const;
+  [[nodiscard]] bool hasFontFace(std::string_view fontName, bool italic) const;
   [[nodiscard]] const slughorn::Atlas& native() const;
 
 private:
+  bool loadFontFace(void* nativeFace, FontFace face,
+                    const std::vector<std::uint32_t>& codepoints);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

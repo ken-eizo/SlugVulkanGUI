@@ -5,6 +5,7 @@
 #include <exception>
 #include <functional>
 #include <string>
+#include <vector>
 
 struct GLFWwindow;
 
@@ -33,6 +34,9 @@ public:
   void setSize(int width, int height);
   // Invoked from the platform refresh event, including the Windows modal resize loop.
   void setRefreshCallback(std::function<void()> callback);
+  // Called on the event thread when files are dropped on the native window. Paths remain owned by
+  // the callback vector, so copy any path that must outlive the callback.
+  void setDropCallback(std::function<void(const std::vector<std::string>&)> callback);
   void pollEvents();
   // Refreshes only the absolute pointer position. Call immediately before building latency-critical
   // drag UI when useful; button/key edges still come from pollEvents().
@@ -55,6 +59,7 @@ private:
   Vec2 framebufferScale_ = {1.0f, 1.0f};
   InputState input_{};
   std::function<void()> refreshCallback_{};
+  std::function<void(const std::vector<std::string>&)> dropCallback_{};
   std::exception_ptr callbackException_{};
 };
 

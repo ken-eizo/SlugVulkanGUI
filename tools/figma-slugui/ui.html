@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root { font: 12px/1.45 Inter, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      color: var(--figma-color-text);
+      background: var(--figma-color-bg);
+    }
+    header { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+    h1 { margin: 0; font-size: 16px; }
+    .muted { color: var(--figma-color-text-secondary); }
+    .summary { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0; }
+    .badge {
+      padding: 3px 7px;
+      border-radius: 999px;
+      color: var(--figma-color-text-secondary);
+      background: var(--figma-color-bg-secondary);
+    }
+    .actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+    button {
+      min-height: 32px;
+      padding: 6px 10px;
+      border: 1px solid var(--figma-color-border);
+      border-radius: 6px;
+      color: var(--figma-color-text);
+      background: var(--figma-color-bg-secondary);
+      cursor: pointer;
+    }
+    button.primary {
+      color: var(--figma-color-text-onbrand);
+      border-color: var(--figma-color-bg-brand);
+      background: var(--figma-color-bg-brand);
+    }
+    button:disabled { opacity: .45; cursor: default; }
+    textarea {
+      width: 100%;
+      height: 330px;
+      resize: vertical;
+      padding: 10px;
+      border: 1px solid var(--figma-color-border);
+      border-radius: 6px;
+      color: var(--figma-color-text);
+      background: var(--figma-color-bg-secondary);
+      font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+      tab-size: 2;
+    }
+    h2 { margin: 13px 0 7px; font-size: 12px; }
+    #diagnostics {
+      max-height: 145px;
+      overflow: auto;
+      border-top: 1px solid var(--figma-color-border);
+    }
+    .diagnostic { padding: 7px 0; border-bottom: 1px solid var(--figma-color-border); }
+    .diagnostic strong { margin-right: 6px; }
+    .native { color: var(--figma-color-text-success); }
+    .baked { color: var(--figma-color-text-brand); }
+    .approximated { color: var(--figma-color-text-warning); }
+    .unsupported { color: var(--figma-color-text-danger); }
+    #status { min-height: 18px; margin-top: 7px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>SlugUI Exporter</h1>
+      <div class="muted">Selection → typed .slugui → AOT C++</div>
+    </div>
+    <button id="close" aria-label="Close">Close</button>
+  </header>
+
+  <div class="summary">
+    <span class="badge" id="selection">0 selected</span>
+    <span class="badge native" id="native">0 native</span>
+    <span class="badge baked" id="baked-vector">0 baked vector</span>
+    <span class="badge approximated" id="approximated">0 approximated</span>
+    <span class="badge unsupported" id="unsupported">0 unsupported</span>
+  </div>
+
+  <div class="actions">
+    <button id="refresh">Refresh</button>
+    <button id="copy">Copy</button>
+    <button class="primary" id="download">Download .slugui</button>
+  </div>
+
+  <textarea id="source" readonly spellcheck="false"
+    placeholder="Select a Frame, Component, or node in Figma."></textarea>
+  <div id="status" class="muted"></div>
+  <h2>Fidelity diagnostics</h2>
+  <div id="diagnostics"></div>
+
+  <script>
+    const state = { source: "", filename: "", diagnostics: [] };
+    const source = document.getElementById("source");
+    const status = document.getElementById("status");
+    const download = document.getElementById("download");
+    const copy = document.getElementById("copy");
+
+    function send(type) {
+      parent.postMessage({ pluginMessage: { type } }, "*");
+    }
+
+    function renderDiagnostics(items) {
+      const container = document.getElementById("diagnostics");
+      container.replaceChildren();
+      if (!items.length) {
+        const empty = document.createElement("div");
+        empty.className = "diagnostic native";
+        empty.textContent = "No fidelity warnings.";
+        container.appendChild(empty);
+        return;
+      }
+      for (const item of items) {
+        const row = document.createElement("div");
+        row.className = "diagnostic " + String(item.fidelity || "").toLowerCase();
+        const code = document.createElement("strong");
+        code.textContent = item.code;
+        const location = item.nodeName ? " [" + item.nodeName + " / " + item.nodeId + "] " : " ";
+        row.append(code, document.createTextNode(location + item.message));
+        container.appendChild(row);
+      }
+    }
+
+    window.onmessage = (event) => {
+      const message = event.data.pluginMessage;
+      if (!message || message.type !== "export-result") return;
+      state.source = message.source || "";
+      state.filename = message.filename || "";
+      state.diagnostics = message.diagnostics || [];
+      source.value = state.source;
+      download.disabled = copy.disabled = !state.source;
+      document.getElementById("selection").textContent =
+        String(message.selectionCount || 0) + " selected";
+      const counts = message.fidelityCounts ||
+        { native: 0, approximated: 0, bakedVector: 0, unsupported: 0 };
+      document.getElementById("native").textContent = counts.native + " native";
+      document.getElementById("baked-vector").textContent =
+        (counts.bakedVector || 0) + " baked vector";
+      document.getElementById("approximated").textContent = counts.approximated + " approximated";
+      document.getElementById("unsupported").textContent = counts.unsupported + " unsupported";
+      status.textContent = state.source
+        ? state.filename + " is ready (format v" + message.formatVersion + ")."
+        : "Nothing exportable is selected.";
+      renderDiagnostics(state.diagnostics);
+    };
+
+    document.getElementById("refresh").onclick = () => send("refresh");
+    document.getElementById("close").onclick = () => send("close");
+    copy.onclick = async () => {
+      if (!state.source) return;
+      try {
+        await navigator.clipboard.writeText(state.source);
+        status.textContent = "Copied " + state.filename + ".";
+      } catch (_) {
+        source.focus();
+        source.select();
+        document.execCommand("copy");
+        status.textContent = "Copied " + state.filename + ".";
+      }
+    };
+    download.onclick = () => {
+      if (!state.source) return;
+      const blob = new Blob([state.source], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = state.filename || "FigmaSelection.slugui";
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      status.textContent = "Downloaded " + anchor.download + ".";
+    };
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") send("close");
+    });
+    download.disabled = copy.disabled = true;
+    send("refresh");
+  </script>
+</body>
+</html>

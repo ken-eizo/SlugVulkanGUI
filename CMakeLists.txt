@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.24)
 
 project(SlugVulkan VERSION 0.1.0 LANGUAGES C CXX)
 
+include(cmake/SlugUI.cmake)
+
 option(SLUGVK_BUILD_EXAMPLE "Build the kitchen-sink example" ${PROJECT_IS_TOP_LEVEL})
 option(SLUGVK_BUILD_TESTS "Build unit tests" ${PROJECT_IS_TOP_LEVEL})
 option(SLUGVK_ENABLE_VALIDATION "Enable Vulkan validation in debug builds" ON)
@@ -34,8 +36,7 @@ if(NOT TARGET Freetype::Freetype)
   add_library(Freetype::Freetype ALIAS freetype-interface)
 endif()
 
-# Build only the slughorn core + FreeType bridge that SlugVulkan uses. Keeping this target here
-# lets external/slughorn stay an unmodified, reproducible upstream submodule.
+# Build only the Slughorn core and FreeType bridge used by SlugVulkan.
 add_library(slughorn STATIC external/slughorn/slughorn/slughorn.cpp)
 target_include_directories(slughorn SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/slughorn")
 target_compile_features(slughorn PUBLIC cxx_std_20)
@@ -92,6 +93,7 @@ add_library(slugvk STATIC
   src/animation.cpp
   src/draw_list.cpp
   src/input.cpp
+  src/slugui.cpp
   src/ui.cpp
   src/vector_atlas.cpp
   src/window.cpp
@@ -114,9 +116,48 @@ else()
 endif()
 
 if(SLUGVK_BUILD_EXAMPLE)
-  add_executable(slugvk_example MACOSX_BUNDLE examples/kitchen_sink.cpp)
+  set(SLUGVK_GEIST_FONT "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/Geist[wght].ttf")
+  set(SLUGVK_GEIST_HEADER "${SLUGVK_GENERATED_DIR}/geist_font.generated.hpp")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_custom_command(
+    OUTPUT "${SLUGVK_GEIST_HEADER}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_binary.py"
+      "${SLUGVK_GEIST_FONT}" "${SLUGVK_GEIST_HEADER}"
+      --namespace slugvk::example::assets --symbol geistFont
+    DEPENDS "${SLUGVK_GEIST_FONT}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_binary.py"
+    VERBATIM)
+  add_custom_target(slugvk_geist_font DEPENDS "${SLUGVK_GEIST_HEADER}")
+  set(SLUGVK_SLUGUI_DEMO_HEADER "${SLUGVK_GENERATED_DIR}/slugui_demo.generated.hpp")
+  set(SLUGVK_FIGMA_DEMO_HEADER "${SLUGVK_GENERATED_DIR}/figma_group_31.generated.hpp")
+  slugvk_compile_slugui(
+    INPUT "${CMAKE_CURRENT_SOURCE_DIR}/examples/slugui_demo.slugui"
+    OUTPUT "${SLUGVK_SLUGUI_DEMO_HEADER}"
+    NAMESPACE slugvk::example)
+  slugvk_compile_slugui(
+    INPUT "${CMAKE_CURRENT_SOURCE_DIR}/examples/figma_group_31.slugui"
+    OUTPUT "${SLUGVK_FIGMA_DEMO_HEADER}"
+    NAMESPACE slugvk::example
+    CLASS_NAME Group_31Generated)
+  add_custom_target(slugvk_slugui_example_codegen DEPENDS
+    "${SLUGVK_SLUGUI_DEMO_HEADER}"
+    "${SLUGVK_FIGMA_DEMO_HEADER}")
+  add_executable(slugvk_example MACOSX_BUNDLE
+    examples/kitchen_sink.cpp
+    "${SLUGVK_GEIST_HEADER}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/OFL-Geist.txt")
   target_link_libraries(slugvk_example PRIVATE SlugVulkan::slugvk)
-  add_dependencies(slugvk_example slugvk_shaders)
+  target_include_directories(slugvk_example PRIVATE "${SLUGVK_GENERATED_DIR}")
+  target_compile_definitions(slugvk_example PRIVATE
+    SLUGVK_DEVELOPMENT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    SLUGVK_DEVELOPMENT_BUILD_DIR="${CMAKE_BINARY_DIR}"
+    SLUGVK_DEVELOPMENT_CONFIG="$<CONFIG>"
+    SLUGVK_CMAKE_COMMAND="${CMAKE_COMMAND}"
+    SLUGVK_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+  )
+  add_dependencies(slugvk_example slugvk_shaders slugvk_slugui_example_codegen slugvk_geist_font)
+  set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/OFL-Geist.txt"
+    PROPERTIES HEADER_FILE_ONLY TRUE MACOSX_PACKAGE_LOCATION Resources)
   set_target_properties(slugvk_example PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME "SlugVulkanGUI Example"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.slugvulkan.example"
@@ -129,9 +170,30 @@ if(SLUGVK_BUILD_TESTS)
   add_executable(slugvk_tests tests/core_tests.cpp)
   target_link_libraries(slugvk_tests PRIVATE SlugVulkan::slugvk)
   add_test(NAME slugvk_core COMMAND slugvk_tests)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME slugui_compiler
+    COMMAND "${Python3_EXECUTABLE}" -m unittest
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/slugui_compiler_test.py" -v)
+  set_tests_properties(slugui_compiler PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+  find_program(SLUGVK_NODE_EXECUTABLE NAMES node)
+  if(SLUGVK_NODE_EXECUTABLE)
+    add_test(NAME slugui_figma_exporter
+      COMMAND "${SLUGVK_NODE_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/figma_plugin_test.js")
+    set_tests_properties(slugui_figma_exporter PROPERTIES
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      ENVIRONMENT "SLUGUI_PYTHON=${Python3_EXECUTABLE}")
+  else()
+    message(WARNING "Node.js was not found; the Figma exporter integration test is disabled.")
+  endif()
 endif()
 
 if(SLUGVK_INSTALL)
   install(TARGETS slugvk ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
   install(DIRECTORY include/ DESTINATION include)
+  install(PROGRAMS tools/slugui_compiler.py DESTINATION bin)
+  install(FILES tools/svg_path.py DESTINATION bin)
+  install(FILES cmake/SlugUI.cmake DESTINATION share/SlugVulkan/cmake)
+  install(DIRECTORY tools/figma-slugui DESTINATION share/SlugVulkan)
 endif()

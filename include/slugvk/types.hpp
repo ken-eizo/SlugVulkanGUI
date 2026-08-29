@@ -110,6 +110,7 @@ struct Paint {
 
 enum class LineCap : std::uint8_t { Butt, Round, Square };
 enum class LineJoin : std::uint8_t { Miter, Round, Bevel };
+enum class StrokeAlign : std::uint8_t { Inside, Center, Outside };
 
 struct DashCapOverride {
   std::optional<LineCap> start = {};
@@ -134,6 +135,29 @@ struct StrokeStyle {
   std::vector<DashCapOverride> dashCaps = {};
 };
 
+struct BorderWidths {
+  float top = 0.0f;
+  float right = 0.0f;
+  float bottom = 0.0f;
+  float left = 0.0f;
+
+  static constexpr BorderWidths all(float width) { return {width, width, width, width}; }
+  [[nodiscard]] constexpr float maximum() const {
+    return std::max(std::max(top, right), std::max(bottom, left));
+  }
+};
+
+struct BorderStyle {
+  Paint paint = Paint::solid(Color::fromRgb8(0x000000), 0.0f);
+  float width = 0.0f;
+  StrokeAlign align = StrokeAlign::Center;
+  std::optional<BorderWidths> individualWidths = {};
+
+  [[nodiscard]] constexpr BorderWidths resolvedWidths() const {
+    return individualWidths.value_or(BorderWidths::all(width));
+  }
+};
+
 struct CornerRadii {
   float topLeft = 0.0f;
   float topRight = 0.0f;
@@ -153,21 +177,29 @@ struct CornerSmoothing {
 };
 
 enum class HorizontalAlign : std::uint8_t { Left, Center, Right, Justify };
+enum class VerticalAlign : std::uint8_t { Top, Center, Bottom };
 enum class ListMarker : std::uint8_t { None, Bullet, Numbered };
 
 struct TextStyle {
   std::string fontName = "system-ui";
   float size = 14.0f;
+  std::uint16_t weight = 400;
   bool bold = false;
   bool italic = false;
   bool underline = false;
   bool strikethrough = false;
   HorizontalAlign align = HorizontalAlign::Left;
+  VerticalAlign verticalAlign = VerticalAlign::Top;
   float lineHeight = 1.25f;
   float letterSpacing = 0.0f;
   float indent = 0.0f;
   ListMarker listMarker = ListMarker::None;
   Paint paint = Paint::solid(Color::fromRgb8(0xffffff));
+};
+
+struct TextRun {
+  std::string text;
+  TextStyle style = {};
 };
 
 enum class ContinuousCorners : std::uint8_t { Circular = 0, IosLike = 100 };

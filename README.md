@@ -18,6 +18,10 @@ with reproducible cross-library benchmarks; this repository does not make that u
 - [Performance and low-latency guide](docs/PERFORMANCE.md)
 - [Generic native-host embedding design](docs/EMBEDDING.md), including the path toward dockable
   DCC/plugin panels without making the core host-specific
+- [SlugUI declarative IR](docs/SLUGUI.md), including typed properties, layout, events, and the
+  build-time AOT language boundary
+- [Figma exporter and import design](docs/FIGMA_IMPORT.md), including the local development plugin,
+  semantic mapping, fidelity diagnostics, and generated-code ownership
 
 ## Implemented
 
@@ -25,11 +29,17 @@ with reproducible cross-library benchmarks; this repository does not make that u
   value and fragment path are used by fills, strokes, and vector text (`DrawList::fill` and
   `DrawList::stroke` are semantic aliases over the common shape renderer). `stroke` accepts either
   a `Paint` directly or a `StrokeStyle`, whose `paint` member is forwarded unchanged.
-- Rectangle, circle, ellipse, polygon, star, cubic and quadratic paths. `DrawList::roundedRect`
+- Rectangle, circle, ellipse, polygon, star, cubic and quadratic paths. `Path::svgPath` accepts
+  absolute or relative SVG path data, including smooth curves and elliptical arcs; an optional
+  view-box height preserves SVG's Y-down orientation when converting into the Slug atlas.
+  `DrawList::roundedRect`
   applies its radius in absolute framebuffer pixels after width/height placement, including a
   0–100% continuous-corner control; resizing the rectangle never stretches its corner radius.
   The compact scalar overload remains the normal API. An optional `CornerRadii` / `CornerSmoothing`
   overload independently overrides the four corners without increasing the GPU instance size.
+  `BorderStyle::align` supports inside, center, and outside strokes. Optional
+  `BorderWidths {top, right, bottom, left}` keeps asymmetric Figma borders in the same instanced
+  batch.
 - Multiple independently painted stroke shapes, width, butt/round/square caps,
   miter/round/bevel joins, dash arrays, gap lengths, dash offset, and start/end width taper.
   `cap` remains the only required/default cap field. Optional whole-path `startCap` / `endCap`,
@@ -38,14 +48,25 @@ with reproducible cross-library benchmarks; this repository does not make that u
   runtime.
   The Example exposes live dash-length, gap, and offset sliders; its straight-line preview emits
   only the visible analytic dash instances and does not rebuild the immutable Slug atlas.
-- FreeType outlines loaded into the same Slug atlas. Multiple fonts are namespaced by font family
-  or filename. Size, simulated bold/italic, underline, strikethrough, horizontal alignment,
+- `DrawList::cubicBezier` keeps control points in framebuffer space and adaptively converts a
+  changing cubic into analytic antialiased GPU stroke segments during frame construction. Use it
+  for interactive curves whose control points change; use atlas paths for immutable geometry.
+- FreeType outlines loaded into the same Slug atlas. Explicitly registered family/weight/italic
+  faces and variable-font `wght` values select distinct glyph namespaces. Size, compatibility bold,
+  underline, strikethrough, horizontal alignment,
   line-height, letter-spacing, indent, bullet and numbered-list state are represented by `TextStyle`.
+  Static `TextRun` arrays add per-range family, size, numeric weight, italic, decoration, spacing,
+  line height, and paint without a runtime parser or per-frame style copy. The Example embeds only
+  the Geist variable font and registers weights 100–900 explicitly.
 - Mouse hover and position; press/release/held states for left/right/middle and five extra buttons;
   scroll start/active/end and direction; cursor delta; opt-in GLFW raw mouse motion; arbitrary GLFW
-  key press/release/held state; Unicode text input.
+  key press/release/held state; Unicode text input. `InputWriter` exposes the same frame snapshot
+  contract to non-GLFW native-host adapters, including focus-loss cancellation.
 - Button, spin button, slider, list box, checkbox, combo box, dropdown, radio, editable string field,
   switch, horizontal/vertical scrollbar, tooltip, tree view, and grid view.
+- Small deterministic layout/editing primitives: inset/outset, linear row/column allocation,
+  fixed-plus-weighted grid columns, and UTF-8 boundary-safe caret/selection editing. These helpers
+  have no retained layout tree and the standard text field owns only per-widget edit state.
 - Press-edge state updates, cursor-position drag mapping, hover feedback for interactive controls,
   and a final overlay command layer for dropdowns and tooltips. Overlay content remains part of the
   single instanced GPU batch but is emitted after ordinary panels and widgets.
@@ -59,6 +80,13 @@ with reproducible cross-library benchmarks; this repository does not make that u
   before declaring interactive controls. IMMEDIATE also uses the minimum legal swapchain image
   count; launch the Example with `--mailbox` when tear-free presentation is preferred.
 - Generic `Tween<T>` with linear, ease-in/out, smooth-step, and spring easing.
+- A first SlugUI declarative IR/runtime: typed property slots and revision-based bindings,
+  `Absolute`/`Row`/`Column`/`Stack` layout, logical/physical/percent lengths, grow/alignment,
+  state paints, synchronous hover/press/release events, inherited overlays, source/fidelity
+  metadata, and direct lowering into the existing `DrawList`. The runtime performs no per-frame
+  property-name lookup and can apply callback-driven property/layout changes in the same frame.
+  The textual `.slugui` compiler runs at build time and emits typed C++; the Figma development
+  plugin exports its current selection to the same language without adding runtime dependencies.
 - One immutable GPU atlas, a dynamic host-visible instance ring, and optional retained device-local
   text buffers. Quad vertices come from `gl_VertexIndex`; there is no index buffer. Adjacent dynamic
   content remains one batch, while retained documents add only the draw boundaries needed to keep
@@ -77,9 +105,15 @@ with reproducible cross-library benchmarks; this repository does not make that u
 - Resize/minimize-safe swapchain recreation; frame fences; acquire semaphores per frame; present
   semaphores per swapchain image; device-loss errors are surfaced as exceptions.
 - MoltenVK portability enumeration and portability-subset device-extension handling.
-- A two-page Example: the complete component gallery with a clearly labelled text input, plus a
-  long-form Slug text page that zooms from 25% to 800% in real time by slider, buttons, or mouse
-  wheel at the cursor position, and pans 1:1 while the document is dragged.
+- A host-neutral `PlatformSurface` constructor for externally owned Vulkan-capable views.
+  It separates required instance extensions, surface creation, framebuffer size/scale, visibility,
+  and redraw requests from the renderer. The GLFW `Window` constructor remains the standalone
+  compatibility path.
+- A four-page Example: the complete component gallery with a clearly labelled text input; a
+  long-form Slug text page that zooms from 25% to 800% in real time and pans 1:1 while dragged;
+  an interactive AOT-generated SlugUI page exercising responsive layout, typed reactive state,
+  press-edge callbacks, hover/pressed paints, and overlays; and a Figma import page for single or
+  multi-selection `.slugui` previews.
 
 ## Architecture
 
@@ -146,9 +180,12 @@ or line counts for that measurement.
 
 ## Build on Windows
 
-Requirements: Visual Studio 2022 with C++, CMake 3.24+, and the LunarG Vulkan SDK with `glslc`.
+Requirements: Visual Studio 2022 with C++, CMake 3.24+, Python 3, and the LunarG Vulkan SDK with `glslc`.
 Dependencies are pinned as Git submodules under `external/`. Clone with `--recurse-submodules`, or
 run `git submodule update --init --recursive` after an ordinary clone.
+
+Python is used only to AOT-compile the Example's `.slugui` source and run toolchain tests; it is not
+linked into the library or Example. Node.js enables the optional Figma exporter integration test.
 
 ```powershell
 $env:VULKAN_SDK = "C:\VulkanSDK\1.x.y"
@@ -222,6 +259,9 @@ while (!window.shouldClose()) {
 ```
 
 See [`examples/kitchen_sink.cpp`](examples/kitchen_sink.cpp) for all components in one executable.
+The SlugUI page is declared in [`examples/slugui_demo.slugui`](examples/slugui_demo.slugui) and
+AOT-generated during the CMake build. The local Figma development plugin lives under
+[`tools/figma-slugui`](tools/figma-slugui).
 
 ### Use from another CMake project
 
@@ -242,8 +282,8 @@ options, CRT/ABI constraints, lifecycle, and MoltenVK packaging.
 
 - The included text layout is intentionally small and currently performs codepoint layout, not
   full HarfBuzz shaping/Unicode bidi/line breaking. The glyph renderer itself is vector Slug.
-- Bold and italic are synthetic presentation options. Load dedicated bold/italic font files under
-  their family names when exact typeface masters are required.
+- Font files are never discovered from a Figma family name. Register every required face explicitly;
+  numeric weight selects the closest registered face or the requested variable-font `wght` value.
 - macOS is compiled as a Universal app in GitHub Actions. The hosted job verifies both slices,
   bundle linkage, unit tests, and SPIR-V; interactive latency still requires measurement on physical
   Apple hardware because hosted runners are not a display-performance benchmark.
@@ -253,9 +293,17 @@ options, CRT/ABI constraints, lifecycle, and MoltenVK packaging.
 - `Path::roundedRect` remains an ordinary authored vector path and therefore scales like any other
   path when its destination transform changes. Use `DrawList::roundedRect` for layout rectangles
   whose corner radius must remain an absolute pixel value.
-- The current `Window`/`VulkanRenderer` backend owns a GLFW top-level window and its Vulkan surface.
-  Host-owned `HWND` / `NSView` embedding is a documented backend-decomposition roadmap, not an
-  already supported constructor. Host SDK adapters remain separate from the general-purpose core.
+- `VulkanRenderer(PlatformSurface&, ...)` and `InputWriter` provide the generic boundary needed
+  for host-owned views. This repository does not include concrete `HWND`, `NSView`, After Effects,
+  or other host-SDK adapters, and the renderer still creates one Vulkan device per renderer.
+  Host-specific ownership, event translation, packaging, and multi-surface device sharing remain
+  separate adapter work.
+- SlugUI exposes the C++ IR/builder/runtime, a build-time `.slugui` parser/type checker/C++ generator,
+  and a Figma selection exporter for the documented semantic subset. SVG-derived fill/stroke
+  geometry is converted to Slug atlas assets at AOT time, so generated components do not parse SVG
+  while rendering frames.
+  EVENODD winding, variables/component variants, conditional/repeated nodes, accessibility,
+  hot reload, and dirty-subtree layout remain staged work.
 
 ## Dependency revisions
 

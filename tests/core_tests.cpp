@@ -1,6 +1,7 @@
 #include "slughorn/slughorn.hpp"
 #include "slugvk/slugvk.hpp"
 
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -100,6 +101,18 @@ int main() try {
   staticTextList.textStatic(persistentText, {0, 0, 300, 30}, {});
   require(std::get<TextCommand>(staticTextList.commands().front()).text() == persistentText,
           "borrowed static text command");
+  std::array<TextRun, 2> persistentRuns{{
+    {"mixed ", TextStyle{.fontName = "Geist", .weight = 300}},
+    {"text", TextStyle{.fontName = "Geist", .weight = 900,
+                       .underline = true,
+                       .paint = Paint::solid(Color::fromRgb8(0xff4080))}},
+  }};
+  DrawList richTextList;
+  richTextList.textRunsStatic(persistentRuns, {0, 0, 300, 30}, {}, 2.0f);
+  const auto& richText = std::get<TextCommand>(richTextList.commands().front());
+  require(richText.runs.size() == 2 && richText.runs[1].style.weight == 900 &&
+          richText.runs[1].style.underline && richText.runScale == 2.0f,
+          "borrowed rich text runs preserve per-range style");
 
   DrawList cornerList;
   cornerList.roundedRect({20, 30, 360, 72}, 12.0f, sharedShader, 100.0f);
@@ -112,13 +125,24 @@ int main() try {
           "rounded rectangle keeps absolute pixel radius after sizing");
   DrawList individualCornerList;
   individualCornerList.roundedRect({0, 0, 200, 80}, {4, 12, 20, 28}, sharedShader,
-                                   {0, 25, 50, 100});
-  const auto& individualCorner =
-      std::get<RoundedRectCommand>(individualCornerList.commands().front());
+                                   {0, 25, 50, 100},
+                                   {Paint::solid(Color::fromRgb8(0xff4080)), 3.0f,
+                                    StrokeAlign::Inside});
+  const auto& individualCorner = std::get<RoundedRectCommand>(individualCornerList.commands().front());
   require(individualCorner.radiiPx.topLeft == 4 && individualCorner.radiiPx.bottomLeft == 28 &&
-              individualCorner.continuousCorners.topRightPercent == 25 &&
-              individualCorner.continuousCorners.bottomLeftPercent == 100,
+          individualCorner.continuousCorners.topRightPercent == 25 &&
+          individualCorner.continuousCorners.bottomLeftPercent == 100 &&
+          individualCorner.border.width == 3.0f &&
+          individualCorner.border.align == StrokeAlign::Inside &&
+          individualCorner.border.paint.start.r == Color::fromRgb8(0xff4080).r,
           "individual corner radius and smoothing overrides");
+  BorderStyle sideBorder;
+  sideBorder.width = 9.0f;
+  sideBorder.individualWidths = BorderWidths{1.0f, 2.0f, 3.0f, 4.0f};
+  const auto resolvedSides = sideBorder.resolvedWidths();
+  require(resolvedSides.top == 1.0f && resolvedSides.right == 2.0f &&
+          resolvedSides.bottom == 3.0f && resolvedSides.left == 4.0f,
+          "individual border widths override the uniform compatibility field");
 
   DrawList cubicList;
   StrokeStyle cubicStyle;
@@ -174,6 +198,176 @@ int main() try {
   require(metric && metric->width > 0 && metric->height > 0, "shape metrics");
   require(!atlas.native().getCurveTextureData().empty(), "curve texture");
   require(!atlas.native().getBandTextureData().empty(), "band texture");
+
+  const std::string fontPath = findDefaultSystemFont();
+  if (!fontPath.empty()) {
+    VectorAtlas fontAtlas;
+    require(fontAtlas.loadFont(
+              fontPath, FontFace{.family = "TestFace", .weight = 400}, {'A'}) &&
+            fontAtlas.loadFont(
+              fontPath, FontFace{.family = "TestFace", .weight = 700}, {'A'}),
+            "explicit font face registration");
+    require(fontAtlas.glyph('A', "TestFace", 400) !=
+            fontAtlas.glyph('A', "TestFace", 700),
+            "font weight selects distinct glyph namespaces");
+    require(fontAtlas.hasFontFace("TestFace", false) &&
+            !fontAtlas.hasFontFace("TestFace", true),
+            "font face style availability");
+  }
+
+  {
+    namespace sui = slugui;
+    sui::Component component(sui::absolute(hashId("property-root")));
+    auto& properties = component.properties();
+    const auto source = properties.define<float>("source", 3.0f);
+    const auto doubled = properties.define<float>("doubled", 0.0f);
+    const auto borderWidths = properties.define<BorderWidths>(
+      "border-widths", BorderWidths{1.0f, 2.0f, 3.0f, 4.0f});
+    properties.bind<float>(doubled, {source.id}, [source](const sui::PropertyStore& values) {
+      return values.get(source) * 2.0f;
+    });
+    require(properties.evaluateBindings() && properties.get(doubled) == 6.0f,
+            "SlugUI typed binding initial evaluation");
+    require(properties.set(source, 5.0f) && properties.evaluateBindings() &&
+            properties.get(doubled) == 10.0f,
+            "SlugUI dependency revision evaluation");
+    require(properties.find("doubled") == doubled.id &&
+            properties.type(doubled.id) == sui::PropertyType::Scalar,
+            "SlugUI construction-time property metadata");
+    require(properties.type(borderWidths.id) == sui::PropertyType::BorderWidths &&
+            properties.get(borderWidths).left == 4.0f,
+            "SlugUI typed per-side border width property");
+  }
+
+  {
+    namespace sui = slugui;
+    auto icon = sui::shape(hashId("dual-shape"), 1,
+                           Paint::solid(Color::fromRgb8(0x80d8ff)));
+    icon.layout.width = sui::Length::physical(32.0f);
+    icon.layout.height = sui::Length::physical(32.0f);
+    auto& visual = std::get<sui::ShapeVisual>(icon.visual);
+    visual.strokeShape = 2;
+    visual.strokePaint.normal = Paint::solid(Color::fromRgb8(0xff4080));
+    visual.fillPlacement = {0.125f, 0.25f, 0.5f, 0.5f};
+    visual.strokePlacement = {0.0625f, 0.1875f, 0.625f, 0.625f};
+    sui::Component component(std::move(icon));
+    sui::Runtime runtime;
+    DrawList list;
+    runtime.render(component, sui::FrameInput{}, list, {0, 0, 32, 32});
+    require(list.commands().size() == 2,
+            "SlugUI vector fill and expanded stroke lower into one ordered batch");
+    require(std::get<DrawCommand>(list.commands()[0]).shape == 1 &&
+            std::get<DrawCommand>(list.commands()[1]).shape == 2,
+            "SlugUI vector stroke draws after its fill");
+    const auto fillDestination = std::get<DrawCommand>(list.commands()[0]).destination;
+    const auto strokeDestination = std::get<DrawCommand>(list.commands()[1]).destination;
+    require(fillDestination.x == 4.0f && fillDestination.y == 8.0f &&
+            fillDestination.width == 16.0f && fillDestination.height == 16.0f,
+            "SlugUI vector fill preserves its source-coordinate placement");
+    require(strokeDestination.x == 2.0f && strokeDestination.y == 6.0f &&
+            strokeDestination.width == 20.0f && strokeDestination.height == 20.0f,
+            "SlugUI vector stroke preserves its source-coordinate placement");
+  }
+
+  {
+    namespace sui = slugui;
+    auto root = sui::column(hashId("layout-root"));
+    root.layout.padding = sui::Insets::all(sui::Length::logical(5.0f));
+    root.layout.spacing = sui::Length::logical(2.0f);
+
+    auto fixed = sui::roundedRectangle(hashId("layout-fixed"), sharedShader);
+    fixed.layout.width = sui::Length::percent(50.0f);
+    fixed.layout.height = sui::Length::logical(10.0f);
+    root.add(std::move(fixed));
+
+    auto growing = sui::roundedRectangle(hashId("layout-growing"), sharedShader);
+    growing.layout.grow = 1.0f;
+    root.add(std::move(growing));
+
+    sui::Component component(std::move(root));
+    sui::Runtime runtime;
+    runtime.layout(component, {0, 0, 100, 100}, 2.0f);
+    const auto* fixedBox = runtime.find(hashId("layout-fixed"));
+    const auto* growingBox = runtime.find(hashId("layout-growing"));
+    require(fixedBox && growingBox, "SlugUI layout produces stable element boxes");
+    require(fixedBox->bounds.x == 10.0f && fixedBox->bounds.y == 10.0f &&
+            fixedBox->bounds.width == 40.0f && fixedBox->bounds.height == 20.0f,
+            "SlugUI resolves logical pixels and percent once");
+    require(growingBox->bounds.x == 10.0f && growingBox->bounds.y == 34.0f &&
+            growingBox->bounds.width == 80.0f && growingBox->bounds.height == 56.0f,
+            "SlugUI column grow and stretch layout");
+  }
+
+  {
+    namespace sui = slugui;
+    auto root = sui::absolute(hashId("interactive-root"));
+    auto button = sui::roundedRectangle(
+      hashId("interactive-button"), Paint::solid(Color::fromRgb8(0x203050)),
+      CornerRadii::all(6.0f), CornerSmoothing::all(100.0f));
+    button.layout.x = sui::Length::physical(10.0f);
+    button.layout.y = sui::Length::physical(10.0f);
+    button.layout.height = sui::Length::physical(40.0f);
+    button.interaction = {true, true, 1};
+    auto& buttonVisual = std::get<sui::RoundedRectangleVisual>(button.visual);
+    buttonVisual.paint.hovered =
+      sui::ValueSource<Paint>{Paint::solid(Color::fromRgb8(0x30a060))};
+    buttonVisual.paint.pressed =
+      sui::ValueSource<Paint>{Paint::solid(Color::fromRgb8(0x3060d0))};
+    buttonVisual.stroke.paint.normal =
+      Paint::gradient(GradientKind::Linear, Color::fromRgb8(0xff4080),
+                      Color::fromRgb8(0x40e0ff));
+    buttonVisual.stroke.width = 2.5f;
+    buttonVisual.stroke.align = StrokeAlign::Inside;
+    root.add(std::move(button));
+
+    auto popup = sui::roundedRectangle(
+      hashId("overlay-popup"), Paint::solid(Color::fromRgb8(0xf09030)));
+    popup.layout.x = sui::Length::physical(4.0f);
+    popup.layout.y = sui::Length::physical(4.0f);
+    popup.layout.width = sui::Length::physical(60.0f);
+    popup.layout.height = sui::Length::physical(24.0f);
+    popup.overlay = true;
+    root.add(std::move(popup));
+
+    sui::Component component(std::move(root));
+    const auto buttonWidth =
+      component.properties().define<sui::Length>("button-width", sui::Length::physical(100.0f));
+    component.root().children[0].layout.width = buttonWidth;
+    int pressed = 0;
+    component.on(1, [&](const sui::UiEvent& event) {
+      if (event.type == sui::EventType::Pressed) ++pressed;
+      if (event.type == sui::EventType::Activated) {
+        component.properties().set(buttonWidth, sui::Length::physical(120.0f));
+      }
+    });
+
+    sui::Runtime runtime;
+    DrawList uiList;
+    sui::FrameInput input;
+    input.cursor = {20.0f, 20.0f};
+    input.primary = {.pressed = true, .released = false, .down = true};
+    const auto stats = runtime.render(component, input, uiList, {0, 0, 200, 100});
+    const auto* buttonBox = runtime.find(hashId("interactive-button"));
+    require(pressed == 1 && stats.callbacks == 3 && stats.layoutPasses == 2,
+            "SlugUI press-edge activation updates the current frame");
+    require(buttonBox && buttonBox->bounds.width == 120.0f,
+            "SlugUI callback property change relayouts without a frame delay");
+    require(uiList.commands().size() == 1 && uiList.overlayCommands().size() == 1,
+            "SlugUI overlay lowers after regular commands");
+    const auto pressedColor =
+      std::get<RoundedRectCommand>(uiList.commands().front()).paint.start;
+    const auto resolvedBorder =
+      std::get<RoundedRectCommand>(uiList.commands().front()).border;
+    require(std::abs(pressedColor.r - Color::fromRgb8(0x3060d0).r) < 0.0001f &&
+            std::abs(pressedColor.g - Color::fromRgb8(0x3060d0).g) < 0.0001f &&
+            std::abs(pressedColor.b - Color::fromRgb8(0x3060d0).b) < 0.0001f,
+            "SlugUI pressed paint resolves on the input frame");
+    require(resolvedBorder.width == 2.5f &&
+            resolvedBorder.align == StrokeAlign::Inside &&
+            resolvedBorder.paint.kind == GradientKind::Linear,
+            "SlugUI stroke paint and width lower into the current frame");
+  }
+
   std::cout << "SlugVulkan core tests passed\n";
   return 0;
 } catch (const std::exception& error) {

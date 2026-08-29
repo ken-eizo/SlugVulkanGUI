@@ -7,6 +7,12 @@
 layout(set = 0, binding = 0) uniform sampler2D curveTexture;
 layout(set = 0, binding = 1) uniform usampler2D bandTexture;
 
+layout(push_constant) uniform PushConstants {
+  vec4 viewportScale;
+  vec4 translationOverride;
+  vec4 overrideClip;
+} pushConstants;
+
 layout(location = 0) in vec2 emCoord;
 layout(location = 1) in vec2 uv;
 layout(location = 2) flat in vec4 bandTransform;
@@ -16,6 +22,7 @@ layout(location = 5) flat in vec4 color1;
 layout(location = 6) flat in vec4 paintData;
 layout(location = 7) flat in vec4 gradientData;
 layout(location = 8) flat in vec4 clipRect;
+layout(location = 9) flat in vec4 strokeWidths;
 
 layout(location = 0) out vec4 outColor;
 
@@ -27,37 +34,89 @@ vec2 unpackFixed16(uint packed, float scale) {
   return vec2(float(packed & 0xFFFFu), float(packed >> 16u)) / scale;
 }
 
+float roundedRectShapeCoverage(vec2 point, vec2 size, vec4 radiiX, vec4 radiiY,
+                               vec4 smoothing) {
+  size = max(size, vec2(0.0001));
+  vec2 halfSize = size * 0.5;
+  int cornerIndex = point.y < halfSize.y
+    ? (point.x < halfSize.x ? 0 : 1)
+    : (point.x < halfSize.x ? 3 : 2);
+  vec2 radius = max(vec2(radiiX[cornerIndex], radiiY[cornerIndex]), vec2(0.0));
+  float exponent = mix(2.0, 5.0, clamp(smoothing[cornerIndex] * 0.01, 0.0, 1.0));
+  vec2 fromCenter = abs(point - halfSize);
+  vec2 boxDistanceVector = fromCenter - halfSize;
+  if (max(radius.x, radius.y) <= 0.0001) {
+    float distance = max(boxDistanceVector.x, boxDistanceVector.y);
+    float aa = max(fwidth(distance), 0.0001);
+    return clamp(0.5 - distance / aa, 0.0, 1.0);
+  }
+
+  // The rounded corner is a superellipse attached to the two straight edges. Convert its
+  // implicit value to pixel distance with the analytic gradient. This is important even far
+  // from a corner: treating the whole radius-wide edge strip as distance zero leaves a broad
+  // 50% coverage band and makes an inside stroke look thick, translucent, and doubled.
+  vec2 safeRadius = max(radius, vec2(0.0001));
+  vec2 cornerOffset = fromCenter - (halfSize - safeRadius);
+  vec2 positiveOffset = max(cornerOffset, vec2(0.0));
+  float distance;
+  if (max(positiveOffset.x, positiveOffset.y) <= 0.0001) {
+    distance = max(boxDistanceVector.x, boxDistanceVector.y);
+  } else {
+    vec2 normalized = positiveOffset / safeRadius;
+    vec2 poweredMinusOne = pow(normalized, vec2(exponent - 1.0));
+    vec2 powered = poweredMinusOne * normalized;
+    float powerSum = max(powered.x + powered.y, 1.0e-12);
+    float inverseExponent = 1.0 / exponent;
+    float implicitValue = pow(powerSum, inverseExponent);
+    vec2 gradient = poweredMinusOne / safeRadius;
+    gradient *= implicitValue / powerSum;
+    distance = (implicitValue - 1.0) / max(length(gradient), 0.0001);
+  }
+  float aa = max(fwidth(distance), 0.0001);
+  return clamp(0.5 - distance / aa, 0.0, 1.0);
+}
+
 float roundedRectCoverage(vec2 point, vec4 metrics) {
   vec2 size = max(metrics.xy, vec2(0.0001));
+  float coverageMode = metrics.z;
   vec4 radii = vec4(unpackFixed16(shapeData.y, 16.0), unpackFixed16(shapeData.z, 16.0));
   vec4 smoothing = vec4(unpackFixed16(shapeData.w, 256.0),
                         unpackFixed16(floatBitsToUint(paintData.w), 256.0));
-  vec2 halfSize = size * 0.5;
-  bool right = point.x >= halfSize.x;
-  bool bottom = point.y >= halfSize.y;
-  int cornerIndex = bottom ? (right ? 2 : 3) : (right ? 1 : 0);
-  float encodedRadius = radii[cornerIndex];
-  float radius = max(encodedRadius, 0.5);
+  vec4 widths = max(strokeWidths, vec4(0.0)); // top, right, bottom, left
+  float outsideFactor = clamp(metrics.w, 0.0, 1.0);
+  vec4 horizontal = vec4(widths.w, widths.y, widths.y, widths.w);
+  vec4 vertical = vec4(widths.x, widths.x, widths.z, widths.z);
+  vec4 innerRadiiX = max(radii - horizontal * (1.0 - outsideFactor), vec4(0.0));
+  vec4 innerRadiiY = max(radii - vertical * (1.0 - outsideFactor), vec4(0.0));
+  // An opaque Figma-style stroke is composited as an outer border mask followed by an inner
+  // fill mask. The fill uses only the inward part of each independently authored side width.
+  // Resolve this mode before evaluating the unrelated outer SDF.
+  if (coverageMode < -0.5) {
+    vec4 insets = widths * (1.0 - outsideFactor); // top, right, bottom, left
+    vec2 innerSize = size - vec2(insets.w + insets.y, insets.x + insets.z);
+    if (min(innerSize.x, innerSize.y) <= 0.0) return 0.0;
+    return roundedRectShapeCoverage(
+      point - vec2(insets.w, insets.x), innerSize, innerRadiiX, innerRadiiY, smoothing);
+  }
 
-  // One continuous implicit curve covers both straight edges and corners. The
-  // previous corner/non-corner branch evaluated fwidth() in divergent control
-  // flow, which produced a visible AA seam at the exact edge/corner tangent.
-  vec2 corner = max(abs(point - halfSize) - (halfSize - vec2(radius)), 0.0) / radius;
-  float exponent = mix(2.0, 5.0, clamp(smoothing[cornerIndex] * 0.01, 0.0, 1.0));
-  float implicitCurve = pow(corner.x, exponent) + pow(corner.y, exponent) - 1.0;
-  float roundedAA = max(fwidth(implicitCurve), 0.0001);
-  float roundedCoverage = 1.0 - smoothstep(-roundedAA, roundedAA, implicitCurve);
-
-  // Preserve exact zero-radius rectangles without evaluating a near-zero
-  // radius derivative. Both paths are derivative-safe and the flat radius
-  // selector changes only between quadrants, where their straight edges agree.
-  vec2 rectangleQ = abs(point - halfSize) - halfSize;
-  float rectangleDistance =
-    length(max(rectangleQ, 0.0)) + min(max(rectangleQ.x, rectangleQ.y), 0.0);
-  float rectangleAA = max(fwidth(rectangleDistance), 0.0001);
-  float rectangleCoverage =
-    1.0 - smoothstep(-rectangleAA, rectangleAA, rectangleDistance);
-  return mix(rectangleCoverage, roundedCoverage, step(0.5, encodedRadius));
+  // A zero authored radius is a mitered rectangle corner, not a round cap produced by the
+  // outside stroke width. Non-zero corners expand elliptically per adjacent side.
+  vec4 roundedCorner = step(vec4(0.0001), radii);
+  vec4 outerRadiiX = (radii + horizontal * outsideFactor) * roundedCorner;
+  vec4 outerRadiiY = (radii + vertical * outsideFactor) * roundedCorner;
+  float outer = roundedRectShapeCoverage(
+    point, size, outerRadiiX, outerRadiiY, smoothing);
+  if (max(max(widths.x, widths.y), max(widths.z, widths.w)) <= 0.0001) return outer;
+  vec2 innerSize = size - vec2(widths.w + widths.y, widths.x + widths.z);
+  if (min(innerSize.x, innerSize.y) <= 0.0) return outer;
+  float inner = roundedRectShapeCoverage(
+    point - vec2(widths.w, widths.x), innerSize, innerRadiiX, innerRadiiY, smoothing);
+  float ring = clamp(outer - inner, 0.0, 1.0);
+  // A fully opaque border stays solid beneath the inner fill's AA transition. On a zero-width
+  // side outer == inner, so no border is introduced there. This applies outer coverage once and
+  // prevents a lighter fill layer from leaking through the outside edge.
+  if (coverageMode > 1.5) return ring > 0.00001 ? outer : 0.0;
+  return ring;
 }
 
 float strokeSegmentCoverage(vec2 point, vec4 endpoints) {
@@ -219,6 +278,13 @@ vec4 evaluatePaint() {
   return mix(color0, color1, clamp(t, 0.0, 1.0));
 }
 
+vec3 srgbToLinear(vec3 value) {
+  bvec3 low = lessThanEqual(value, vec3(0.04045));
+  vec3 linearLow = value / 12.92;
+  vec3 linearHigh = pow((value + 0.055) / 1.055, vec3(2.4));
+  return mix(linearHigh, linearLow, low);
+}
+
 void main() {
   if (gl_FragCoord.x < clipRect.x || gl_FragCoord.y < clipRect.y ||
       gl_FragCoord.x >= clipRect.x + clipRect.z || gl_FragCoord.y >= clipRect.y + clipRect.w) discard;
@@ -231,6 +297,8 @@ void main() {
     coverage = slugCoverage(emCoord);
   if (coverage <= 0.001) discard;
   vec4 color = evaluatePaint();
+  if (pushConstants.translationOverride.w > 0.5)
+    color.rgb = srgbToLinear(clamp(color.rgb, 0.0, 1.0));
   color.a *= coverage * paintData.y;
   outColor = color;
 }
