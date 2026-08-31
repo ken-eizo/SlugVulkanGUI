@@ -62,6 +62,9 @@ public:
   [[nodiscard]] const std::u32string& textInput() const {
     return textInput_;
   }
+  [[nodiscard]] bool focusLostThisFrame() const {
+    return focusLostThisFrame_;
+  }
 
 private:
   friend class Window;
@@ -85,6 +88,7 @@ private:
   ScrollState scroll_{};
   std::u32string textInput_{};
   double lastScrollTime_ = -1.0;
+  bool focusLostThisFrame_ = false;
 };
 
 // Narrow write-side API for native host adapters. Read-side UI code continues

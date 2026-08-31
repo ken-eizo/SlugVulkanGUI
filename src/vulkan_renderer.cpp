@@ -351,14 +351,16 @@ struct DrawBatch {
   Vec2 translation = {};
   float scale = 1.0f;
   Rect clip = {};
+  float opacity = 1.0f;
 };
 
 struct alignas(16) PushConstants {
   float viewportScale[4];
   float translationOverride[4];
   float overrideClip[4];
+  float opacity[4];
 };
-static_assert(sizeof(PushConstants) == 48);
+static_assert(sizeof(PushConstants) == 64);
 
 struct Texture {
   VkImage image = VK_NULL_HANDLE;
@@ -374,6 +376,9 @@ struct VulkanRenderer::Impl {
   const VectorAtlas& vectorAtlas;
   RendererConfig config;
   RendererStats statistics{};
+  Buffer readback{};
+  bool captureFrame = false;
+  FramePixels captured{};
 
   VkInstance instance = VK_NULL_HANDLE;
   VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
@@ -990,6 +995,11 @@ struct VulkanRenderer::Impl {
     info.imageExtent = extent;
     info.imageArrayLayers = 1;
     info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (config.enableReadback) {
+      if (!(support.capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+        throw std::runtime_error("Surface does not support readback");
+      info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
     const std::array families{*queueFamilies.graphics, *queueFamilies.present};
     if (queueFamilies.graphics != queueFamilies.present) {
       info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
@@ -1230,11 +1240,16 @@ struct VulkanRenderer::Impl {
     fit(command.destination.height, radii[0] + radii[3]);
     fit(command.destination.height, radii[1] + radii[2]);
     for (float& radius : radii) radius *= std::clamp(radiusScale, 0.0f, 1.0f);
+    const auto resolvedSmoothing = [&](float authored) {
+      return config.enableContinuousCorners
+               ? std::clamp(authored, 0.0f, 100.0f)
+               : 0.0f;
+    };
     const std::array<float, 4> smoothing{
-        std::clamp(command.continuousCorners.topLeftPercent, 0.0f, 100.0f),
-        std::clamp(command.continuousCorners.topRightPercent, 0.0f, 100.0f),
-        std::clamp(command.continuousCorners.bottomRightPercent, 0.0f, 100.0f),
-        std::clamp(command.continuousCorners.bottomLeftPercent, 0.0f, 100.0f)};
+        resolvedSmoothing(command.continuousCorners.topLeftPercent),
+        resolvedSmoothing(command.continuousCorners.topRightPercent),
+        resolvedSmoothing(command.continuousCorners.bottomRightPercent),
+        resolvedSmoothing(command.continuousCorners.bottomLeftPercent)};
     quad.bandTransform[0] = destination.width;
     quad.bandTransform[1] = destination.height;
     quad.bandTransform[2] = coverageMode;
@@ -1367,12 +1382,12 @@ struct VulkanRenderer::Impl {
 
   void appendStrokeSegment(std::vector<Instance>& instances, Vec2 from, Vec2 to,
                            const CubicBezierCommand& command, bool firstSegment,
-                           bool lastSegment) const {
+                           bool lastSegment, Vec2 startPartition, Vec2 endPartition) const {
     const float dx = to.x - from.x;
     const float dy = to.y - from.y;
     if (dx * dx + dy * dy <= 1.0e-8f) return;
 
-    const float padding = command.style.width * 0.5f + 1.5f;
+    const float padding = command.style.width * 2.0f + 1.5f;
     const float left = std::min(from.x, to.x) - padding;
     const float top = std::min(from.y, to.y) - padding;
     const float right = std::max(from.x, to.x) + padding;
@@ -1389,10 +1404,14 @@ struct VulkanRenderer::Impl {
     quad.bandTransform[2] = to.x;
     quad.bandTransform[3] = to.y;
     quad.shapeData[0] = analyticStrokeSegmentShape;
-    const bool roundJoin = command.style.join == LineJoin::Round;
-    const bool roundStart = !firstSegment || roundJoin || command.style.cap == LineCap::Round;
-    const bool roundEnd = !lastSegment || roundJoin || command.style.cap == LineCap::Round;
-    quad.shapeData[1] = (roundStart ? 1U : 0U) | (roundEnd ? 2U : 0U);
+    const bool roundStart = firstSegment && command.style.cap == LineCap::Round;
+    const bool roundEnd = lastSegment && command.style.cap == LineCap::Round;
+    quad.shapeData[1] = (roundStart ? 1U : 0U) | (roundEnd ? 2U : 0U) |
+                       (firstSegment ? 0U : 4U) | (lastSegment ? 0U : 8U);
+    quad.strokeWidths[0] = startPartition.x;
+    quad.strokeWidths[1] = startPartition.y;
+    quad.strokeWidths[2] = endPartition.x;
+    quad.strokeWidths[3] = endPartition.y;
     const auto& paint = command.style.paint;
     const float first[4]{paint.start.r, paint.start.g, paint.start.b, paint.start.a};
     const float second[4]{paint.end.r, paint.end.g, paint.end.b, paint.end.a};
@@ -1421,8 +1440,8 @@ struct VulkanRenderer::Impl {
                                  length(command.control2, command.to);
     const float chord = length(command.from, command.to);
     const float curvature = std::max(0.0f, controlPolygon - chord);
-    const int segments =
-      std::clamp(static_cast<int>(std::ceil(controlPolygon / 14.0f + curvature / 6.0f)), 4, 64);
+    const int segments = curvature < 0.001f ? 1 :
+      std::clamp(static_cast<int>(std::ceil(controlPolygon / 8.0f + curvature / 4.0f)), 4, 128);
     const auto pointAt = [&](float t) {
       const float u = 1.0f - t;
       const float uu = u * u;
@@ -1433,12 +1452,42 @@ struct VulkanRenderer::Impl {
                     3.0f * u * tt * command.control2.y + tt * t * command.to.y};
     };
 
-    Vec2 previous = command.from;
+    std::array<Vec2, 129> points{};
+    std::array<Vec2, 128> tangents{};
+    points[0] = command.from;
     for (int index = 1; index <= segments; ++index) {
-      const Vec2 current = pointAt(static_cast<float>(index) / static_cast<float>(segments));
-      appendStrokeSegment(instances, previous, current, command, index == 1, index == segments);
-      previous = current;
+      points[index] = pointAt(static_cast<float>(index) / static_cast<float>(segments));
+      const auto delta = points[index] - points[index - 1];
+      tangents[index - 1] = delta * (1.0f / std::max(std::hypot(delta.x, delta.y), 0.00001f));
     }
+    for (int index = 0; index < segments; ++index) {
+      const auto start = index == 0 ? tangents[index] : tangents[index - 1] + tangents[index];
+      const auto end = index + 1 == segments ? tangents[index] : tangents[index] + tangents[index + 1];
+      appendStrokeSegment(instances, points[index], points[index + 1], command,
+                          index == 0, index + 1 == segments, start, end);
+    }
+  }
+
+  void appendArc(std::vector<Instance>& instances, const ArcCommand& command) const {
+    const float padding = command.radius + command.style.width * 0.5f + 1.5f;
+    const auto first = instances.size();
+    CubicBezierCommand stroke{};
+    stroke.clip = command.clip;
+    stroke.style = command.style;
+    appendStrokeSegment(instances, command.center - Vec2{padding, padding},
+                        command.center + Vec2{padding, padding}, stroke, true, true, {}, {});
+    if (instances.size() == first) return;
+    auto& quad = instances.back();
+    const float bounds[4]{command.center.x - padding, command.center.y - padding,
+                          command.center.x + padding, command.center.y + padding};
+    std::copy(std::begin(bounds), std::end(bounds), quad.positionRect);
+    std::copy(std::begin(bounds), std::end(bounds), quad.emRect);
+    quad.shapeData[0] = 0xFFFFFFFDU;
+    quad.bandTransform[0] = command.center.x;
+    quad.bandTransform[1] = command.center.y;
+    quad.bandTransform[2] = command.radius;
+    quad.bandTransform[3] = command.startRadians;
+    quad.strokeWidths[0] = command.sweepRadians;
   }
 
   float textWidth(const std::vector<std::uint32_t>& codepoints, const TextStyle& style) const {
@@ -1612,6 +1661,15 @@ struct VulkanRenderer::Impl {
     }
     std::size_t lineStart = 0;
     std::size_t lineNumber = 0;
+    const std::size_t lineCount =
+      1 + static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n'));
+    const float lineAdvance = command.style.size * std::max(command.style.lineHeight, 0.01f);
+    const float textBlockHeight = lineAdvance * static_cast<float>(lineCount);
+    float firstLineTop = command.bounds.y;
+    if (command.style.verticalAlign == VerticalAlign::Center)
+      firstLineTop += (command.bounds.height - textBlockHeight) * 0.5f;
+    else if (command.style.verticalAlign == VerticalAlign::Bottom)
+      firstLineTop += command.bounds.height - textBlockHeight;
     const float slant = command.style.italic &&
       !vectorAtlas.hasFontFace(command.style.fontName, true) ? 0.18f : 0.0f;
     while (lineStart <= text.size()) {
@@ -1619,8 +1677,7 @@ struct VulkanRenderer::Impl {
       const std::string_view line(text.data() + lineStart,
                                   (lineEnd == std::string::npos ? text.size() : lineEnd) -
                                       lineStart);
-      const float top = command.bounds.y + static_cast<float>(lineNumber) * command.style.size *
-                                               command.style.lineHeight;
+      const float top = firstLineTop + static_cast<float>(lineNumber) * lineAdvance;
       const float lineBottom = top + command.style.size * std::max(command.style.lineHeight, 1.25f);
       if (lineBottom < command.clip.y ||
           top - command.style.size * 0.5f > command.clip.y + command.clip.height) {
@@ -1741,7 +1798,7 @@ struct VulkanRenderer::Impl {
             continue;
           drawBatches.push_back({retainedCommand->text, 0, retained.instanceCount,
                                  retainedCommand->position, retainedCommand->scale,
-                                 retainedCommand->clip});
+                                 retainedCommand->clip, retainedCommand->opacity});
           continue;
         }
         const std::size_t first = instances.size();
@@ -1760,7 +1817,8 @@ struct VulkanRenderer::Impl {
           if (baseCanStack) {
             while (stackEnd < commands.size()) {
               const auto* overlay = std::get_if<RoundedRectCommand>(&commands[stackEnd]);
-              if (!overlay || !sameRoundedRectGeometry(*roundedCommand, *overlay)) break;
+              if (!overlay || overlay->opacity != roundedCommand->opacity ||
+                  !sameRoundedRectGeometry(*roundedCommand, *overlay)) break;
               const BorderWidths overlayWidths = resolvedBorderWidths(overlay->border);
               if (!paintFullyTransparent(overlay->paint) ||
                   overlayWidths.maximum() <= 0.0f ||
@@ -1777,6 +1835,11 @@ struct VulkanRenderer::Impl {
         }
         else if (const auto* cubicCommand = std::get_if<CubicBezierCommand>(&display))
           appendCubicBezier(instances, *cubicCommand);
+        else if (const auto* arcCommand = std::get_if<ArcCommand>(&display))
+          appendArc(instances, *arcCommand);
+        const float opacity = std::visit([](const auto& command) { return command.opacity; }, display);
+        if (opacity < 1.0f)
+          for (std::size_t i = first; i < instances.size(); ++i) instances[i].paint[1] *= opacity;
         const std::uint32_t count = static_cast<std::uint32_t>(instances.size() - first);
         if (count == 0)
           continue;
@@ -1860,13 +1923,38 @@ struct VulkanRenderer::Impl {
                             {retained ? batch.translation.x : 0.0f,
                              retained ? batch.translation.y : 0.0f, retained ? 1.0f : 0.0f,
                              isSrgbFormat(swapchainFormat) ? 1.0f : 0.0f},
-                           {batch.clip.x, batch.clip.y, batch.clip.width, batch.clip.height}};
+                           {batch.clip.x, batch.clip.y, batch.clip.width, batch.clip.height},
+                           {batch.opacity, 0.0f, 0.0f, 0.0f}};
         vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push),
                            &push);
         vkCmdDraw(command, 6, batch.instanceCount, 0, retained ? 0 : batch.firstInstance);
       }
     }
     vkCmdEndRenderPass(command);
+    if (captureFrame) {
+      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = swapchainImages[imageIndex];
+      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+      VkBufferImageCopy region{};
+      region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      region.imageExtent = {extent.width, extent.height, 1};
+      vkCmdCopyImageToBuffer(command, barrier.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             readback.buffer, 1, &region);
+      barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      barrier.dstAccessMask = 0;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
     if (frame.writeTimestamps)
       vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, frame.timestamps, 1);
     check(vkEndCommandBuffer(command), "vkEndCommandBuffer(frame)");
@@ -1915,6 +2003,13 @@ struct VulkanRenderer::Impl {
     Frame& frame = frames[currentFrame];
     const std::uint32_t imageIndex = preparedImageIndex;
 
+    if (captureFrame) {
+      if (swapchainFormat != VK_FORMAT_B8G8R8A8_SRGB && swapchainFormat != VK_FORMAT_B8G8R8A8_UNORM &&
+          swapchainFormat != VK_FORMAT_R8G8B8A8_SRGB && swapchainFormat != VK_FORMAT_R8G8B8A8_UNORM)
+        throw std::runtime_error("Readback requires an RGBA8/BGRA8 swapchain");
+      ensureCapacity(readback, static_cast<VkDeviceSize>(extent.width) * extent.height * 4,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    }
     const auto cpuBuildStart = std::chrono::steady_clock::now();
     stagingInstances.clear();
     buildMesh(list, stagingInstances);
@@ -1942,6 +2037,16 @@ struct VulkanRenderer::Impl {
     submit.pSignalSemaphores = &renderFinished[imageIndex];
     check(vkQueueSubmit(graphicsQueue, 1, &submit, frame.fence), "vkQueueSubmit(frame)");
     frame.timestampsWritten = frame.writeTimestamps;
+    if (captureFrame) {
+      check(vkWaitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(readback)");
+      captured.width = extent.width;
+      captured.height = extent.height;
+      captured.rgba.resize(static_cast<std::size_t>(extent.width) * extent.height * 4);
+      std::memcpy(captured.rgba.data(), readback.mapped, captured.rgba.size());
+      if (swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB || swapchainFormat == VK_FORMAT_B8G8R8A8_UNORM)
+        for (std::size_t i = 0; i < captured.rgba.size(); i += 4)
+          std::swap(captured.rgba[i], captured.rgba[i + 2]);
+    }
 
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
@@ -1980,6 +2085,7 @@ struct VulkanRenderer::Impl {
     if (device)
       vkDeviceWaitIdle(device);
     if (device) {
+      destroyBuffer(readback);
       for (auto& retained : retainedTexts)
         destroyBuffer(retained.instances);
       retainedTexts.clear();
@@ -2039,6 +2145,14 @@ RetainedTextId VulkanRenderer::createRetainedText(std::string_view utf8, Rect la
 }
 void VulkanRenderer::draw(const DrawList& list) {
   impl_->draw(list);
+}
+FramePixels VulkanRenderer::drawAndReadback(const DrawList& list) {
+  if (!impl_->config.enableReadback) throw std::runtime_error("Readback was not enabled");
+  impl_->captureFrame = true;
+  try { impl_->draw(list); }
+  catch (...) { impl_->captureFrame = false; throw; }
+  impl_->captureFrame = false;
+  return std::move(impl_->captured);
 }
 void VulkanRenderer::waitIdle() {
   if (impl_->device)

@@ -557,8 +557,34 @@ ShapeId VectorAtlas::addPath(const Path& path) {
 }
 
 ShapeId VectorAtlas::addStroke(const Path& path, const StrokeStyle& style) {
+  return addStrokeImpl(path, style, std::nullopt);
+}
+
+ShapeId VectorAtlas::addStrokeInSquareViewBox(const Path& path, const StrokeStyle& style,
+                                               float viewBoxSize) {
+  if (!std::isfinite(viewBoxSize) || viewBoxSize <= 0.0f)
+    throw std::invalid_argument("viewBoxSize must be positive");
+  return addStrokeImpl(path, style, viewBoxSize);
+}
+
+ShapeId VectorAtlas::addStrokeImpl(const Path& path, const StrokeStyle& style,
+                                   std::optional<float> squareViewBoxSize) {
   if (impl_->atlas.isBuilt()) throw std::logic_error("VectorAtlas is already built");
   slughorn::canvas::Path centerline = path.impl_->value;
+  const auto commit = [&](const slughorn::canvas::Path& outline) {
+    const ShapeId id = impl_->nextId++;
+    slughorn::canvas::Canvas canvas(impl_->atlas);
+    if (squareViewBoxSize.has_value()) {
+      // Slughorn normally tightens every path to its visible bounds. SVG icons need their
+      // canonical padding retained so hover/pressed/state variants share an identical quad.
+      canvas.setAutoMetrics(false);
+      if (!canvas.defineShape(outline, slughorn::Key(id),
+                              1.0f / *squareViewBoxSize)) return ShapeId{0};
+    } else if (!canvas.defineShape(outline, slughorn::Key(id))) {
+      return ShapeId{0};
+    }
+    return id;
+  };
 
   const bool tapered = std::abs(style.startTaper - 1.0f) > 0.0001f ||
                        std::abs(style.endTaper - 1.0f) > 0.0001f;
@@ -638,10 +664,7 @@ ShapeId VectorAtlas::addStroke(const Path& path, const StrokeStyle& style) {
       appendCap(outline, previous, endHalf,
                 resolvedEndCap(style, visibleIndex, true, patternLength > 0.0f), false);
     }
-    const ShapeId id = impl_->nextId++;
-    slughorn::canvas::Canvas canvas(impl_->atlas);
-    if (!canvas.defineShape(outline, slughorn::Key(id))) return 0;
-    return id;
+    return commit(outline);
   }
 
   // Slughorn expands the centerline once during atlas construction. Runtime transforms therefore
@@ -662,10 +685,7 @@ ShapeId VectorAtlas::addStroke(const Path& path, const StrokeStyle& style) {
                                             segment.atPathEnd, true))) return 0;
     }
   }
-  const ShapeId id = impl_->nextId++;
-  slughorn::canvas::Canvas canvas(impl_->atlas);
-  if (!canvas.defineShape(outline, slughorn::Key(id))) return 0;
-  return id;
+  return commit(outline);
 }
 
 bool VectorAtlas::loadFont(const std::string& fontPath, const std::vector<std::uint32_t>& codepoints) {

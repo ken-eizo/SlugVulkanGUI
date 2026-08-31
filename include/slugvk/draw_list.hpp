@@ -15,6 +15,7 @@ struct DrawCommand {
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
   Paint paint = {};
   float italicShear = 0.0f;
+  float opacity = 1.0f;
 };
 
 struct TextCommand {
@@ -25,6 +26,7 @@ struct TextCommand {
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
   TextStyle style = {};
   float runScale = 1.0f;
+  float opacity = 1.0f;
 
   [[nodiscard]] std::string_view text() const {
     return borrowedUtf8.data() ? borrowedUtf8 : std::string_view(utf8);
@@ -38,6 +40,7 @@ struct RoundedRectCommand {
   CornerSmoothing continuousCorners = {};
   Paint paint = {};
   BorderStyle border = {};
+  float opacity = 1.0f;
 };
 
 // A screen-space cubic stroke. Unlike an atlas ShapeId, its control points stay in the
@@ -51,6 +54,7 @@ struct CubicBezierCommand {
   Vec2 to = {};
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
   StrokeStyle style = {};
+  float opacity = 1.0f;
 };
 
 struct RetainedTextCommand {
@@ -58,14 +62,28 @@ struct RetainedTextCommand {
   Vec2 position = {};
   float scale = 1.0f;
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
+  float opacity = 1.0f;
+};
+
+// Analytic circular stroke: one coverage evaluation, without tessellation seams.
+struct ArcCommand {
+  Vec2 center = {};
+  float radius = 0.0f;
+  float startRadians = 0.0f;
+  float sweepRadians = 0.0f;
+  Rect clip = {};
+  StrokeStyle style = {};
+  float opacity = 1.0f;
 };
 
 using DisplayCommand = std::variant<DrawCommand, TextCommand, RoundedRectCommand,
-                                    CubicBezierCommand, RetainedTextCommand>;
+                                    CubicBezierCommand, RetainedTextCommand, ArcCommand>;
 
 class DrawList {
 public:
   void clear();
+  void setOpacity(float opacity) { opacity_ = std::clamp(opacity, 0.0f, 1.0f); }
+  [[nodiscard]] float opacity() const { return opacity_; }
   void setClip(Rect clip) {
     clip_ = clip;
   }
@@ -103,6 +121,7 @@ public:
   void roundedRect(Rect destination, CornerRadii radiiPx, Paint paint,
                    CornerSmoothing continuousCorners = {}, BorderStyle border = {});
   void cubicBezier(Vec2 from, Vec2 control1, Vec2 control2, Vec2 to, StrokeStyle style);
+  void arc(Vec2 center, float radius, float startRadians, float sweepRadians, StrokeStyle style);
   void text(std::string utf8, Rect bounds, TextStyle style);
   // The referenced bytes must remain alive until VulkanRenderer::draw() returns.
   void textStatic(std::string_view utf8, Rect bounds, TextStyle style);
@@ -125,6 +144,7 @@ private:
   std::vector<DisplayCommand> commands_{};
   std::vector<DisplayCommand> overlayCommands_{};
   bool overlayMode_ = false;
+  float opacity_ = 1.0f;
 };
 
 } // namespace slugvk

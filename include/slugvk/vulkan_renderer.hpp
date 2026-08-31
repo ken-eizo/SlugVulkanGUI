@@ -13,12 +13,16 @@ class Window;
 class PlatformSurface;
 
 struct RendererConfig {
+  // Opt-in diagnostics only; normal rendering does not allocate/copy/wait for pixels.
+  bool enableReadback = false;
   Color clearColor = Color::fromRgb8(0x0b1020);
   bool validation = false;
   // false prefers refresh-synchronized MAILBOX for smooth low-latency interaction.
   bool vsync = false;
   // Select IMMEDIATE before MAILBOX when tearing is acceptable and absolute latency is primary.
   bool allowTearing = false;
+  // Retain authored radii while forcing circular (non-superellipse) corners when disabled.
+  bool enableContinuousCorners = true;
   // Number of quad instances preallocated per frame; buffers grow geometrically when needed.
   std::size_t initialVertexCapacity = 1U << 12U;
   // GPU timestamps add query commands. Zero disables them; otherwise sample every Nth submission.
@@ -34,6 +38,11 @@ struct RendererStats {
   float cpuUploadMilliseconds = 0.0f;
   float gpuMilliseconds = 0.0f;
   float cpuSubmitMilliseconds = 0.0f;
+};
+
+struct FramePixels {
+  std::uint32_t width = 0, height = 0;
+  std::vector<std::uint8_t> rgba;
 };
 
 class VulkanRenderer {
@@ -52,6 +61,7 @@ public:
   // this renderer's lifetime and can be transformed cheaply with DrawList::retainedText().
   RetainedTextId createRetainedText(std::string_view utf8, Rect layoutBounds, TextStyle style);
   void draw(const DrawList& list);
+  [[nodiscard]] FramePixels drawAndReadback(const DrawList& list);
   void waitIdle();
   [[nodiscard]] RendererStats stats() const;
   [[nodiscard]] const char* deviceName() const;

@@ -619,8 +619,8 @@ struct Runtime::Impl {
   }
 
   void draw(const Resolved& entry, const PropertyStore& properties,
-            const FrameInput& input, DrawList& drawList) const {
-    drawList.setClip(entry.box.clip);
+            const FrameInput& input, DrawList& drawList, Rect callerClip) const {
+    drawList.setClip(intersect(entry.box.clip, callerClip));
     if (const auto* rounded = std::get_if<RoundedRectangleVisual>(&entry.element->visual)) {
       auto radii = rounded->radii.resolve(properties);
       radii.topLeft *= scale;
@@ -680,14 +680,14 @@ struct Runtime::Impl {
     const Rect previousClip = drawList.clip();
     const bool previousOverlay = drawList.overlayMode();
     if (previousOverlay) {
-      for (const auto& entry : resolved) draw(entry, properties, input, drawList);
+      for (const auto& entry : resolved) draw(entry, properties, input, drawList, previousClip);
     } else {
       for (const auto& entry : resolved) {
-        if (!entry.box.overlay) draw(entry, properties, input, drawList);
+        if (!entry.box.overlay) draw(entry, properties, input, drawList, previousClip);
       }
       drawList.beginOverlay();
       for (const auto& entry : resolved) {
-        if (entry.box.overlay) draw(entry, properties, input, drawList);
+        if (entry.box.overlay) draw(entry, properties, input, drawList, previousClip);
       }
       drawList.endOverlay();
     }

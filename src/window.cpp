@@ -1,6 +1,9 @@
 #include "slugvk/window.hpp"
 
 #define GLFW_INCLUDE_NONE
+#if defined(__APPLE__)
+#include <vulkan/vulkan.h>
+#endif
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
@@ -27,6 +30,11 @@ std::runtime_error glfwFailure(const char* operation) {
 }
 
 void retainGlfw() {
+#if defined(__APPLE__)
+  // Use the linked (and potentially bundle-local) MoltenVK entry points. Loading
+  // a second system Vulkan library would mix implementations/require a global SDK.
+  if (glfwReferenceCount == 0) glfwInitVulkanLoader(vkGetInstanceProcAddr);
+#endif
   if (glfwReferenceCount == 0 && glfwInit() != GLFW_TRUE) throw glfwFailure("glfwInit");
   ++glfwReferenceCount;
 }

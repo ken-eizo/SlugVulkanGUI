@@ -71,6 +71,10 @@ public:
 
   ShapeId addPath(const Path& path);
   ShapeId addStroke(const Path& path, const StrokeStyle& style);
+  // Registers a stroked path without discarding its authored square-viewBox padding.
+  // This is intended for SVG icon atlases whose state variants must keep one stable quad.
+  ShapeId addStrokeInSquareViewBox(const Path& path, const StrokeStyle& style,
+                                   float viewBoxSize);
   bool loadFont(const std::string& fontPath, const std::vector<std::uint32_t>& codepoints = {});
   bool loadFont(const std::string& fontPath, FontFace face,
                 const std::vector<std::uint32_t>& codepoints = {});
@@ -90,6 +94,8 @@ public:
   [[nodiscard]] const slughorn::Atlas& native() const;
 
 private:
+  ShapeId addStrokeImpl(const Path& path, const StrokeStyle& style,
+                        std::optional<float> squareViewBoxSize);
   bool loadFontFace(void* nativeFace, FontFace face,
                     const std::vector<std::uint32_t>& codepoints);
   struct Impl;

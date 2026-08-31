@@ -42,6 +42,7 @@ const ButtonState& InputState::key(int keyCode) const {
 }
 
 void InputState::beginFrame() {
+  focusLostThisFrame_ = false;
   for (auto& state : mouse_) {
     state.pressed = false;
     state.released = false;
@@ -159,6 +160,7 @@ void InputWriter::codepoint(std::uint32_t value) noexcept {
 }
 
 void InputWriter::focusLost() noexcept {
+  state_.focusLostThisFrame_ = true;
   for (auto& state : state_.mouse_) {
     state.released = state.released || state.down;
     state.down = false;

@@ -29,6 +29,7 @@ layout(location = 0) out vec4 outColor;
 const int indirectionSize = 32;
 const uint analyticRoundedRectShape = 0xFFFFFFFFu;
 const uint analyticStrokeSegmentShape = 0xFFFFFFFEu;
+const uint analyticArcShape = 0xFFFFFFFDu;
 
 vec2 unpackFixed16(uint packed, float scale) {
   return vec2(float(packed & 0xFFFFu), float(packed >> 16u)) / scale;
@@ -130,19 +131,46 @@ float strokeSegmentCoverage(vec2 point, vec4 endpoints) {
   float halfWidth = max(paintData.w * 0.5, 0.0001);
   bool roundStart = (shapeData.y & 1u) != 0u;
   bool roundEnd = (shapeData.y & 2u) != 0u;
+  bool innerStart = (shapeData.y & 4u) != 0u;
+  bool innerEnd = (shapeData.y & 8u) != 0u;
 
   float distance;
-  if (local.x < 0.0 && roundStart) {
+  if (local.x < 0.0 && roundStart && !innerStart) {
     distance = length(local) - halfWidth;
-  } else if (local.x > axisLength && roundEnd) {
+  } else if (local.x > axisLength && roundEnd && !innerEnd) {
     distance = length(vec2(local.x - axisLength, local.y)) - halfWidth;
   } else {
-    vec2 q = vec2(max(max(-local.x, local.x - axisLength), 0.0),
+    vec2 q = vec2(max(innerStart ? -1.0e6 : -local.x,
+                      innerEnd ? -1.0e6 : local.x - axisLength),
                   abs(local.y) - halfWidth);
     distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
   }
   float aa = max(fwidth(distance), 0.0001);
+  // Partition pixels at the shared tangent bisector, without AA or alpha overlap
+  // on artificial tessellation boundaries. Compute derivatives before discarding.
+  if (innerStart && dot(point - from, strokeWidths.xy) < 0.0) discard;
+  if (innerEnd && dot(point - to, strokeWidths.zw) >= 0.0) discard;
   return 1.0 - smoothstep(-aa, aa, distance);
+}
+
+float arcCoverage(vec2 point) {
+  const float tau = 6.28318530718;
+  vec2 p = point - bandTransform.xy;
+  float radius = bandTransform.z;
+  float start = bandTransform.w;
+  float sweep = strokeWidths.x;
+  float halfWidth = paintData.w * 0.5;
+  float distance = abs(length(p) - radius) - halfWidth;
+  if (abs(sweep) < tau - 0.00001) {
+    float along = mod((atan(p.y, p.x) - start) * sign(sweep), tau);
+    if (along > abs(sweep)) {
+      vec2 a = radius * vec2(cos(start), sin(start));
+      vec2 b = radius * vec2(cos(start + sweep), sin(start + sweep));
+      distance = min(length(p - a), length(p - b)) - halfWidth;
+    }
+  }
+  float aa = max(fwidth(distance), 0.0001);
+  return clamp(0.5 - distance / aa, 0.0, 1.0);
 }
 
 uint calcRootCode(float y1, float y2, float y3) {
@@ -270,7 +298,7 @@ vec4 evaluatePaint() {
   else if (kind == 4) t = 0.5 + 0.5 * sin((uv.x * 1.7 + uv.y + paintData.z) * 24.0);
   else if (kind == 5) {
     vec2 centered = uv - origin;
-    float hue = fract(atan(centered.x, -centered.y) / 6.28318530718 + 1.0);
+    float hue = fract(atan(centered.x, -centered.y) / 6.28318530718 + paintData.z + 1.0);
     vec3 rgb = clamp(abs(mod(hue * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0,
                      0.0, 1.0);
     return vec4(rgb, color0.a);
@@ -293,6 +321,8 @@ void main() {
     coverage = roundedRectCoverage(emCoord, bandTransform);
   else if (shapeData.x == analyticStrokeSegmentShape)
     coverage = strokeSegmentCoverage(emCoord, bandTransform);
+  else if (shapeData.x == analyticArcShape)
+    coverage = arcCoverage(emCoord);
   else
     coverage = slugCoverage(emCoord);
   if (coverage <= 0.001) discard;
