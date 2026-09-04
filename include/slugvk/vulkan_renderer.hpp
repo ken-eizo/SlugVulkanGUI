@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <memory>
 
+#include <vulkan/vulkan.h>
+
 namespace slugvk {
 
 class VectorAtlas;
@@ -45,6 +47,22 @@ struct FramePixels {
   std::vector<std::uint8_t> rgba;
 };
 
+struct VulkanDeviceContext {
+  VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+  VkDevice device = VK_NULL_HANDLE;
+  VkQueue graphicsQueue = VK_NULL_HANDLE;
+  std::uint32_t graphicsQueueFamily = 0;
+};
+
+struct VulkanFrameContext {
+  VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+  std::uint32_t framebufferWidth = 0;
+  std::uint32_t framebufferHeight = 0;
+};
+
+using VulkanBeforeDrawRecorder = void (*)(void* context,
+                                          const VulkanFrameContext& frame) noexcept;
+
 class VulkanRenderer {
 public:
   VulkanRenderer(PlatformSurface& surface, const VectorAtlas& atlas,
@@ -66,6 +84,14 @@ public:
   [[nodiscard]] RendererStats stats() const;
   [[nodiscard]] const char* deviceName() const;
   [[nodiscard]] const char* presentModeName() const;
+  [[nodiscard]] VulkanDeviceContext deviceContext() const noexcept;
+  // The caller owns the buffer and must create it from deviceContext(). Call only after
+  // prepareFrame() (or while no frame is in flight). Passing VK_NULL_HANDLE restores the internal
+  // transparent pixel. The buffer contains tightly packed A,R,G,B float32 words.
+  void setExternalPixelBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range);
+  // Records compute/transfer work into the same submission immediately before the UI render pass.
+  // The callback must not submit, wait, throw, or retain the command buffer.
+  void setBeforeDrawRecorder(VulkanBeforeDrawRecorder recorder, void* context) noexcept;
 
 private:
   struct Impl;

@@ -76,8 +76,21 @@ struct ArcCommand {
   float opacity = 1.0f;
 };
 
+// A linear RGBA32F pixel buffer owned by the VulkanRenderer's device. The renderer samples the
+// buffer directly in the vector fragment pass, so compute clients can publish an image without a
+// CPU readback or a second graphics device. Pixel storage is A,R,G,B float words, matching the
+// CompNode/After Effects 32-bpc field contract.
+struct PixelBufferCommand {
+  Rect destination = {};
+  Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  float opacity = 1.0f;
+};
+
 using DisplayCommand = std::variant<DrawCommand, TextCommand, RoundedRectCommand,
-                                    CubicBezierCommand, RetainedTextCommand, ArcCommand>;
+                                    CubicBezierCommand, RetainedTextCommand, ArcCommand,
+                                    PixelBufferCommand>;
 
 class DrawList {
 public:
@@ -122,6 +135,8 @@ public:
                    CornerSmoothing continuousCorners = {}, BorderStyle border = {});
   void cubicBezier(Vec2 from, Vec2 control1, Vec2 control2, Vec2 to, StrokeStyle style);
   void arc(Vec2 center, float radius, float startRadians, float sweepRadians, StrokeStyle style);
+  // Draws the buffer most recently supplied to VulkanRenderer::setExternalPixelBuffer().
+  void pixelBuffer(Rect destination, std::uint32_t width, std::uint32_t height);
   void text(std::string utf8, Rect bounds, TextStyle style);
   // The referenced bytes must remain alive until VulkanRenderer::draw() returns.
   void textStatic(std::string_view utf8, Rect bounds, TextStyle style);

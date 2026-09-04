@@ -76,6 +76,14 @@ void DrawList::arc(Vec2 center, float radius, float startRadians, float sweepRad
   else commands_.emplace_back(std::move(command));
 }
 
+void DrawList::pixelBuffer(Rect destination, std::uint32_t width, std::uint32_t height) {
+  if (destination.width <= 0.0f || destination.height <= 0.0f || width == 0 || height == 0)
+    return;
+  PixelBufferCommand command{destination, clip_, width, height, opacity_};
+  if (overlayMode_) overlayCommands_.emplace_back(std::move(command));
+  else commands_.emplace_back(std::move(command));
+}
+
 void DrawList::textStatic(std::string_view utf8, Rect bounds, TextStyle style) {
   if (utf8.empty() || style.size <= 0.0f) return;
   TextCommand command{{}, utf8, {}, bounds, clip_, std::move(style)};

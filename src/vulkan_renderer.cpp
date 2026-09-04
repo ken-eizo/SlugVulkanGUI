@@ -34,6 +34,7 @@ constexpr std::size_t framesInFlight = 1;
 constexpr const char* portabilitySubsetExtension = "VK_KHR_portability_subset";
 constexpr std::uint32_t analyticRoundedRectShape = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t analyticStrokeSegmentShape = std::numeric_limits<std::uint32_t>::max() - 1U;
+constexpr std::uint32_t externalPixelBufferShape = std::numeric_limits<std::uint32_t>::max() - 3U;
 
 class GlfwPlatformSurface final : public PlatformSurface {
 public:
@@ -408,6 +409,9 @@ struct VulkanRenderer::Impl {
   VkSampler sampler = VK_NULL_HANDLE;
   Texture curveTexture{};
   Texture bandTexture{};
+  Buffer externalPixelFallback{};
+  VulkanBeforeDrawRecorder beforeDrawRecorder = nullptr;
+  void* beforeDrawContext = nullptr;
 
   VkCommandPool commandPool = VK_NULL_HANDLE;
   std::array<VkCommandBuffer, framesInFlight> commandBuffers{};
@@ -456,6 +460,10 @@ struct VulkanRenderer::Impl {
       createDevice();
       createCommandPool();
       createTextures();
+      createBuffer(4 * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   externalPixelFallback, true);
+      std::memset(externalPixelFallback.mapped, 0, 4 * sizeof(float));
       createDescriptorResources();
       createSwapchainResources();
       createFrames();
@@ -756,23 +764,30 @@ struct VulkanRenderer::Impl {
   }
 
   void createDescriptorResources() {
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
-    for (std::uint32_t i = 0; i < bindings.size(); ++i) {
+    std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+    for (std::uint32_t i = 0; i < 2; ++i) {
       bindings[i].binding = i;
       bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
       bindings[i].descriptorCount = 1;
       bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
+    bindings[2].binding = 2;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layout.bindingCount = static_cast<std::uint32_t>(bindings.size());
     layout.pBindings = bindings.data();
     check(vkCreateDescriptorSetLayout(device, &layout, nullptr, &descriptorSetLayout),
           "vkCreateDescriptorSetLayout");
-    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
+    std::array<VkDescriptorPoolSize, 2> sizes{{
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+    }};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool.maxSets = 1;
-    pool.poolSizeCount = 1;
-    pool.pPoolSizes = &size;
+    pool.poolSizeCount = static_cast<std::uint32_t>(sizes.size());
+    pool.pPoolSizes = sizes.data();
     check(vkCreateDescriptorPool(device, &pool, nullptr, &descriptorPool),
           "vkCreateDescriptorPool");
     VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -783,8 +798,9 @@ struct VulkanRenderer::Impl {
     VkDescriptorImageInfo curve{sampler, curveTexture.view,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkDescriptorImageInfo band{sampler, bandTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    std::array<VkWriteDescriptorSet, 2> writes{};
-    for (std::uint32_t i = 0; i < writes.size(); ++i) {
+    VkDescriptorBufferInfo pixels{externalPixelFallback.buffer, 0, externalPixelFallback.size};
+    std::array<VkWriteDescriptorSet, 3> writes{};
+    for (std::uint32_t i = 0; i < 2; ++i) {
       writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
       writes[i].dstSet = descriptorSet;
       writes[i].dstBinding = i;
@@ -793,6 +809,12 @@ struct VulkanRenderer::Impl {
     }
     writes[0].pImageInfo = &curve;
     writes[1].pImageInfo = &band;
+    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[2].dstSet = descriptorSet;
+    writes[2].dstBinding = 2;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[2].pBufferInfo = &pixels;
     vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0,
                            nullptr);
   }
@@ -1490,6 +1512,25 @@ struct VulkanRenderer::Impl {
     quad.strokeWidths[0] = command.sweepRadians;
   }
 
+  void appendPixelBuffer(std::vector<Instance>& instances,
+                         const PixelBufferCommand& command) const {
+    Instance quad{};
+    const float bounds[4]{command.destination.x, command.destination.y,
+                          command.destination.x + command.destination.width,
+                          command.destination.y + command.destination.height};
+    std::copy(std::begin(bounds), std::end(bounds), quad.positionRect);
+    std::copy(std::begin(bounds), std::end(bounds), quad.emRect);
+    quad.shapeData[0] = externalPixelBufferShape;
+    quad.shapeData[1] = command.width;
+    quad.shapeData[2] = command.height;
+    quad.paint[1] = 1.0f;
+    quad.clip[0] = command.clip.x;
+    quad.clip[1] = command.clip.y;
+    quad.clip[2] = command.clip.width;
+    quad.clip[3] = command.clip.height;
+    instances.push_back(quad);
+  }
+
   float textWidth(const std::vector<std::uint32_t>& codepoints, const TextStyle& style) const {
     float width = 0.0f;
     for (auto codepoint : codepoints) {
@@ -1837,6 +1878,8 @@ struct VulkanRenderer::Impl {
           appendCubicBezier(instances, *cubicCommand);
         else if (const auto* arcCommand = std::get_if<ArcCommand>(&display))
           appendArc(instances, *arcCommand);
+        else if (const auto* pixels = std::get_if<PixelBufferCommand>(&display))
+          appendPixelBuffer(instances, *pixels);
         const float opacity = std::visit([](const auto& command) { return command.opacity; }, display);
         if (opacity < 1.0f)
           for (std::size_t i = first; i < instances.size(); ++i) instances[i].paint[1] *= opacity;
@@ -1874,6 +1917,8 @@ struct VulkanRenderer::Impl {
       vkCmdResetQueryPool(command, frame.timestamps, 0, 2);
       vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame.timestamps, 0);
     }
+    if (beforeDrawRecorder != nullptr)
+      beforeDrawRecorder(beforeDrawContext, {command, extent.width, extent.height});
     Color clearColor = config.clearColor;
     if (isSrgbFormat(swapchainFormat)) {
       clearColor.r = srgbToLinear(clearColor.r);
@@ -2086,6 +2131,7 @@ struct VulkanRenderer::Impl {
       vkDeviceWaitIdle(device);
     if (device) {
       destroyBuffer(readback);
+      destroyBuffer(externalPixelFallback);
       for (auto& retained : retainedTexts)
         destroyBuffer(retained.instances);
       retainedTexts.clear();
@@ -2175,6 +2221,31 @@ const char* VulkanRenderer::presentModeName() const {
   default:
     return "FIFO";
   }
+}
+VulkanDeviceContext VulkanRenderer::deviceContext() const noexcept {
+  return {impl_->physicalDevice, impl_->device, impl_->graphicsQueue,
+          impl_->queueFamilies.graphics.value_or(0)};
+}
+void VulkanRenderer::setExternalPixelBuffer(VkBuffer buffer, VkDeviceSize offset,
+                                            VkDeviceSize range) {
+  if (buffer == VK_NULL_HANDLE || range == 0) {
+    buffer = impl_->externalPixelFallback.buffer;
+    offset = 0;
+    range = impl_->externalPixelFallback.size;
+  }
+  VkDescriptorBufferInfo pixels{buffer, offset, range};
+  VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = impl_->descriptorSet;
+  write.dstBinding = 2;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  write.pBufferInfo = &pixels;
+  vkUpdateDescriptorSets(impl_->device, 1, &write, 0, nullptr);
+}
+void VulkanRenderer::setBeforeDrawRecorder(VulkanBeforeDrawRecorder recorder,
+                                           void* context) noexcept {
+  impl_->beforeDrawRecorder = recorder;
+  impl_->beforeDrawContext = recorder != nullptr ? context : nullptr;
 }
 
 } // namespace slugvk

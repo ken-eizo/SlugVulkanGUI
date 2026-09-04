@@ -6,6 +6,9 @@
 
 layout(set = 0, binding = 0) uniform sampler2D curveTexture;
 layout(set = 0, binding = 1) uniform usampler2D bandTexture;
+layout(set = 0, binding = 2, std430) readonly buffer ExternalPixels {
+  uint externalPixelWords[];
+};
 
 layout(push_constant) uniform PushConstants {
   vec4 viewportScale;
@@ -30,6 +33,7 @@ const int indirectionSize = 32;
 const uint analyticRoundedRectShape = 0xFFFFFFFFu;
 const uint analyticStrokeSegmentShape = 0xFFFFFFFEu;
 const uint analyticArcShape = 0xFFFFFFFDu;
+const uint externalPixelBufferShape = 0xFFFFFFFCu;
 
 vec2 unpackFixed16(uint packed, float scale) {
   return vec2(float(packed & 0xFFFFu), float(packed >> 16u)) / scale;
@@ -313,9 +317,33 @@ vec3 srgbToLinear(vec3 value) {
   return mix(linearHigh, linearLow, low);
 }
 
+vec3 linearToSrgb(vec3 value) {
+  value = max(value, vec3(0.0));
+  bvec3 low = lessThanEqual(value, vec3(0.0031308));
+  vec3 encodedLow = value * 12.92;
+  vec3 encodedHigh = 1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055;
+  return mix(encodedHigh, encodedLow, low);
+}
+
 void main() {
   if (gl_FragCoord.x < clipRect.x || gl_FragCoord.y < clipRect.y ||
       gl_FragCoord.x >= clipRect.x + clipRect.z || gl_FragCoord.y >= clipRect.y + clipRect.w) discard;
+  if (shapeData.x == externalPixelBufferShape) {
+    uvec2 size = max(uvec2(shapeData.yz), uvec2(1u));
+    uvec2 coordinate = min(uvec2(uv * vec2(size)), size - 1u);
+    uint offset = (coordinate.y * size.x + coordinate.x) * 4u;
+    vec4 color = vec4(uintBitsToFloat(externalPixelWords[offset + 1u]),
+                      uintBitsToFloat(externalPixelWords[offset + 2u]),
+                      uintBitsToFloat(externalPixelWords[offset + 3u]),
+                      uintBitsToFloat(externalPixelWords[offset]));
+    // Compute clients publish linear pixels. An sRGB swapchain performs the transfer itself;
+    // an UNORM fallback does not, so encode only for that fallback.
+    if (pushConstants.translationOverride.w <= 0.5)
+      color.rgb = linearToSrgb(color.rgb);
+    color.a *= paintData.y;
+    outColor = color;
+    return;
+  }
   float coverage;
   if (shapeData.x == analyticRoundedRectShape)
     coverage = roundedRectCoverage(emCoord, bandTransform);
