@@ -17,12 +17,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace slugvk {
@@ -338,6 +340,97 @@ struct Instance {
   float strokeWidths[4];
 };
 
+bool sameFloatBits(float left, float right) noexcept {
+  return std::bit_cast<std::uint32_t>(left) == std::bit_cast<std::uint32_t>(right);
+}
+
+bool sameRectBits(const Rect& left, const Rect& right) noexcept {
+  return sameFloatBits(left.x, right.x) && sameFloatBits(left.y, right.y) &&
+         sameFloatBits(left.width, right.width) && sameFloatBits(left.height, right.height);
+}
+
+bool sameColorBits(const Color& left, const Color& right) noexcept {
+  return sameFloatBits(left.r, right.r) && sameFloatBits(left.g, right.g) &&
+         sameFloatBits(left.b, right.b) && sameFloatBits(left.a, right.a);
+}
+
+bool samePaintBits(const Paint& left, const Paint& right) noexcept {
+  return left.kind == right.kind && sameColorBits(left.start, right.start) &&
+         sameColorBits(left.end, right.end) && sameFloatBits(left.origin.x, right.origin.x) &&
+         sameFloatBits(left.origin.y, right.origin.y) && sameFloatBits(left.target.x, right.target.x) &&
+         sameFloatBits(left.target.y, right.target.y) && sameFloatBits(left.opacity, right.opacity) &&
+         sameFloatBits(left.shaderParameter, right.shaderParameter);
+}
+
+bool sameTextStyleBits(const TextStyle& left, const TextStyle& right) noexcept {
+  return left.fontName == right.fontName && sameFloatBits(left.size, right.size) &&
+         left.weight == right.weight && left.bold == right.bold && left.italic == right.italic &&
+         left.underline == right.underline && left.strikethrough == right.strikethrough &&
+         left.align == right.align && left.verticalAlign == right.verticalAlign &&
+         sameFloatBits(left.lineHeight, right.lineHeight) &&
+         sameFloatBits(left.letterSpacing, right.letterSpacing) &&
+         sameFloatBits(left.indent, right.indent) && left.listMarker == right.listMarker &&
+         samePaintBits(left.paint, right.paint);
+}
+
+void hashCombine(std::size_t& seed, std::size_t value) noexcept {
+  seed ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ULL) + (seed << 6U) + (seed >> 2U);
+}
+
+void hashFloat(std::size_t& seed, float value) noexcept {
+  hashCombine(seed, std::bit_cast<std::uint32_t>(value));
+}
+
+void hashColor(std::size_t& seed, const Color& value) noexcept {
+  hashFloat(seed, value.r); hashFloat(seed, value.g); hashFloat(seed, value.b); hashFloat(seed, value.a);
+}
+
+void hashRect(std::size_t& seed, const Rect& value) noexcept {
+  hashFloat(seed, value.x); hashFloat(seed, value.y);
+  hashFloat(seed, value.width); hashFloat(seed, value.height);
+}
+
+struct PlainTextMeshKey {
+  std::string text;
+  Rect bounds{};
+  Rect clip{};
+  TextStyle style{};
+  float runScale = 1.0f;
+
+  bool operator==(const PlainTextMeshKey& other) const noexcept {
+    return text == other.text && sameRectBits(bounds, other.bounds) &&
+           sameRectBits(clip, other.clip) && sameTextStyleBits(style, other.style) &&
+           sameFloatBits(runScale, other.runScale);
+  }
+};
+
+struct PlainTextMeshKeyHash {
+  std::size_t operator()(const PlainTextMeshKey& value) const noexcept {
+    std::size_t seed = std::hash<std::string_view>{}(value.text);
+    hashRect(seed, value.bounds);
+    hashRect(seed, value.clip);
+    hashCombine(seed, std::hash<std::string_view>{}(value.style.fontName));
+    hashFloat(seed, value.style.size);
+    hashCombine(seed, value.style.weight);
+    hashCombine(seed, value.style.bold); hashCombine(seed, value.style.italic);
+    hashCombine(seed, value.style.underline); hashCombine(seed, value.style.strikethrough);
+    hashCombine(seed, static_cast<std::size_t>(value.style.align));
+    hashCombine(seed, static_cast<std::size_t>(value.style.verticalAlign));
+    hashFloat(seed, value.style.lineHeight); hashFloat(seed, value.style.letterSpacing);
+    hashFloat(seed, value.style.indent);
+    hashCombine(seed, static_cast<std::size_t>(value.style.listMarker));
+    hashCombine(seed, static_cast<std::size_t>(value.style.paint.kind));
+    hashColor(seed, value.style.paint.start); hashColor(seed, value.style.paint.end);
+    hashFloat(seed, value.style.paint.origin.x); hashFloat(seed, value.style.paint.origin.y);
+    hashFloat(seed, value.style.paint.target.x); hashFloat(seed, value.style.paint.target.y);
+    hashFloat(seed, value.style.paint.opacity); hashFloat(seed, value.style.paint.shaderParameter);
+    hashFloat(seed, value.runScale);
+    return seed;
+  }
+};
+
+using BorderEdgeIndex = std::vector<std::pair<double, std::size_t>>;
+
 struct Buffer {
   VkBuffer buffer = VK_NULL_HANDLE;
   VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -375,6 +468,16 @@ struct VulkanRenderer::Impl {
   std::unique_ptr<PlatformSurface> ownedPlatformSurface;
   PlatformSurface& platformSurface;
   const VectorAtlas& vectorAtlas;
+  // The renderer uploads a built, immutable atlas once. Rendering needs only
+  // metrics/band addresses, never the retained authoring curves. getShape()
+  // returns those curves by value, so do not call it for every drawn glyph.
+  mutable std::unordered_map<ShapeId, std::optional<slughorn::Atlas::Shape>> shapeMetricsCache;
+  // Plain UI labels are overwhelmingly stable from frame to frame. Cache their
+  // exact, pre-opacity instances; the frame builder still applies command
+  // opacity after copying, so animations do not poison the retained value.
+  mutable std::unordered_map<PlainTextMeshKey, std::vector<Instance>, PlainTextMeshKeyHash>
+      plainTextMeshCache;
+  mutable std::size_t plainTextMeshCacheBytes = 0;
   RendererConfig config;
   RendererStats statistics{};
   Buffer readback{};
@@ -1165,6 +1268,23 @@ struct VulkanRenderer::Impl {
     }
   }
 
+  const slughorn::Atlas::Shape* shapeMetrics(ShapeId id) const {
+    // The returned pointer remains valid until the next cache insertion (which
+    // may rehash) or the bounded-cache clear below. Callers consume it inline.
+    auto found = shapeMetricsCache.find(id);
+    if (found == shapeMetricsCache.end()) {
+      // Bound retention, including missing-glyph entries, for arbitrary input.
+      if (shapeMetricsCache.size() >= 4096) shapeMetricsCache.clear();
+      auto shape = vectorAtlas.native().getShape(slughorn::Key(id));
+      if (shape) {
+        decltype(shape->curves){}.swap(shape->curves);
+        decltype(shape->contourStarts){}.swap(shape->contourStarts);
+      }
+      found = shapeMetricsCache.emplace(id, std::move(shape)).first;
+    }
+    return found->second ? &*found->second : nullptr;
+  }
+
   void appendResolvedShape(std::vector<Instance>& instances, const slughorn::Atlas::Shape& shape,
                            Rect destination, const Paint& paintValue, Rect clip,
                            float italicShear = 0.0f) const {
@@ -1222,7 +1342,7 @@ struct VulkanRenderer::Impl {
 
   void appendShape(std::vector<Instance>& instances, ShapeId id, Rect destination,
                    const Paint& paintValue, Rect clip, float italicShear = 0.0f) const {
-    const auto shape = vectorAtlas.native().getShape(slughorn::Key(id));
+    const auto* shape = shapeMetrics(id);
     if (shape)
       appendResolvedShape(instances, *shape, destination, paintValue, clip, italicShear);
   }
@@ -1349,9 +1469,24 @@ struct VulkanRenderer::Impl {
 
   void appendOpaqueRoundedRectStack(std::vector<Instance>& instances,
                                     const std::vector<DisplayCommand>& commands,
-                                    std::size_t begin, std::size_t end) const {
+                                    std::size_t begin, std::size_t end,
+                                    const BorderEdgeIndex& leftEdges,
+                                    const BorderEdgeIndex& rightEdges) const {
     const auto& base = std::get<RoundedRectCommand>(commands[begin]);
     const float outsideFactor = strokeOutsideFactor(base.border.align);
+    std::vector<BorderWidths> laterWidths(end - begin);
+    BorderWidths suffix{};
+    for (std::size_t index = end; index-- > begin;) {
+      laterWidths[index - begin] = suffix;
+      const auto& command = std::get<RoundedRectCommand>(commands[index]);
+      if (paintFullyOpaque(command.border.paint)) {
+        const BorderWidths widths = resolvedBorderWidths(command.border);
+        suffix.top = std::max(suffix.top, widths.top);
+        suffix.right = std::max(suffix.right, widths.right);
+        suffix.bottom = std::max(suffix.bottom, widths.bottom);
+        suffix.left = std::max(suffix.left, widths.left);
+      }
+    }
     BorderWidths combined{};
     for (std::size_t index = begin; index < end; ++index) {
       const auto& command = std::get<RoundedRectCommand>(commands[index]);
@@ -1363,9 +1498,20 @@ struct VulkanRenderer::Impl {
       combined.left = std::max(combined.left, widths.left);
 
       bool coveredByEarlierEdge = false;
-      for (std::size_t earlierIndex = 0; earlierIndex < index; ++earlierIndex) {
-        const auto* earlier = std::get_if<RoundedRectCommand>(&commands[earlierIndex]);
-        if (earlier && opaqueInsideBorderCovers(*earlier, command)) {
+      // Coverage necessarily shares X (top/bottom/left) or right X (right-only).
+      // Index that necessary condition, then retain the exact old predicate and
+      // painter-order rule. This avoids a full display-list scan for every edge.
+      const bool needsLeft = widths.left > 0 || widths.top > 0 || widths.bottom > 0;
+      const auto& edges = needsLeft ? leftEdges : rightEdges;
+      const double coordinate = needsLeft ? command.destination.x :
+          command.destination.x + command.destination.width;
+      for (auto candidate = std::lower_bound(
+             edges.begin(), edges.end(), coordinate - .0002,
+             [](const auto& edge, double value) { return edge.first < value; });
+           candidate != edges.end() && candidate->first <= coordinate + .0002; ++candidate) {
+        if (candidate->second >= index) continue;
+        const auto& earlier = std::get<RoundedRectCommand>(commands[candidate->second]);
+        if (opaqueInsideBorderCovers(earlier, command)) {
           coveredByEarlierEdge = true;
           break;
         }
@@ -1374,16 +1520,7 @@ struct VulkanRenderer::Impl {
 
       RoundedRectCommand visible = command;
       if (command.border.align == StrokeAlign::Inside) {
-        BorderWidths later{};
-        for (std::size_t laterIndex = index + 1; laterIndex < end; ++laterIndex) {
-          const auto& overlay = std::get<RoundedRectCommand>(commands[laterIndex]);
-          if (!paintFullyOpaque(overlay.border.paint)) continue;
-          const BorderWidths overlayWidths = resolvedBorderWidths(overlay.border);
-          later.top = std::max(later.top, overlayWidths.top);
-          later.right = std::max(later.right, overlayWidths.right);
-          later.bottom = std::max(later.bottom, overlayWidths.bottom);
-          later.left = std::max(later.left, overlayWidths.left);
-        }
+        const BorderWidths& later = laterWidths[index - begin];
         const Rect owner{
           command.destination.x + later.left,
           command.destination.y + later.top,
@@ -1534,8 +1671,8 @@ struct VulkanRenderer::Impl {
   float textWidth(const std::vector<std::uint32_t>& codepoints, const TextStyle& style) const {
     float width = 0.0f;
     for (auto codepoint : codepoints) {
-      const auto glyph = vectorAtlas.native().getShape(slughorn::Key(
-        vectorAtlas.glyph(codepoint, style.fontName, style.weight, style.italic)));
+      const auto* glyph = shapeMetrics(
+        vectorAtlas.glyph(codepoint, style.fontName, style.weight, style.italic));
       width += (glyph ? static_cast<float>(glyph->advance) : 0.6f) * style.size + style.letterSpacing;
     }
     return std::max(0.0f, width - style.letterSpacing);
@@ -1639,7 +1776,7 @@ struct VulkanRenderer::Impl {
           for (const auto codepoint : decodeUtf8(fragment.text)) {
             const ShapeId glyphId = vectorAtlas.glyph(
               codepoint, authored.fontName, authored.weight, authored.italic);
-            const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
+            const auto* glyph = shapeMetrics(glyphId);
             if (!glyph) {
               x += size * 0.6f + spacing;
               continue;
@@ -1686,7 +1823,7 @@ struct VulkanRenderer::Impl {
     }
   }
 
-  void appendText(std::vector<Instance>& instances, const TextCommand& command) const {
+  void appendTextUncached(std::vector<Instance>& instances, const TextCommand& command) const {
     if (!command.runs.empty()) {
       appendRichText(instances, command);
       return;
@@ -1742,7 +1879,7 @@ struct VulkanRenderer::Impl {
       for (auto codepoint : codepoints) {
         const ShapeId glyphId = vectorAtlas.glyph(
           codepoint, command.style.fontName, command.style.weight, command.style.italic);
-        const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
+        const auto* glyph = shapeMetrics(glyphId);
         if (!glyph) {
           x += command.style.size * 0.6f + command.style.letterSpacing;
           continue;
@@ -1780,6 +1917,36 @@ struct VulkanRenderer::Impl {
       lineStart = lineEnd + 1;
       ++lineNumber;
     }
+  }
+
+  void appendText(std::vector<Instance>& instances, const TextCommand& command) const {
+    if (!command.runs.empty()) {
+      appendTextUncached(instances, command);
+      return;
+    }
+    PlainTextMeshKey key{std::string(command.text()), command.bounds, command.clip,
+                         command.style, command.runScale};
+    if (const auto found = plainTextMeshCache.find(key); found != plainTextMeshCache.end()) {
+      instances.insert(instances.end(), found->second.begin(), found->second.end());
+      return;
+    }
+
+    const std::size_t first = instances.size();
+    appendTextUncached(instances, command);
+    const std::size_t byteCount = (instances.size() - first) * sizeof(Instance);
+    constexpr std::size_t maximumEntries = 16384;
+    constexpr std::size_t maximumBytes = 64U * 1024U * 1024U;
+    if (byteCount > maximumBytes) return;
+    if (plainTextMeshCache.size() >= maximumEntries ||
+        plainTextMeshCacheBytes + byteCount > maximumBytes) {
+      plainTextMeshCache.clear();
+      plainTextMeshCacheBytes = 0;
+    }
+    std::vector<Instance> cached(instances.begin() + static_cast<std::ptrdiff_t>(first),
+                                 instances.end());
+    const auto [unused, inserted] = plainTextMeshCache.emplace(std::move(key), std::move(cached));
+    if (inserted) plainTextMeshCacheBytes += byteCount;
+    (void)unused;
   }
 
   RetainedTextId createRetainedText(std::string_view utf8, Rect layoutBounds, TextStyle style) {
@@ -1829,6 +1996,23 @@ struct VulkanRenderer::Impl {
     drawBatches.clear();
     drawBatches.reserve(commandCount);
     const auto appendCommands = [&](const auto& commands) {
+      BorderEdgeIndex leftEdges, rightEdges;
+      leftEdges.reserve(commands.size());
+      rightEdges.reserve(commands.size());
+      for (std::size_t i = 0; i < commands.size(); ++i) {
+        const auto* rect = std::get_if<RoundedRectCommand>(&commands[i]);
+        if (!rect || rect->border.align != StrokeAlign::Inside ||
+            !paintFullyOpaque(rect->border.paint)) continue;
+        const float right = rect->destination.x + rect->destination.width;
+        if (std::isfinite(rect->destination.x)) leftEdges.emplace_back(rect->destination.x, i);
+        if (std::isfinite(right)) rightEdges.emplace_back(right, i);
+      }
+      const auto byCoordinate = [](const auto& left, const auto& right) {
+        return left.first < right.first ||
+               (left.first == right.first && left.second < right.second);
+      };
+      std::sort(leftEdges.begin(), leftEdges.end(), byCoordinate);
+      std::sort(rightEdges.begin(), rightEdges.end(), byCoordinate);
       for (std::size_t commandIndex = 0; commandIndex < commands.size(); ++commandIndex) {
         const auto& display = commands[commandIndex];
         if (const auto* retainedCommand = std::get_if<RetainedTextCommand>(&display)) {
@@ -1868,7 +2052,7 @@ struct VulkanRenderer::Impl {
             }
           }
           if (stackEnd > commandIndex + 1) {
-            appendOpaqueRoundedRectStack(instances, commands, commandIndex, stackEnd);
+            appendOpaqueRoundedRectStack(instances, commands, commandIndex, stackEnd, leftEdges, rightEdges);
             commandIndex = stackEnd - 1;
           } else {
             appendRoundedRect(instances, *roundedCommand);
