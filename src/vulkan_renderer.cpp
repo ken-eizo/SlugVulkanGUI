@@ -660,7 +660,21 @@ struct VulkanRenderer::Impl {
     vkFreeCommandBuffers(device, commandPool, 1, &command);
   }
 
-  void createTexture(const slughorn::Atlas::TextureData& source, VkFormat format, Texture& output) {
+  VkFormat atlasTextureFormat(slughorn::Atlas::TextureData::Format format) const {
+    using Format = slughorn::Atlas::TextureData::Format;
+    switch (format) {
+      case Format::RGBA32F: return VK_FORMAT_R32G32B32A32_SFLOAT;
+      case Format::RGBA16F: return VK_FORMAT_R16G16B16A16_SFLOAT;
+      case Format::RGBA16UI: return VK_FORMAT_R16G16B16A16_UINT;
+      case Format::RG16UI: return VK_FORMAT_R16G16_UINT;
+      case Format::RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
+      case Format::RGB32F: break;
+    }
+    throw std::runtime_error("Unsupported Slug atlas texture format");
+  }
+
+  void createTexture(const slughorn::Atlas::TextureData& source, Texture& output) {
+    const VkFormat format = atlasTextureFormat(source.format);
     if (source.empty() || source.width == 0 || source.height == 0)
       throw std::runtime_error("Slug atlas returned an empty texture");
     Buffer staging{};
@@ -741,8 +755,8 @@ struct VulkanRenderer::Impl {
 
   void createTextures() {
     const auto& atlas = vectorAtlas.native();
-    createTexture(atlas.getCurveTextureData(), VK_FORMAT_R32G32B32A32_SFLOAT, curveTexture);
-    createTexture(atlas.getBandTextureData(), VK_FORMAT_R16G16B16A16_UINT, bandTexture);
+    createTexture(atlas.getCurveTextureData(), curveTexture);
+    createTexture(atlas.getBandTextureData(), bandTexture);
     VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     info.magFilter = VK_FILTER_NEAREST;
     info.minFilter = VK_FILTER_NEAREST;

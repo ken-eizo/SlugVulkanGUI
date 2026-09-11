@@ -196,8 +196,14 @@ int main() try {
   require(atlas.built(), "atlas build");
   const auto metric = atlas.metrics(rounded);
   require(metric && metric->width > 0 && metric->height > 0, "shape metrics");
-  require(!atlas.native().getCurveTextureData().empty(), "curve texture");
-  require(!atlas.native().getBandTextureData().empty(), "band texture");
+  const auto& curveTexture = atlas.native().getCurveTextureData();
+  const auto& bandTexture = atlas.native().getBandTextureData();
+  require(!curveTexture.empty(), "curve texture");
+  require(!bandTexture.empty(), "band texture");
+  require(bandTexture.format == slughorn::Atlas::TextureData::Format::RG16UI &&
+              bandTexture.bytes.size() ==
+                static_cast<std::size_t>(bandTexture.width) * bandTexture.height * 4U,
+          "band texture uses compact RG16UI storage");
 
   const std::string fontPath = findDefaultSystemFont();
   if (!fontPath.empty()) {
