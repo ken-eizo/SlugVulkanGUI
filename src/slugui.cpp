@@ -3,6 +3,7 @@
 #include "slugvk/vector_atlas.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <stdexcept>
 #include <type_traits>
@@ -61,7 +62,20 @@ bool same(const PropertyValue& a, const PropertyValue& b) {
 }
 
 PropertyType propertyType(const PropertyValue& value) {
-  return static_cast<PropertyType>(value.index());
+  return std::visit([](const auto& entry) -> PropertyType {
+    using T = std::decay_t<decltype(entry)>;
+    if constexpr (std::is_same_v<T, bool>) return PropertyType::Boolean;
+    else if constexpr (std::is_same_v<T, std::int64_t>) return PropertyType::Integer;
+    else if constexpr (std::is_same_v<T, float>) return PropertyType::Scalar;
+    else if constexpr (std::is_same_v<T, std::string>) return PropertyType::String;
+    else if constexpr (std::is_same_v<T, Color>) return PropertyType::Color;
+    else if constexpr (std::is_same_v<T, Paint>) return PropertyType::Paint;
+    else if constexpr (std::is_same_v<T, Length>) return PropertyType::Length;
+    else if constexpr (std::is_same_v<T, CornerRadii>) return PropertyType::CornerRadii;
+    else if constexpr (std::is_same_v<T, CornerSmoothing>) return PropertyType::CornerSmoothing;
+    else if constexpr (std::is_same_v<T, BorderWidths>) return PropertyType::BorderWidths;
+    else static_assert(!sizeof(T), "Unhandled SlugUI property type");
+  }, value);
 }
 
 } // namespace
@@ -278,10 +292,26 @@ struct Runtime::Impl {
     Measured measured;
     float grow = 0.0f;
   };
+  struct MeasureKey {
+    const Element* element = nullptr;
+    std::uint32_t parentWidth = 0;
+    std::uint32_t parentHeight = 0;
+    bool operator==(const MeasureKey&) const = default;
+  };
+  struct MeasureKeyHash {
+    std::size_t operator()(const MeasureKey& key) const noexcept {
+      std::size_t hash = std::hash<const Element*>{}(key.element);
+      hash ^= static_cast<std::size_t>(key.parentWidth) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+      hash ^= static_cast<std::size_t>(key.parentHeight) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+      return hash;
+    }
+  };
 
   std::vector<Resolved> resolved;
   std::vector<LayoutBox> publicBoxes;
   std::vector<std::vector<FlowChild>> flowScratch;
+  std::unordered_map<MeasureKey, Measured, MeasureKeyHash> measureCache;
+  std::unordered_map<ElementId, std::size_t> resolvedIndex;
   ElementId hovered = 0;
   ElementId active = 0;
   ElementId focused = 0;
@@ -361,8 +391,16 @@ struct Runtime::Impl {
   }
 
   [[nodiscard]] Measured measure(const Element& element, const PropertyStore& properties,
-                                 float parentWidth, float parentHeight) const {
-    if (!element.visible.resolve(properties)) return {};
+                                 float parentWidth, float parentHeight) {
+    const MeasureKey key{&element, std::bit_cast<std::uint32_t>(parentWidth),
+                         std::bit_cast<std::uint32_t>(parentHeight)};
+    if (const auto cached = measureCache.find(key); cached != measureCache.end()) {
+      return cached->second;
+    }
+    if (!element.visible.resolve(properties)) {
+      measureCache.emplace(key, Measured{});
+      return {};
+    }
     const float left = inset(element.layout.padding.left, properties, parentWidth);
     const float right = inset(element.layout.padding.right, properties, parentWidth);
     const float top = inset(element.layout.padding.top, properties, parentHeight);
@@ -406,7 +444,9 @@ struct Runtime::Impl {
     }
     result.width = std::max(result.width, childrenWidth + left + right);
     result.height = std::max(result.height, childrenHeight + top + bottom);
-    return constrain(element, result, properties, parentWidth, parentHeight);
+    const auto constrained = constrain(element, result, properties, parentWidth, parentHeight);
+    measureCache.emplace(key, constrained);
+    return constrained;
   }
 
   void append(const Element& element, Rect bounds, Rect inheritedClip,
@@ -418,11 +458,13 @@ struct Runtime::Impl {
 
     const bool enabled = ancestorEnabled && element.interaction.enabled.resolve(properties);
     const bool overlay = ancestorOverlay || element.overlay;
+    const std::size_t resolvedPosition = resolved.size();
     resolved.push_back({
       {element.id, bounds, inheritedClip, overlay, element.interaction.interactive},
       &element,
       enabled
     });
+    if (element.id != 0) resolvedIndex.try_emplace(element.id, resolvedPosition);
 
     const float left = inset(element.layout.padding.left, properties, bounds.width);
     const float right = inset(element.layout.padding.right, properties, bounds.width);
@@ -538,6 +580,8 @@ struct Runtime::Impl {
   void performLayout(Component& component, Rect viewport, float deviceScale) {
     resolved.clear();
     publicBoxes.clear();
+    measureCache.clear();
+    resolvedIndex.clear();
     scale = std::max(0.01f, deviceScale);
     flowScratch.resize(treeDepth(component.root()));
     auto rootSize = measure(component.root(), component.properties(),
@@ -557,9 +601,9 @@ struct Runtime::Impl {
 
   [[nodiscard]] const Resolved* resolvedById(ElementId id) const {
     if (id == 0) return nullptr;
-    const auto it = std::find_if(resolved.begin(), resolved.end(),
-      [id](const Resolved& entry) { return entry.box.id == id; });
-    return it == resolved.end() ? nullptr : &*it;
+    const auto found = resolvedIndex.find(id);
+    if (found == resolvedIndex.end() || found->second >= resolved.size()) return nullptr;
+    return &resolved[found->second];
   }
 
   [[nodiscard]] ElementId hit(Vec2 cursor) const {
@@ -725,9 +769,10 @@ RuntimeStats Runtime::render(Component& component, const FrameInput& input,
 std::span<const LayoutBox> Runtime::boxes() const { return impl_->publicBoxes; }
 
 const LayoutBox* Runtime::find(ElementId id) const {
-  const auto it = std::find_if(impl_->publicBoxes.begin(), impl_->publicBoxes.end(),
-    [id](const LayoutBox& box) { return box.id == id; });
-  return it == impl_->publicBoxes.end() ? nullptr : &*it;
+  if (id == 0) return nullptr;
+  const auto found = impl_->resolvedIndex.find(id);
+  if (found == impl_->resolvedIndex.end() || found->second >= impl_->publicBoxes.size()) return nullptr;
+  return &impl_->publicBoxes[found->second];
 }
 
 ElementId Runtime::hovered() const { return impl_->hovered; }
