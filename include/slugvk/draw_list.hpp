@@ -65,6 +65,14 @@ struct RetainedTextCommand {
   float opacity = 1.0f;
 };
 
+struct RetainedDrawListCommand {
+  RetainedDrawListId drawList = 0;
+  Vec2 position = {};
+  float scale = 1.0f;
+  Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
+  float opacity = 1.0f;
+};
+
 // Analytic circular stroke: one coverage evaluation, without tessellation seams.
 struct ArcCommand {
   Vec2 center = {};
@@ -77,7 +85,8 @@ struct ArcCommand {
 };
 
 using DisplayCommand = std::variant<DrawCommand, TextCommand, RoundedRectCommand,
-                                    CubicBezierCommand, RetainedTextCommand, ArcCommand>;
+                                    CubicBezierCommand, RetainedTextCommand,
+                                    RetainedDrawListCommand, ArcCommand>;
 
 class DrawList {
 public:
@@ -131,6 +140,8 @@ public:
   // Draws text whose glyph instances were retained by VulkanRenderer. Only this transform and
   // clip are dynamic, so zoom/pan does not relayout or upload the document.
   void retainedText(RetainedTextId text, Vec2 position, float scale);
+  // Draws a renderer-retained DrawList. Use this for static or rarely-changing UI subtrees.
+  void retainedDrawList(RetainedDrawListId drawList, Vec2 position = {}, float scale = 1.0f);
 
   [[nodiscard]] const std::vector<DisplayCommand>& commands() const {
     return commands_;

@@ -58,6 +58,7 @@ inline Color lerp(Color a, Color b, float t) {
 
 using ShapeId = std::uint32_t;
 using RetainedTextId = std::uint32_t;
+using RetainedDrawListId = std::uint32_t;
 using WidgetId = std::uint64_t;
 
 enum class GradientKind : std::uint32_t { Solid, Linear, Diamond, Radial, Shader, HsvConic };

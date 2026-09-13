@@ -345,7 +345,8 @@ struct Buffer {
 };
 
 struct DrawBatch {
-  RetainedTextId retainedText = 0;
+  std::uint32_t retainedId = 0;
+  bool retainedDrawList = false;
   std::uint32_t firstInstance = 0;
   std::uint32_t instanceCount = 0;
   Vec2 translation = {};
@@ -423,11 +424,12 @@ struct VulkanRenderer::Impl {
   std::size_t currentFrame = 0;
   std::vector<Instance> stagingInstances{};
   std::vector<DrawBatch> drawBatches{};
-  struct RetainedText {
+  struct RetainedGeometry {
     Buffer instances{};
     std::uint32_t instanceCount = 0;
   };
-  std::vector<RetainedText> retainedTexts{};
+  std::vector<RetainedGeometry> retainedTexts{};
+  std::vector<RetainedGeometry> retainedDrawLists{};
   std::uint32_t timestampValidBits = 0;
   std::uint64_t submittedFrameCount = 0;
   bool framePrepared = false;
@@ -1808,7 +1810,7 @@ struct VulkanRenderer::Impl {
                  staging, true);
     std::memcpy(staging.mapped, instances.data(), static_cast<std::size_t>(byteCount));
 
-    RetainedText retained;
+    RetainedGeometry retained;
     createBuffer(byteCount, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, retained.instances, false);
     VkCommandBuffer commandBuffer = beginSingleUse();
@@ -1831,6 +1833,42 @@ struct VulkanRenderer::Impl {
     return static_cast<RetainedTextId>(retainedTexts.size());
   }
 
+  RetainedDrawListId createRetainedDrawList(const DrawList& list) {
+    std::vector<Instance> instances;
+    buildMesh(list, instances);
+    for (const DrawBatch& batch : drawBatches) {
+      if (batch.retainedId != 0)
+        throw std::invalid_argument("Retained DrawLists cannot contain retained resources");
+    }
+    if (instances.empty()) return 0;
+    const VkDeviceSize byteCount = instances.size() * sizeof(Instance);
+    Buffer staging{};
+    createBuffer(byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 staging, true);
+    std::memcpy(staging.mapped, instances.data(), static_cast<std::size_t>(byteCount));
+    RetainedGeometry retained;
+    createBuffer(byteCount, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, retained.instances, false);
+    VkCommandBuffer commandBuffer = beginSingleUse();
+    VkBufferCopy copy{0, 0, byteCount};
+    vkCmdCopyBuffer(commandBuffer, staging.buffer, retained.instances.buffer, 1, &copy);
+    VkBufferMemoryBarrier ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ready.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    ready.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ready.buffer = retained.instances.buffer;
+    ready.size = byteCount;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, nullptr, 1, &ready, 0, nullptr);
+    endSingleUse(commandBuffer);
+    destroyBuffer(staging);
+    retained.instanceCount = static_cast<std::uint32_t>(instances.size());
+    retainedDrawLists.push_back(retained);
+    return static_cast<RetainedDrawListId>(retainedDrawLists.size());
+  }
+
   void buildMesh(const DrawList& list, std::vector<Instance>& instances) {
     const std::size_t commandCount = list.commands().size() + list.overlayCommands().size();
     instances.reserve(commandCount);
@@ -1842,10 +1880,20 @@ struct VulkanRenderer::Impl {
         if (const auto* retainedCommand = std::get_if<RetainedTextCommand>(&display)) {
           if (retainedCommand->text == 0 || retainedCommand->text > retainedTexts.size())
             continue;
-          const RetainedText& retained = retainedTexts[retainedCommand->text - 1U];
+          const RetainedGeometry& retained = retainedTexts[retainedCommand->text - 1U];
           if (retained.instanceCount == 0)
             continue;
-          drawBatches.push_back({retainedCommand->text, 0, retained.instanceCount,
+          drawBatches.push_back({retainedCommand->text, false, 0, retained.instanceCount,
+                                 retainedCommand->position, retainedCommand->scale,
+                                 retainedCommand->clip, retainedCommand->opacity});
+          continue;
+        }
+        if (const auto* retainedCommand = std::get_if<RetainedDrawListCommand>(&display)) {
+          if (retainedCommand->drawList == 0 || retainedCommand->drawList > retainedDrawLists.size())
+            continue;
+          const RetainedGeometry& retained = retainedDrawLists[retainedCommand->drawList - 1U];
+          if (retained.instanceCount == 0) continue;
+          drawBatches.push_back({retainedCommand->drawList, true, 0, retained.instanceCount,
                                  retainedCommand->position, retainedCommand->scale,
                                  retainedCommand->clip, retainedCommand->opacity});
           continue;
@@ -1892,11 +1940,11 @@ struct VulkanRenderer::Impl {
         const std::uint32_t count = static_cast<std::uint32_t>(instances.size() - first);
         if (count == 0)
           continue;
-        if (!drawBatches.empty() && drawBatches.back().retainedText == 0 &&
+        if (!drawBatches.empty() && drawBatches.back().retainedId == 0 &&
             drawBatches.back().firstInstance + drawBatches.back().instanceCount == first) {
           drawBatches.back().instanceCount += count;
         } else {
-          drawBatches.push_back({0, static_cast<std::uint32_t>(first), count});
+          drawBatches.push_back({0, false, static_cast<std::uint32_t>(first), count});
         }
       }
     };
@@ -1947,9 +1995,11 @@ struct VulkanRenderer::Impl {
                               &descriptorSet, 0, nullptr);
       const VkDeviceSize offset = 0;
       for (const DrawBatch& batch : drawBatches) {
-        const bool retained = batch.retainedText != 0;
-        const Buffer& buffer =
-            retained ? retainedTexts[batch.retainedText - 1U].instances : frame.instances;
+        const bool retained = batch.retainedId != 0;
+        const Buffer& buffer = retained
+          ? (batch.retainedDrawList ? retainedDrawLists[batch.retainedId - 1U].instances
+                                    : retainedTexts[batch.retainedId - 1U].instances)
+          : frame.instances;
         VkRect2D scissor{{0, 0}, extent};
         if (retained) {
           const float left = std::clamp(batch.clip.x, 0.0f, static_cast<float>(extent.width));
@@ -2111,7 +2161,7 @@ struct VulkanRenderer::Impl {
 
     std::uint32_t retainedQuadCount = 0;
     for (const DrawBatch& batch : drawBatches)
-      if (batch.retainedText != 0)
+      if (batch.retainedId != 0)
         retainedQuadCount += batch.instanceCount;
     statistics.quads = static_cast<std::uint32_t>(stagingInstances.size()) + retainedQuadCount;
     statistics.retainedQuads = retainedQuadCount;
@@ -2138,6 +2188,9 @@ struct VulkanRenderer::Impl {
       for (auto& retained : retainedTexts)
         destroyBuffer(retained.instances);
       retainedTexts.clear();
+      for (auto& retained : retainedDrawLists)
+        destroyBuffer(retained.instances);
+      retainedDrawLists.clear();
       for (auto& frame : frames) {
         destroyBuffer(frame.instances);
         if (frame.timestamps)
@@ -2191,6 +2244,9 @@ void VulkanRenderer::prepareFrame() {
 RetainedTextId VulkanRenderer::createRetainedText(std::string_view utf8, Rect layoutBounds,
                                                   TextStyle style) {
   return impl_->createRetainedText(utf8, layoutBounds, std::move(style));
+}
+RetainedDrawListId VulkanRenderer::createRetainedDrawList(const DrawList& list) {
+  return impl_->createRetainedDrawList(list);
 }
 void VulkanRenderer::draw(const DrawList& list) {
   impl_->draw(list);

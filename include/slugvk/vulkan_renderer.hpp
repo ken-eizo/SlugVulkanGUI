@@ -60,6 +60,9 @@ public:
   // Resolves and uploads an immutable document once. The returned resource remains valid for
   // this renderer's lifetime and can be transformed cheaply with DrawList::retainedText().
   RetainedTextId createRetainedText(std::string_view utf8, Rect layoutBounds, TextStyle style);
+  // Retains an arbitrary static DrawList in device-local memory. Retained commands may be
+  // transformed, clipped and faded every frame without rebuilding their instances.
+  RetainedDrawListId createRetainedDrawList(const DrawList& list);
   void draw(const DrawList& list);
   [[nodiscard]] FramePixels drawAndReadback(const DrawList& list);
   void waitIdle();

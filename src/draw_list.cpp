@@ -93,6 +93,14 @@ void DrawList::textRunsStatic(std::span<const TextRun> runs, Rect bounds,
   else commands_.emplace_back(std::move(command));
 }
 
+void DrawList::retainedDrawList(RetainedDrawListId drawList, Vec2 position, float scale) {
+  if (drawList == 0 || scale <= 0.0f) return;
+  RetainedDrawListCommand command{drawList, position, scale, clip_};
+  command.opacity = opacity_;
+  if (overlayMode_) overlayCommands_.emplace_back(command);
+  else commands_.emplace_back(command);
+}
+
 void DrawList::retainedText(RetainedTextId text, Vec2 position, float scale) {
   if (text == 0 || scale <= 0.0f)
     return;
