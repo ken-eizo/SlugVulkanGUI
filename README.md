@@ -114,6 +114,8 @@ with reproducible cross-library benchmarks; this repository does not make that u
   an interactive AOT-generated SlugUI page exercising responsive layout, typed reactive state,
   press-edge callbacks, hover/pressed paints, and overlays; and a Figma import page for single or
   multi-selection `.slugui` previews.
+  Normal launches always start without an imported document. Only the automatic relaunch after a
+  successful drop loads its AOT data; closing that session does not restore it on the next launch.
 
 ## Architecture
 

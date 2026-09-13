@@ -161,9 +161,16 @@ subsetを段階的に広げます。
 source treeからビルドしたExampleのFigma Importページでは、任意の有効なcomponent名を持つ
 `.slugui`をウィンドウへdropできます。AOT出力型だけをExample用の固定名へoverrideするため、
 単一selectionと複数selectionの両方を扱えます。Exampleだけがfixtureを置換し、現在の
-Debug/Release構成を別processでAOT再ビルドしてFigmaページを開き直します。同一bytesのfileは
-何も変更せず再起動もしません。変更fileは現在のwindowを閉じる前にcompilerの構文・型検査を通し、
+Debug/Release構成を別processでAOT再ビルドしてFigmaページを開き直します。同じsessionですでに取り込んだ
+同一bytesのfileは何も変更せず再起動もしません。空のsessionでは同じfileも再度取り込めます。
+変更fileは現在のwindowを閉じる前にcompilerの構文・型検査を通し、
 有効な場合だけ一度置換します。library/runtimeへ
 `.slugui` parserは追加していません。build失敗時は元fixtureを復元し、詳細を
 `build/slugui_drop_rebuild.log`へ保存します。配布アプリで任意UIを動的ロードする契約ではなく、
 Figma exporterを反復確認するための開発用導線です。
+
+通常起動では前回の取り込みdataを復元せず、Figma Importページは空になります。`--figma`は
+ページを選ぶだけで、dataを読み込みません。生成componentとそのatlas geometryを作るのは、drop成功後に
+helperが`--import-success`を渡して開いたsessionだけです。`--import-failed`では読み込みません。
+取り込み元fileとAOT成果物は削除せず、通常起動の初期化経路から切り離しています。問題のあるdataで
+import sessionが終了しても、EXEを引数なしで起動し直せばそのdataを実行せず開けます。

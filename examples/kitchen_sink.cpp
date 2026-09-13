@@ -293,7 +293,7 @@ bool sameFileContents(const std::filesystem::path& first,
   return left.eof() && right.eof();
 }
 
-bool stageFigmaSource(const std::filesystem::path& source, std::string& status) {
+bool stageFigmaSource(const std::filesystem::path& source, bool importLoaded, std::string& status) {
   if (lowerAscii(source.extension().string()) != ".slugui") {
     status = "Drop rejected: expected a .slugui file";
     return false;
@@ -308,8 +308,9 @@ bool stageFigmaSource(const std::filesystem::path& source, std::string& status) 
     "examples" / "figma_group_31.slugui";
   const std::filesystem::path backup = destination.string() + ".drop-backup";
   std::error_code equivalentError;
-  if (std::filesystem::equivalent(source, destination, equivalentError) ||
-      sameFileContents(source, destination)) {
+  const bool identical = std::filesystem::equivalent(source, destination, equivalentError) ||
+                         sameFileContents(source, destination);
+  if (importLoaded && identical) {
     status = "Already loaded: the dropped .slugui is identical";
     return false;
   }
@@ -327,16 +328,16 @@ bool stageFigmaSource(const std::filesystem::path& source, std::string& status) 
       : "Drop rejected: .slugui syntax or types are invalid";
     return false;
   }
-  {
+  if (!identical) {
     std::error_code cleanupError;
     std::filesystem::remove(backup, cleanupError);
     std::filesystem::copy_file(
       destination, backup, std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(
       source, destination, std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::last_write_time(
+      destination, std::filesystem::file_time_type::clock::now());
   }
-  std::filesystem::last_write_time(
-    destination, std::filesystem::file_time_type::clock::now());
   status = "Import staged: AOT rebuilding, then replacing this window...";
   return true;
 }
@@ -413,13 +414,15 @@ int main(int argc, char** argv) try {
   };
   const bool smokeTest = hasArgument("--smoke");
   const bool figmaPreview = hasArgument("--figma");
-  const bool importSucceeded = hasArgument("--import-success");
   const bool importFailed = hasArgument("--import-failed");
+  const bool importSucceeded = hasArgument("--import-success") && !importFailed;
   const bool lowestLatency = !hasArgument("--mailbox");
   VectorAtlas atlas;
   slugvk::example::SlugUiDemoGenerated slugUiDemo(atlas);
-  slugvk::example::Group_31Generated figmaImportDemo(atlas);
-  const Vec2 figmaDesignSize = componentSize(figmaImportDemo.component, {236.0f, 339.0f});
+  std::optional<slugvk::example::Group_31Generated> figmaImportDemo;
+  if (importSucceeded) figmaImportDemo.emplace(atlas);
+  const Vec2 figmaDesignSize = figmaImportDemo
+    ? componentSize(figmaImportDemo->component, {236.0f, 339.0f}) : Vec2{};
   const Shapes shapes = buildAtlas(atlas);
 
   Window window({1500, 950, "SlugVulkan - Vector Renderer + Declarative GUI", true, !smokeTest});
@@ -438,6 +441,7 @@ int main(int argc, char** argv) try {
   std::cout << "SlugVulkan device: " << renderer.deviceName() << '\n';
   std::cout << "Present mode: " << renderer.presentModeName() << " | frames in flight: 1\n";
   std::cout << "Vector font: " << atlas.fontFamily() << " " << atlas.fontStyle() << '\n';
+  std::cout << "Figma import: " << (figmaImportDemo ? "loaded (drop session)" : "none") << '\n';
 
   UiSkin skin;
   skin.rectangle = shapes.rectangle;
@@ -538,7 +542,7 @@ int main(int argc, char** argv) try {
     ? "Drop import succeeded: generated C++ and Slug atlas were rebuilt"
     : importFailed
       ? "Drop import failed: see build/slugui_drop_rebuild.log"
-      : "Drop any exported .slugui anywhere on this window to rebuild and reopen";
+      : "No file imported. Drop a .slugui to preview it for this session only.";
 
   window.setDropCallback([&](const std::vector<std::string>& paths) {
     const auto found = std::find_if(paths.rbegin(), paths.rend(), [](const std::string& path) {
@@ -800,36 +804,45 @@ int main(int argc, char** argv) try {
 
       const Rect canvas{38.0f, 178.0f, framebuffer.x - 76.0f,
                         std::max(100.0f, framebuffer.y - 242.0f)};
-      const Interaction drag = ui.interaction(hashId("figma-import-pan"), canvas);
-      if (drag.held) figmaPan = figmaPan + drag.cursorDelta;
-      const Vec2 canvasCenter{canvas.x + canvas.width * 0.5f,
-                              canvas.y + canvas.height * 0.5f};
-      const Vec2 designSize = figmaDesignSize;
-      const float fitScale = std::max(0.1f, std::min(
-        (canvas.width - 40.0f) / designSize.x,
-        (canvas.height - 40.0f) / designSize.y));
-      const float previousZoom = figmaZoom;
-      const Vec2 cursor = window.input().cursorPosition();
-      if (canvas.contains(cursor) && std::abs(window.input().scroll().delta.y) > 0.0001f)
-        figmaZoom *= std::exp(window.input().scroll().delta.y * 0.13f);
-      figmaZoom = std::clamp(figmaZoom, 0.2f, 8.0f);
-      if (std::abs(figmaZoom - previousZoom) > 0.000001f) {
-        const float oldScale = fitScale * previousZoom;
-        const float newScale = fitScale * figmaZoom;
-        const Vec2 oldOrigin = canvasCenter + figmaPan - designSize * (oldScale * 0.5f);
-        const Vec2 localAnchor = (cursor - oldOrigin) * (1.0f / oldScale);
-        figmaPan = cursor - canvasCenter + designSize * (newScale * 0.5f) -
-                   localAnchor * newScale;
-      }
-
+      const Interaction drag = figmaImportDemo
+        ? ui.interaction(hashId("figma-import-pan"), canvas) : Interaction{};
       draw.roundedRect(canvas, 12.0f,
         drag.held ? Paint::solid(Color::fromRgb8(0x151d31))
                   : Paint::solid(Color::fromRgb8(0x0d1323)), 100.0f);
-      const float renderScale = fitScale * figmaZoom;
-      const Vec2 origin = canvasCenter + figmaPan - designSize * (renderScale * 0.5f);
-      figmaRuntime.render(figmaImportDemo.component, window.input(), draw,
-                          {origin.x, origin.y, designSize.x * renderScale,
-                           designSize.y * renderScale}, renderScale);
+      if (figmaImportDemo) {
+        if (drag.held) figmaPan = figmaPan + drag.cursorDelta;
+        const Vec2 canvasCenter{canvas.x + canvas.width * 0.5f,
+                                canvas.y + canvas.height * 0.5f};
+        const Vec2 designSize = figmaDesignSize;
+        const float fitScale = std::max(0.1f, std::min(
+          (canvas.width - 40.0f) / designSize.x,
+          (canvas.height - 40.0f) / designSize.y));
+        const float previousZoom = figmaZoom;
+        const Vec2 cursor = window.input().cursorPosition();
+        if (canvas.contains(cursor) && std::abs(window.input().scroll().delta.y) > 0.0001f)
+          figmaZoom *= std::exp(window.input().scroll().delta.y * 0.13f);
+        figmaZoom = std::clamp(figmaZoom, 0.2f, 8.0f);
+        if (std::abs(figmaZoom - previousZoom) > 0.000001f) {
+          const float oldScale = fitScale * previousZoom;
+          const float newScale = fitScale * figmaZoom;
+          const Vec2 oldOrigin = canvasCenter + figmaPan - designSize * (oldScale * 0.5f);
+          const Vec2 localAnchor = (cursor - oldOrigin) * (1.0f / oldScale);
+          figmaPan = cursor - canvasCenter + designSize * (newScale * 0.5f) -
+                     localAnchor * newScale;
+        }
+
+        const float renderScale = fitScale * figmaZoom;
+        const Vec2 origin = canvasCenter + figmaPan - designSize * (renderScale * 0.5f);
+        figmaRuntime.render(figmaImportDemo->component, window.input(), draw,
+                            {origin.x, origin.y, designSize.x * renderScale,
+                             designSize.y * renderScale}, renderScale);
+      } else {
+        TextStyle empty = textStyle(18);
+        empty.align = HorizontalAlign::Center;
+        empty.paint = skin.muted;
+        draw.text("No .slugui imported - drop a file to preview",
+                  {canvas.x, canvas.y + canvas.height * 0.5f - 18, canvas.width, 36}, empty);
+      }
     }
 
     ui.endFrame();
@@ -874,7 +887,7 @@ int main(int argc, char** argv) try {
     window.pollEvents();
     if (pendingDrop) {
       try {
-        if (stageFigmaSource(*pendingDrop, dropStatus)) {
+        if (stageFigmaSource(*pendingDrop, figmaImportDemo.has_value(), dropStatus)) {
           rebuildAfterExit = true;
           window.requestClose();
         }
