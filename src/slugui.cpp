@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -90,15 +91,27 @@ struct PropertyStore::Impl {
   struct Binding {
     PropertyId target = 0;
     std::vector<PropertyId> dependencies;
-    std::vector<std::uint64_t> observed;
     std::function<PropertyValue(const PropertyStore&)> function;
-    bool initialized = false;
   };
 
   std::vector<Slot> slots;
   std::unordered_map<std::string, PropertyId> names;
   std::vector<Binding> bindings;
+  std::vector<std::vector<std::size_t>> dependents;
+  std::vector<bool> bindingQueued;
+  std::deque<std::size_t> dirtyBindings;
   std::uint64_t generation = 0;
+
+
+  void queueBinding(std::size_t index) {
+    if (bindingQueued[index]) return;
+    bindingQueued[index] = true;
+    dirtyBindings.push_back(index);
+  }
+  void queueDependents(PropertyId property) {
+    if (property == 0 || property > dependents.size()) return;
+    for (const auto binding : dependents[property - 1]) queueBinding(binding);
+  }
 };
 
 PropertyStore::PropertyStore() : impl_(std::make_unique<Impl>()) {}
@@ -111,6 +124,7 @@ PropertyId PropertyStore::addProperty(std::string name, PropertyValue value) {
   if (impl_->names.contains(name)) throw std::invalid_argument("Duplicate SlugUI property: " + name);
   const auto id = static_cast<PropertyId>(impl_->slots.size() + 1);
   impl_->slots.push_back({std::move(name), std::move(value), 1});
+  impl_->dependents.emplace_back();
   impl_->names.emplace(impl_->slots.back().name, id);
   ++impl_->generation;
   return id;
@@ -132,6 +146,7 @@ bool PropertyStore::setValue(PropertyId property, PropertyValue value) {
   slot.value = std::move(value);
   ++slot.revision;
   ++impl_->generation;
+  impl_->queueDependents(property);
   return true;
 }
 
@@ -139,7 +154,12 @@ void PropertyStore::addBinding(PropertyId target, std::vector<PropertyId> depend
                                BindingFunction function) {
   (void)value(target);
   for (const auto dependency : dependencies) (void)value(dependency);
-  impl_->bindings.push_back({target, std::move(dependencies), {}, std::move(function), false});
+  const auto index = impl_->bindings.size();
+  impl_->bindings.push_back({target, std::move(dependencies), std::move(function)});
+  impl_->bindingQueued.push_back(false);
+  for (const auto dependency : impl_->bindings.back().dependencies)
+    impl_->dependents[dependency - 1].push_back(index);
+  impl_->queueBinding(index);
 }
 
 std::optional<PropertyId> PropertyStore::find(std::string_view name) const {
@@ -161,35 +181,22 @@ std::uint64_t PropertyStore::generation() const { return impl_->generation; }
 
 bool PropertyStore::evaluateBindings() {
   bool changed = false;
-  for (std::size_t pass = 0; pass <= impl_->bindings.size(); ++pass) {
-    bool passChanged = false;
-    for (auto& binding : impl_->bindings) {
-      bool dirty = !binding.initialized || binding.observed.size() != binding.dependencies.size();
-      if (!dirty) {
-        for (std::size_t i = 0; i < binding.dependencies.size(); ++i) {
-          if (binding.observed[i] != revision(binding.dependencies[i])) {
-            dirty = true;
-            break;
-          }
-        }
-      }
-      if (!dirty) continue;
-      auto next = binding.function(*this);
-      if (propertyType(next) != type(binding.target)) {
-        throw std::invalid_argument("SlugUI binding returned the wrong property type");
-      }
-      passChanged |= setValue(binding.target, std::move(next));
-      binding.observed.clear();
-      binding.observed.reserve(binding.dependencies.size());
-      for (const auto dependency : binding.dependencies) {
-        binding.observed.push_back(revision(dependency));
-      }
-      binding.initialized = true;
-    }
-    changed |= passChanged;
-    if (!passChanged) return changed;
+  std::size_t evaluations = 0;
+  const std::size_t maximumEvaluations = std::max<std::size_t>(
+    32, impl_->bindings.size() * std::max<std::size_t>(4, impl_->slots.size() + 1));
+  while (!impl_->dirtyBindings.empty()) {
+    const auto index = impl_->dirtyBindings.front();
+    impl_->dirtyBindings.pop_front();
+    impl_->bindingQueued[index] = false;
+    if (++evaluations > maximumEvaluations)
+      throw std::runtime_error("SlugUI property bindings did not converge");
+    auto& binding = impl_->bindings[index];
+    auto next = binding.function(*this);
+    if (propertyType(next) != type(binding.target))
+      throw std::invalid_argument("SlugUI binding returned the wrong property type");
+    changed |= setValue(binding.target, std::move(next));
   }
-  throw std::runtime_error("SlugUI property bindings did not converge");
+  return changed;
 }
 
 namespace {

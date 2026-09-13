@@ -229,13 +229,18 @@ int main() try {
     const auto doubled = properties.define<float>("doubled", 0.0f);
     const auto borderWidths = properties.define<BorderWidths>(
       "border-widths", BorderWidths{1.0f, 2.0f, 3.0f, 4.0f});
-    properties.bind<float>(doubled, {source.id}, [source](const sui::PropertyStore& values) {
+    int bindingEvaluations = 0;
+    properties.bind<float>(doubled, {source.id}, [source, &bindingEvaluations](const sui::PropertyStore& values) {
+      ++bindingEvaluations;
       return values.get(source) * 2.0f;
     });
-    require(properties.evaluateBindings() && properties.get(doubled) == 6.0f,
+    require(properties.evaluateBindings() && properties.get(doubled) == 6.0f &&
+            bindingEvaluations == 1,
             "SlugUI typed binding initial evaluation");
+    require(!properties.evaluateBindings() && bindingEvaluations == 1,
+            "SlugUI skips unchanged bindings");
     require(properties.set(source, 5.0f) && properties.evaluateBindings() &&
-            properties.get(doubled) == 10.0f,
+            properties.get(doubled) == 10.0f && bindingEvaluations == 2,
             "SlugUI dependency revision evaluation");
     require(properties.find("doubled") == doubled.id &&
             properties.type(doubled.id) == sui::PropertyType::Scalar,
