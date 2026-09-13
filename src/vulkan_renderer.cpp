@@ -341,6 +341,13 @@ struct Instance {
   float strokeWidths[4];
 };
 
+struct PrimitiveInstance {
+  float positionRect[4];
+  std::uint16_t color[4];
+  std::uint16_t clip[4]; // normalized minX, minY, maxX, maxY
+};
+static_assert(sizeof(PrimitiveInstance) == 32);
+
 struct Buffer {
   VkBuffer buffer = VK_NULL_HANDLE;
   VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -357,6 +364,21 @@ struct DrawBatch {
   float scale = 1.0f;
   Rect clip = {};
   float opacity = 1.0f;
+  bool primitive = false;
+};
+
+// Private lowering target between public DrawList commands and GPU buffers.
+// It intentionally separates compact primitives from the full Slug/vector instance stream.
+struct RenderIR {
+  std::vector<Instance> instances{};
+  std::vector<PrimitiveInstance> primitives{};
+  std::vector<DrawBatch> batches{};
+
+  void clear() {
+    instances.clear();
+    primitives.clear();
+    batches.clear();
+  }
 };
 
 struct alignas(16) PushConstants {
@@ -410,6 +432,7 @@ struct VulkanRenderer::Impl {
   VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
   VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
   VkPipeline pipeline = VK_NULL_HANDLE;
+  VkPipeline primitivePipeline = VK_NULL_HANDLE;
   VkSampler sampler = VK_NULL_HANDLE;
   Texture curveTexture{};
   Texture bandTexture{};
@@ -423,11 +446,11 @@ struct VulkanRenderer::Impl {
     bool timestampsWritten = false;
     bool writeTimestamps = false;
     Buffer instances{};
+    Buffer primitiveInstances{};
   };
   std::array<Frame, framesInFlight> frames{};
   std::size_t currentFrame = 0;
-  std::vector<Instance> stagingInstances{};
-  std::vector<DrawBatch> drawBatches{};
+  RenderIR frameIR{};
   struct RetainedGeometry {
     Buffer instances{};
     std::vector<Instance> shadow{};
@@ -903,6 +926,10 @@ struct VulkanRenderer::Impl {
         createShaderModule(embedded::vectorVert, embedded::vectorVertSize);
     VkShaderModule fragmentModule =
         createShaderModule(embedded::vectorFrag, embedded::vectorFragSize);
+    VkShaderModule primitiveVertexModule =
+        createShaderModule(embedded::primitiveVert, embedded::primitiveVertSize);
+    VkShaderModule primitiveFragmentModule =
+        createShaderModule(embedded::primitiveFrag, embedded::primitiveFragSize);
     VkPipelineShaderStageCreateInfo vertexStage{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     vertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -991,9 +1018,43 @@ struct VulkanRenderer::Impl {
     pipelineInfo.renderPass = renderPass;
     pipelineInfo.subpass = 0;
     check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline),
-          "vkCreateGraphicsPipelines");
+          "vkCreateGraphicsPipelines(vector)");
+
+    VkPipelineShaderStageCreateInfo primitiveVertexStage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    primitiveVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    primitiveVertexStage.module = primitiveVertexModule;
+    primitiveVertexStage.pName = "main";
+    VkPipelineShaderStageCreateInfo primitiveFragmentStage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    primitiveFragmentStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    primitiveFragmentStage.module = primitiveFragmentModule;
+    primitiveFragmentStage.pName = "main";
+    const std::array primitiveStages{primitiveVertexStage, primitiveFragmentStage};
+    VkVertexInputBindingDescription primitiveBinding{
+      0, sizeof(PrimitiveInstance), VK_VERTEX_INPUT_RATE_INSTANCE};
+    std::array<VkVertexInputAttributeDescription, 3> primitiveAttributes{{
+      {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(PrimitiveInstance, positionRect)},
+      {1, 0, VK_FORMAT_R16G16B16A16_UNORM, offsetof(PrimitiveInstance, color)},
+      {2, 0, VK_FORMAT_R16G16B16A16_UINT, offsetof(PrimitiveInstance, clip)}
+    }};
+    VkPipelineVertexInputStateCreateInfo primitiveVertexInput{
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    primitiveVertexInput.vertexBindingDescriptionCount = 1;
+    primitiveVertexInput.pVertexBindingDescriptions = &primitiveBinding;
+    primitiveVertexInput.vertexAttributeDescriptionCount =
+      static_cast<std::uint32_t>(primitiveAttributes.size());
+    primitiveVertexInput.pVertexAttributeDescriptions = primitiveAttributes.data();
+    pipelineInfo.pStages = primitiveStages.data();
+    pipelineInfo.pVertexInputState = &primitiveVertexInput;
+    check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+                                    &primitivePipeline),
+          "vkCreateGraphicsPipelines(primitive)");
+
     vkDestroyShaderModule(device, vertexModule, nullptr);
     vkDestroyShaderModule(device, fragmentModule, nullptr);
+    vkDestroyShaderModule(device, primitiveVertexModule, nullptr);
+    vkDestroyShaderModule(device, primitiveFragmentModule, nullptr);
   }
 
   void createSwapchainResources(VkSwapchainKHR oldSwapchain = VK_NULL_HANDLE) {
@@ -1043,11 +1104,14 @@ struct VulkanRenderer::Impl {
     if (formatChanged) {
       if (pipeline)
         vkDestroyPipeline(device, pipeline, nullptr);
+      if (primitivePipeline)
+        vkDestroyPipeline(device, primitivePipeline, nullptr);
       if (pipelineLayout)
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
       if (renderPass)
         vkDestroyRenderPass(device, renderPass, nullptr);
       pipeline = VK_NULL_HANDLE;
+      primitivePipeline = VK_NULL_HANDLE;
       pipelineLayout = VK_NULL_HANDLE;
       renderPass = VK_NULL_HANDLE;
     }
@@ -1109,11 +1173,14 @@ struct VulkanRenderer::Impl {
     destroySwapchainImages(true);
     if (pipeline)
       vkDestroyPipeline(device, pipeline, nullptr);
+    if (primitivePipeline)
+      vkDestroyPipeline(device, primitivePipeline, nullptr);
     if (pipelineLayout)
       vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
     if (renderPass)
       vkDestroyRenderPass(device, renderPass, nullptr);
     pipeline = VK_NULL_HANDLE;
+    primitivePipeline = VK_NULL_HANDLE;
     pipelineLayout = VK_NULL_HANDLE;
     renderPass = VK_NULL_HANDLE;
   }
@@ -1154,6 +1221,10 @@ struct VulkanRenderer::Impl {
                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                    frame.instances, true);
+      createBuffer(config.initialVertexCapacity * sizeof(PrimitiveInstance),
+                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   frame.primitiveInstances, true);
       if (timestampsSupported) {
         VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         query.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -1224,6 +1295,69 @@ struct VulkanRenderer::Impl {
     const auto shape = vectorAtlas.native().getShape(slughorn::Key(id));
     if (shape)
       appendResolvedShape(instances, *shape, destination, paintValue, clip, italicShear);
+  }
+
+  static std::uint16_t packUnorm16(float value) noexcept {
+    return static_cast<std::uint16_t>(std::lround(
+      std::clamp(value, 0.0f, 1.0f) * 65535.0f));
+  }
+
+  [[nodiscard]] std::uint16_t packClipCoordinate(float value, std::uint32_t dimension) const noexcept {
+    if (dimension == 0) return 0;
+    const float normalized = std::clamp(value / static_cast<float>(dimension), 0.0f, 1.0f);
+    return static_cast<std::uint16_t>(std::lround(normalized * 65535.0f));
+  }
+
+  static bool integralPixel(float value) noexcept {
+    return std::isfinite(value) && std::abs(value - std::nearbyint(value)) <= 0.0001f;
+  }
+
+  [[nodiscard]] bool compactRectangleCompatible(const RoundedRectCommand& command) const noexcept {
+    const auto& color = command.paint.start;
+    const auto widths = resolvedBorderWidths(command.border);
+    const bool borderInvisible = widths.maximum() <= 0.0f || paintFullyTransparent(command.border.paint);
+    const bool square = command.radiiPx.topLeft <= 0.0001f &&
+      command.radiiPx.topRight <= 0.0001f && command.radiiPx.bottomRight <= 0.0001f &&
+      command.radiiPx.bottomLeft <= 0.0001f;
+    const bool unitColor = color.r >= 0.0f && color.r <= 1.0f &&
+      color.g >= 0.0f && color.g <= 1.0f && color.b >= 0.0f && color.b <= 1.0f &&
+      color.a >= 0.0f && color.a <= 1.0f && command.paint.opacity >= 0.0f &&
+      command.paint.opacity <= 1.0f && command.opacity >= 0.0f && command.opacity <= 1.0f;
+    const float right = command.destination.x + command.destination.width;
+    const float bottom = command.destination.y + command.destination.height;
+    return command.destination.width > 0.0f && command.destination.height > 0.0f &&
+      command.paint.kind == GradientKind::Solid && borderInvisible && square && unitColor &&
+      integralPixel(command.destination.x) && integralPixel(command.destination.y) &&
+      integralPixel(right) && integralPixel(bottom);
+  }
+
+  void appendCompactRectangle(std::vector<PrimitiveInstance>& primitives,
+                              const RoundedRectCommand& command) const {
+    const float right = command.destination.x + command.destination.width;
+    const float bottom = command.destination.y + command.destination.height;
+    const float clipRight = command.clip.x + command.clip.width;
+    const float clipBottom = command.clip.y + command.clip.height;
+    if (right <= command.clip.x || command.destination.x >= clipRight ||
+        bottom <= command.clip.y || command.destination.y >= clipBottom) return;
+    PrimitiveInstance primitive{};
+    primitive.positionRect[0] = command.destination.x;
+    primitive.positionRect[1] = command.destination.y;
+    primitive.positionRect[2] = right;
+    primitive.positionRect[3] = bottom;
+    const Color color = command.paint.start;
+    primitive.color[0] = packUnorm16(color.r);
+    primitive.color[1] = packUnorm16(color.g);
+    primitive.color[2] = packUnorm16(color.b);
+    primitive.color[3] = packUnorm16(color.a * command.paint.opacity * command.opacity);
+    const float leftClip = std::clamp(command.clip.x, 0.0f, static_cast<float>(extent.width));
+    const float topClip = std::clamp(command.clip.y, 0.0f, static_cast<float>(extent.height));
+    const float rightClip = std::clamp(clipRight, leftClip, static_cast<float>(extent.width));
+    const float bottomClip = std::clamp(clipBottom, topClip, static_cast<float>(extent.height));
+    primitive.clip[0] = packClipCoordinate(leftClip, extent.width);
+    primitive.clip[1] = packClipCoordinate(topClip, extent.height);
+    primitive.clip[2] = packClipCoordinate(rightClip, extent.width);
+    primitive.clip[3] = packClipCoordinate(bottomClip, extent.height);
+    primitives.push_back(primitive);
   }
 
   void appendRoundedRectInstance(std::vector<Instance>& instances,
@@ -1952,15 +2086,15 @@ struct VulkanRenderer::Impl {
   }
 
   RetainedDrawListId createRetainedDrawList(const DrawList& list) {
-    std::vector<Instance> instances;
-    buildMesh(list, instances);
-    for (const DrawBatch& batch : drawBatches) {
+    RenderIR compiled;
+    compileRenderIR(list, compiled, false);
+    for (const DrawBatch& batch : compiled.batches) {
       if (batch.retainedId != 0)
         throw std::invalid_argument("Retained DrawLists cannot contain retained resources");
     }
-    if (instances.empty()) return 0;
+    if (compiled.instances.empty()) return 0;
     RetainedGeometry retained;
-    uploadRetainedGeometry(retained, instances);
+    uploadRetainedGeometry(retained, compiled.instances);
     retainedDrawLists.push_back(std::move(retained));
     return static_cast<RetainedDrawListId>(retainedDrawLists.size());
   }
@@ -1968,13 +2102,13 @@ struct VulkanRenderer::Impl {
   std::size_t updateRetainedDrawList(RetainedDrawListId id, const DrawList& list) {
     if (id == 0 || id > retainedDrawLists.size())
       throw std::out_of_range("Invalid retained DrawList id");
-    std::vector<Instance> instances;
-    buildMesh(list, instances);
-    for (const DrawBatch& batch : drawBatches) {
+    RenderIR compiled;
+    compileRenderIR(list, compiled, false);
+    for (const DrawBatch& batch : compiled.batches) {
       if (batch.retainedId != 0)
         throw std::invalid_argument("Retained DrawLists cannot contain retained resources");
     }
-    return uploadRetainedGeometry(retainedDrawLists[id - 1U], instances);
+    return uploadRetainedGeometry(retainedDrawLists[id - 1U], compiled.instances);
   }
 
   void destroyRetainedDrawList(RetainedDrawListId id) {
@@ -1989,10 +2123,14 @@ struct VulkanRenderer::Impl {
     retained.instanceCount = 0;
   }
 
-  void buildMesh(const DrawList& list, std::vector<Instance>& instances) {
+  void compileRenderIR(const DrawList& list, RenderIR& ir, bool compactPrimitives) {
+    ir.clear();
+    auto& instances = ir.instances;
+    auto* primitives = compactPrimitives ? &ir.primitives : nullptr;
+    auto& drawBatches = ir.batches;
     const std::size_t commandCount = list.commands().size() + list.overlayCommands().size();
     instances.reserve(commandCount);
-    drawBatches.clear();
+    if (primitives) primitives->reserve(commandCount);
     drawBatches.reserve(commandCount);
     const auto appendCommands = [&](const auto& commands) {
       for (std::size_t commandIndex = 0; commandIndex < commands.size(); ++commandIndex) {
@@ -2019,6 +2157,8 @@ struct VulkanRenderer::Impl {
           continue;
         }
         const std::size_t first = instances.size();
+        const std::size_t primitiveFirst = primitives ? primitives->size() : 0;
+        bool emittedPrimitive = false;
         if (const auto* shapeCommand = std::get_if<DrawCommand>(&display))
           appendShape(instances, shapeCommand->shape, shapeCommand->destination,
                       shapeCommand->paint, shapeCommand->clip, shapeCommand->italicShear);
@@ -2046,6 +2186,9 @@ struct VulkanRenderer::Impl {
           if (stackEnd > commandIndex + 1) {
             appendOpaqueRoundedRectStack(instances, commands, commandIndex, stackEnd);
             commandIndex = stackEnd - 1;
+          } else if (primitives && compactRectangleCompatible(*roundedCommand)) {
+            appendCompactRectangle(*primitives, *roundedCommand);
+            emittedPrimitive = primitives->size() != primitiveFirst;
           } else {
             appendRoundedRect(instances, *roundedCommand);
           }
@@ -2054,6 +2197,19 @@ struct VulkanRenderer::Impl {
           appendCubicBezier(instances, *cubicCommand);
         else if (const auto* arcCommand = std::get_if<ArcCommand>(&display))
           appendArc(instances, *arcCommand);
+        if (emittedPrimitive) {
+          const auto count = static_cast<std::uint32_t>(primitives->size() - primitiveFirst);
+          if (!drawBatches.empty() && drawBatches.back().retainedId == 0 &&
+              drawBatches.back().primitive &&
+              drawBatches.back().firstInstance + drawBatches.back().instanceCount == primitiveFirst) {
+            drawBatches.back().instanceCount += count;
+          } else {
+            DrawBatch batch{0, false, static_cast<std::uint32_t>(primitiveFirst), count};
+            batch.primitive = true;
+            drawBatches.push_back(batch);
+          }
+          continue;
+        }
         const float opacity = std::visit([](const auto& command) { return command.opacity; }, display);
         if (opacity < 1.0f)
           for (std::size_t i = first; i < instances.size(); ++i) instances[i].paint[1] *= opacity;
@@ -2061,6 +2217,7 @@ struct VulkanRenderer::Impl {
         if (count == 0)
           continue;
         if (!drawBatches.empty() && drawBatches.back().retainedId == 0 &&
+            !drawBatches.back().primitive &&
             drawBatches.back().firstInstance + drawBatches.back().instanceCount == first) {
           drawBatches.back().instanceCount += count;
         } else {
@@ -2105,8 +2262,7 @@ struct VulkanRenderer::Impl {
     render.clearValueCount = 1;
     render.pClearValues = &clear;
     vkCmdBeginRenderPass(command, &render, VK_SUBPASS_CONTENTS_INLINE);
-    if (!drawBatches.empty()) {
-      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    if (!frameIR.batches.empty()) {
       VkViewport viewport{
           0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height),
           0.0f, 1.0f};
@@ -2114,12 +2270,20 @@ struct VulkanRenderer::Impl {
       vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
                               &descriptorSet, 0, nullptr);
       const VkDeviceSize offset = 0;
-      for (const DrawBatch& batch : drawBatches) {
+      VkPipeline currentPipeline = VK_NULL_HANDLE;
+      for (const DrawBatch& batch : frameIR.batches) {
+        const VkPipeline desiredPipeline = batch.primitive ? primitivePipeline : pipeline;
+        if (desiredPipeline != currentPipeline) {
+          vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, desiredPipeline);
+          currentPipeline = desiredPipeline;
+        }
         const bool retained = batch.retainedId != 0;
-        const Buffer& buffer = retained
-          ? (batch.retainedDrawList ? retainedDrawLists[batch.retainedId - 1U].instances
-                                    : retainedTexts[batch.retainedId - 1U].instances)
-          : frame.instances;
+        const Buffer& buffer = batch.primitive
+          ? frame.primitiveInstances
+          : retained
+            ? (batch.retainedDrawList ? retainedDrawLists[batch.retainedId - 1U].instances
+                                      : retainedTexts[batch.retainedId - 1U].instances)
+            : frame.instances;
         VkRect2D scissor{{0, 0}, extent};
         if (retained) {
           const float left = std::clamp(batch.clip.x, 0.0f, static_cast<float>(extent.width));
@@ -2230,14 +2394,18 @@ struct VulkanRenderer::Impl {
                      VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
     const auto cpuBuildStart = std::chrono::steady_clock::now();
-    stagingInstances.clear();
-    buildMesh(list, stagingInstances);
+    compileRenderIR(list, frameIR, true);
     const auto cpuBuildEnd = std::chrono::steady_clock::now();
-    ensureCapacity(frame.instances, stagingInstances.size() * sizeof(Instance),
+    ensureCapacity(frame.instances, frameIR.instances.size() * sizeof(Instance),
                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    if (!stagingInstances.empty())
-      std::memcpy(frame.instances.mapped, stagingInstances.data(),
-                  stagingInstances.size() * sizeof(Instance));
+    ensureCapacity(frame.primitiveInstances, frameIR.primitives.size() * sizeof(PrimitiveInstance),
+                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    if (!frameIR.instances.empty())
+      std::memcpy(frame.instances.mapped, frameIR.instances.data(),
+                  frameIR.instances.size() * sizeof(Instance));
+    if (!frameIR.primitives.empty())
+      std::memcpy(frame.primitiveInstances.mapped, frameIR.primitives.data(),
+                  frameIR.primitives.size() * sizeof(PrimitiveInstance));
     const auto cpuUploadEnd = std::chrono::steady_clock::now();
 
     frame.writeTimestamps = config.gpuTimingInterval > 0 && frame.timestamps != VK_NULL_HANDLE &&
@@ -2280,13 +2448,16 @@ struct VulkanRenderer::Impl {
     const auto cpuSubmitEnd = std::chrono::steady_clock::now();
 
     std::uint32_t retainedQuadCount = 0;
-    for (const DrawBatch& batch : drawBatches)
+    for (const DrawBatch& batch : frameIR.batches)
       if (batch.retainedId != 0)
         retainedQuadCount += batch.instanceCount;
-    statistics.quads = static_cast<std::uint32_t>(stagingInstances.size()) + retainedQuadCount;
+    statistics.quads = static_cast<std::uint32_t>(
+      frameIR.instances.size() + frameIR.primitives.size()) + retainedQuadCount;
     statistics.retainedQuads = retainedQuadCount;
-    statistics.drawCalls = static_cast<std::uint32_t>(drawBatches.size());
-    statistics.uploadedBytes = stagingInstances.size() * sizeof(Instance);
+    statistics.primitiveQuads = static_cast<std::uint32_t>(frameIR.primitives.size());
+    statistics.drawCalls = static_cast<std::uint32_t>(frameIR.batches.size());
+    statistics.uploadedBytes = frameIR.instances.size() * sizeof(Instance) +
+                               frameIR.primitives.size() * sizeof(PrimitiveInstance);
     statistics.cpuBuildMilliseconds =
         std::chrono::duration<float, std::milli>(cpuBuildEnd - cpuBuildStart).count();
     statistics.cpuUploadMilliseconds =
@@ -2313,6 +2484,7 @@ struct VulkanRenderer::Impl {
       retainedDrawLists.clear();
       for (auto& frame : frames) {
         destroyBuffer(frame.instances);
+        destroyBuffer(frame.primitiveInstances);
         if (frame.timestamps)
           vkDestroyQueryPool(device, frame.timestamps, nullptr);
         if (frame.imageAvailable)

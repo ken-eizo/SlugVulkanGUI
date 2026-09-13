@@ -34,6 +34,7 @@ struct RendererConfig {
 struct RendererStats {
   std::uint32_t quads = 0;
   std::uint32_t retainedQuads = 0;
+  std::uint32_t primitiveQuads = 0;
   std::uint32_t drawCalls = 0;
   std::size_t uploadedBytes = 0;
   float cpuBuildMilliseconds = 0.0f;

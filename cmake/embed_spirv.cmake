@@ -1,5 +1,7 @@
-if(NOT DEFINED VERTEX_SPV OR NOT DEFINED FRAGMENT_SPV OR NOT DEFINED OUTPUT)
-  message(FATAL_ERROR "VERTEX_SPV, FRAGMENT_SPV, and OUTPUT are required")
+if(NOT DEFINED VERTEX_SPV OR NOT DEFINED FRAGMENT_SPV OR
+   NOT DEFINED PRIMITIVE_VERTEX_SPV OR NOT DEFINED PRIMITIVE_FRAGMENT_SPV OR
+   NOT DEFINED OUTPUT)
+  message(FATAL_ERROR "All shader SPIR-V inputs and OUTPUT are required")
 endif()
 
 function(write_shader_array input symbol append)
@@ -21,4 +23,6 @@ endfunction()
 
 write_shader_array("${VERTEX_SPV}" vectorVert false)
 write_shader_array("${FRAGMENT_SPV}" vectorFrag true)
+write_shader_array("${PRIMITIVE_VERTEX_SPV}" primitiveVert true)
+write_shader_array("${PRIMITIVE_FRAGMENT_SPV}" primitiveFrag true)
 file(APPEND "${OUTPUT}" "} // namespace slugvk::embedded\n")
