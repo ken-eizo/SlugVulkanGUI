@@ -108,6 +108,10 @@ public:
     return std::get<T>(source_);
   }
   [[nodiscard]] bool bound() const { return std::holds_alternative<Property<T>>(source_); }
+  [[nodiscard]] std::optional<PropertyId> propertyId() const {
+    if (const auto* property = std::get_if<Property<T>>(&source_)) return property->id;
+    return std::nullopt;
+  }
 private:
   std::variant<T, Property<T>> source_ = T{};
 };
@@ -244,8 +248,11 @@ public:
   Component& operator=(Component&&) noexcept;
   Component(const Component&) = delete;
   Component& operator=(const Component&) = delete;
-  [[nodiscard]] Element& root() { return root_; }
+  [[nodiscard]] Element& root() { ++structureGeneration_; return root_; }
   [[nodiscard]] const Element& root() const { return root_; }
+  // Call after mutating an Element reference retained outside root().
+  void invalidateLayout() noexcept { ++structureGeneration_; }
+  [[nodiscard]] std::uint64_t layoutGeneration() const noexcept { return structureGeneration_; }
   [[nodiscard]] PropertyStore& properties() { return properties_; }
   [[nodiscard]] const PropertyStore& properties() const { return properties_; }
   void on(CallbackId callback, Callback handler);
@@ -254,6 +261,7 @@ private:
   void dispatch(CallbackId callback, const UiEvent& event);
   Element root_;
   PropertyStore properties_;
+  std::uint64_t structureGeneration_ = 1;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

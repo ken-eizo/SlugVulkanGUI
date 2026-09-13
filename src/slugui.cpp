@@ -320,6 +320,79 @@ struct Runtime::Impl {
   ElementId focused = 0;
   float scale = 1.0f;
   RuntimeStats stats = {};
+  const Component* layoutComponent = nullptr;
+  std::uint64_t layoutStructureGeneration = 0;
+  Rect layoutViewport = {};
+  float layoutDeviceScale = 0.0f;
+  std::vector<PropertyId> layoutDependencies;
+  std::vector<std::uint64_t> layoutObserved;
+
+  template <typename T>
+  static void addLayoutDependency(std::vector<PropertyId>& result,
+                                  const ValueSource<T>& source) {
+    if (const auto property = source.propertyId()) result.push_back(*property);
+  }
+
+  static void collectLayoutDependencies(const Element& element,
+                                        std::vector<PropertyId>& result) {
+    addLayoutDependency(result, element.visible);
+    addLayoutDependency(result, element.interaction.enabled);
+    const auto& layout = element.layout;
+    addLayoutDependency(result, layout.x);
+    addLayoutDependency(result, layout.y);
+    addLayoutDependency(result, layout.width);
+    addLayoutDependency(result, layout.height);
+    addLayoutDependency(result, layout.minWidth);
+    addLayoutDependency(result, layout.minHeight);
+    addLayoutDependency(result, layout.maxWidth);
+    addLayoutDependency(result, layout.maxHeight);
+    addLayoutDependency(result, layout.preferredWidth);
+    addLayoutDependency(result, layout.preferredHeight);
+    addLayoutDependency(result, layout.grow);
+    addLayoutDependency(result, layout.padding.left);
+    addLayoutDependency(result, layout.padding.top);
+    addLayoutDependency(result, layout.padding.right);
+    addLayoutDependency(result, layout.padding.bottom);
+    addLayoutDependency(result, layout.spacing);
+    if (const auto* textVisual = std::get_if<TextVisual>(&element.visual))
+      addLayoutDependency(result, textVisual->text);
+    for (const auto& child : element.children)
+      collectLayoutDependencies(child, result);
+  }
+
+  static bool sameRect(Rect a, Rect b) noexcept {
+    return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+  }
+  [[nodiscard]] bool layoutCurrent(const Component& component, Rect viewport,
+                                   float deviceScale) const {
+    const float normalizedScale = std::max(0.01f, deviceScale);
+    if (layoutComponent != &component ||
+        layoutStructureGeneration != component.layoutGeneration() ||
+        !sameRect(layoutViewport, viewport) || layoutDeviceScale != normalizedScale ||
+        layoutDependencies.size() != layoutObserved.size()) return false;
+    const auto& properties = component.properties();
+    for (std::size_t i = 0; i < layoutDependencies.size(); ++i) {
+      if (properties.revision(layoutDependencies[i]) != layoutObserved[i]) return false;
+    }
+    return true;
+  }
+
+  void rememberLayoutState(const Component& component, Rect viewport, float deviceScale) {
+    layoutComponent = &component;
+    layoutStructureGeneration = component.layoutGeneration();
+    layoutViewport = viewport;
+    layoutDeviceScale = std::max(0.01f, deviceScale);
+    layoutDependencies.clear();
+    collectLayoutDependencies(component.root(), layoutDependencies);
+    std::sort(layoutDependencies.begin(), layoutDependencies.end());
+    layoutDependencies.erase(std::unique(layoutDependencies.begin(), layoutDependencies.end()),
+                             layoutDependencies.end());
+    layoutObserved.clear();
+    layoutObserved.reserve(layoutDependencies.size());
+    const auto& properties = component.properties();
+    for (const auto property : layoutDependencies)
+      layoutObserved.push_back(properties.revision(property));
+  }
 
   [[nodiscard]] std::optional<float> length(const ValueSource<Length>& source,
                                              const PropertyStore& properties,
@@ -627,20 +700,19 @@ struct Runtime::Impl {
     measureCache.clear();
     resolvedIndex.clear();
     scale = std::max(0.01f, deviceScale);
-    flowScratch.resize(treeDepth(component.root()));
-    auto rootSize = measure(component.root(), component.properties(),
-                            viewport.width, viewport.height);
-    if (!length(component.root().layout.width, component.properties(), viewport.width)) {
-      rootSize.width = viewport.width;
-    }
-    if (!length(component.root().layout.height, component.properties(), viewport.height)) {
-      rootSize.height = viewport.height;
-    }
-    append(component.root(), {viewport.x, viewport.y, rootSize.width, rootSize.height},
-           viewport, component.properties(), true, false, 0);
+    const auto& readOnly = static_cast<const Component&>(component);
+    const auto& root = readOnly.root();
+    const auto& properties = readOnly.properties();
+    flowScratch.resize(treeDepth(root));
+    auto rootSize = measure(root, properties, viewport.width, viewport.height);
+    if (!length(root.layout.width, properties, viewport.width)) rootSize.width = viewport.width;
+    if (!length(root.layout.height, properties, viewport.height)) rootSize.height = viewport.height;
+    append(root, {viewport.x, viewport.y, rootSize.width, rootSize.height},
+           viewport, properties, true, false, 0);
     publicBoxes.reserve(resolved.size());
     for (const auto& entry : resolved) publicBoxes.push_back(entry.box);
     buildHitIndex();
+    rememberLayoutState(static_cast<const Component&>(component), viewport, deviceScale);
     ++stats.layoutPasses;
   }
 
@@ -804,20 +876,20 @@ Runtime& Runtime::operator=(Runtime&&) noexcept = default;
 void Runtime::layout(Component& component, Rect viewport, float deviceScale) {
   impl_->stats = {};
   component.properties().evaluateBindings();
-  impl_->performLayout(component, viewport, deviceScale);
+  if (!impl_->layoutCurrent(component, viewport, deviceScale))
+    impl_->performLayout(component, viewport, deviceScale);
 }
 
 RuntimeStats Runtime::render(Component& component, const FrameInput& input,
                              DrawList& drawList, Rect viewport, float deviceScale) {
   impl_->stats = {};
   component.properties().evaluateBindings();
-  impl_->performLayout(component, viewport, deviceScale);
-  const auto beforeInput = component.properties().generation();
+  if (!impl_->layoutCurrent(component, viewport, deviceScale))
+    impl_->performLayout(component, viewport, deviceScale);
   impl_->processInput(component, input);
   component.properties().evaluateBindings();
-  if (component.properties().generation() != beforeInput) {
+  if (!impl_->layoutCurrent(component, viewport, deviceScale))
     impl_->performLayout(component, viewport, deviceScale);
-  }
   impl_->emit(component.properties(), input, drawList);
   return impl_->stats;
 }

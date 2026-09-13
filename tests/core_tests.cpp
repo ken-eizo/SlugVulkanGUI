@@ -374,6 +374,49 @@ int main() try {
             "SlugUI stroke paint and width lower into the current frame");
   }
 
+  {
+    namespace sui = slugui;
+    sui::PropertyStore properties;
+    const auto width = properties.define<sui::Length>(
+      "cached-width", sui::Length::physical(80.0f));
+    const auto paint = properties.define<Paint>(
+      "cached-paint", Paint::solid(Color::fromRgb8(0x204080)));
+    auto root = sui::absolute(hashId("cached-root"));
+    auto child = sui::roundedRectangle(
+      hashId("cached-child"), Paint::solid(Color::fromRgb8(0x000000)));
+    child.layout.width = width;
+    child.layout.height = sui::Length::physical(32.0f);
+    std::get<sui::RoundedRectangleVisual>(child.visual).paint.normal = paint;
+    root.add(std::move(child));
+    sui::Component component(std::move(root), std::move(properties));
+    sui::Runtime runtime;
+    DrawList first;
+    const auto firstStats = runtime.render(
+      component, sui::FrameInput{}, first, {0, 0, 200, 100});
+    require(firstStats.layoutPasses == 1, "SlugUI performs initial layout once");
+
+    DrawList stable;
+    const auto stableStats = runtime.render(
+      component, sui::FrameInput{}, stable, {0, 0, 200, 100});
+    require(stableStats.layoutPasses == 0,
+            "SlugUI skips layout on unchanged frames");
+
+    component.properties().set(paint, Paint::solid(Color::fromRgb8(0x80a020)));
+    DrawList paintOnly;
+    const auto paintStats = runtime.render(
+      component, sui::FrameInput{}, paintOnly, {0, 0, 200, 100});
+    require(paintStats.layoutPasses == 0 && !paintOnly.commands().empty(),
+            "SlugUI paint-only changes bypass layout");
+    component.properties().set(width, sui::Length::physical(120.0f));
+    DrawList resized;
+    const auto resizedStats = runtime.render(
+      component, sui::FrameInput{}, resized, {0, 0, 200, 100});
+    const auto* resizedBox = runtime.find(hashId("cached-child"));
+    require(resizedStats.layoutPasses == 1 && resizedBox &&
+            resizedBox->bounds.width == 120.0f,
+            "SlugUI relayouts when a tracked geometry property changes");
+  }
+
   std::cout << "SlugVulkan core tests passed\n";
   return 0;
 } catch (const std::exception& error) {
