@@ -67,6 +67,11 @@ public:
   // Retains an arbitrary static DrawList in device-local memory. Retained commands may be
   // transformed, clipped and faded every frame without rebuilding their instances.
   RetainedDrawListId createRetainedDrawList(const DrawList& list);
+  // Rebuilds CPU instances, but uploads only changed contiguous ranges when capacity permits.
+  // Returns the number of bytes transferred to the GPU (zero when the retained data is identical).
+  std::size_t updateRetainedDrawList(RetainedDrawListId drawList, const DrawList& list);
+  // Releases the backing GPU allocation. IDs are never recycled, so stale commands stay inert.
+  void destroyRetainedDrawList(RetainedDrawListId drawList);
   void draw(const DrawList& list);
   [[nodiscard]] FramePixels drawAndReadback(const DrawList& list);
   void waitIdle();
