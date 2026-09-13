@@ -1448,37 +1448,72 @@ struct VulkanRenderer::Impl {
 
   void appendCubicBezier(std::vector<Instance>& instances,
                          const CubicBezierCommand& command) const {
-    const auto length = [](Vec2 a, Vec2 b) { return std::hypot(b.x - a.x, b.y - a.y); };
-    const float controlPolygon = length(command.from, command.control1) +
-                                 length(command.control1, command.control2) +
-                                 length(command.control2, command.to);
-    const float chord = length(command.from, command.to);
-    const float curvature = std::max(0.0f, controlPolygon - chord);
-    const int segments = curvature < 0.001f ? 1 :
-      std::clamp(static_cast<int>(std::ceil(controlPolygon / 8.0f + curvature / 4.0f)), 4, 128);
-    const auto pointAt = [&](float t) {
-      const float u = 1.0f - t;
-      const float uu = u * u;
-      const float tt = t * t;
-      return Vec2{uu * u * command.from.x + 3.0f * uu * t * command.control1.x +
-                    3.0f * u * tt * command.control2.x + tt * t * command.to.x,
-                  uu * u * command.from.y + 3.0f * uu * t * command.control1.y +
-                    3.0f * u * tt * command.control2.y + tt * t * command.to.y};
+    struct CubicSegment {
+      Vec2 p0;
+      Vec2 p1;
+      Vec2 p2;
+      Vec2 p3;
+      std::uint8_t depth = 0;
     };
 
+    constexpr float maximumFlatnessError = 0.25f;
+    constexpr std::uint8_t maximumDepth = 7;
+    const auto midpoint = [](Vec2 a, Vec2 b) { return (a + b) * 0.5f; };
+    const auto pointLineDistanceSquared = [](Vec2 point, Vec2 a, Vec2 b) {
+      const Vec2 chord = b - a;
+      const float lengthSquared = chord.x * chord.x + chord.y * chord.y;
+      if (lengthSquared <= 1.0e-12f) {
+        const Vec2 delta = point - a;
+        return delta.x * delta.x + delta.y * delta.y;
+      }
+      const float cross = chord.x * (a.y - point.y) - chord.y * (a.x - point.x);
+      return (cross * cross) / lengthSquared;
+    };
+    const float flatnessSquared = maximumFlatnessError * maximumFlatnessError;
+    std::array<CubicSegment, 128> stack{};
+    std::size_t stackSize = 1;
+    stack[0] = {command.from, command.control1, command.control2, command.to, 0};
     std::array<Vec2, 129> points{};
-    std::array<Vec2, 128> tangents{};
+    std::size_t pointCount = 1;
     points[0] = command.from;
-    for (int index = 1; index <= segments; ++index) {
-      points[index] = pointAt(static_cast<float>(index) / static_cast<float>(segments));
-      const auto delta = points[index] - points[index - 1];
-      tangents[index - 1] = delta * (1.0f / std::max(std::hypot(delta.x, delta.y), 0.00001f));
+
+    while (stackSize != 0) {
+      const CubicSegment segment = stack[--stackSize];
+      const float d1 = pointLineDistanceSquared(segment.p1, segment.p0, segment.p3);
+      const float d2 = pointLineDistanceSquared(segment.p2, segment.p0, segment.p3);
+      const bool flat = std::max(d1, d2) <= flatnessSquared;
+      if (flat || segment.depth >= maximumDepth || pointCount == points.size()) {
+        points[pointCount++] = segment.p3;
+        continue;
+      }
+
+      const Vec2 p01 = midpoint(segment.p0, segment.p1);
+      const Vec2 p12 = midpoint(segment.p1, segment.p2);
+      const Vec2 p23 = midpoint(segment.p2, segment.p3);
+      const Vec2 p012 = midpoint(p01, p12);
+      const Vec2 p123 = midpoint(p12, p23);
+      const Vec2 split = midpoint(p012, p123);
+      const auto nextDepth = static_cast<std::uint8_t>(segment.depth + 1);
+      stack[stackSize++] = {split, p123, p23, segment.p3, nextDepth};
+      stack[stackSize++] = {segment.p0, p01, p012, split, nextDepth};
     }
-    for (int index = 0; index < segments; ++index) {
-      const auto start = index == 0 ? tangents[index] : tangents[index - 1] + tangents[index];
-      const auto end = index + 1 == segments ? tangents[index] : tangents[index] + tangents[index + 1];
+
+    if (pointCount < 2) return;
+    const std::size_t segments = pointCount - 1;
+    std::array<Vec2, 128> tangents{};
+    for (std::size_t index = 0; index < segments; ++index) {
+      const auto delta = points[index + 1] - points[index];
+      const float magnitude = std::max(std::hypot(delta.x, delta.y), 0.00001f);
+      tangents[index] = delta * (1.0f / magnitude);
+    }
+    for (std::size_t index = 0; index < segments; ++index) {
+      const auto startTangent = index == 0 ? tangents[index]
+                                           : tangents[index - 1] + tangents[index];
+      const auto endTangent = index + 1 == segments ? tangents[index]
+                                                     : tangents[index] + tangents[index + 1];
       appendStrokeSegment(instances, points[index], points[index + 1], command,
-                          index == 0, index + 1 == segments, start, end);
+                          index == 0, index + 1 == segments,
+                          startTangent, endTangent);
     }
   }
 
