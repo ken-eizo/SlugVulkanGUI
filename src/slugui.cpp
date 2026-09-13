@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 #include <unordered_map>
@@ -312,6 +313,8 @@ struct Runtime::Impl {
   std::vector<std::vector<FlowChild>> flowScratch;
   std::unordered_map<MeasureKey, Measured, MeasureKeyHash> measureCache;
   std::unordered_map<ElementId, std::size_t> resolvedIndex;
+  std::unordered_map<std::uint64_t, std::vector<std::size_t>> hitCells;
+  std::vector<std::size_t> hitGlobals;
   ElementId hovered = 0;
   ElementId active = 0;
   ElementId focused = 0;
@@ -577,6 +580,47 @@ struct Runtime::Impl {
     return result;
   }
 
+  static constexpr float hitCellSize = 64.0f;
+  static constexpr std::size_t maximumIndexedCellsPerElement = 256;
+
+  [[nodiscard]] static std::uint64_t hitCellKey(std::int32_t x, std::int32_t y) noexcept {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32U) |
+           static_cast<std::uint32_t>(y);
+  }
+
+  [[nodiscard]] static std::int32_t hitCellCoordinate(float value) noexcept {
+    return static_cast<std::int32_t>(std::floor(value / hitCellSize));
+  }
+
+  void buildHitIndex() {
+    hitCells.clear();
+    hitGlobals.clear();
+    hitCells.reserve(resolved.size());
+    for (std::size_t index = 0; index < resolved.size(); ++index) {
+      const auto& entry = resolved[index];
+      if (!entry.box.interactive || !entry.enabled) continue;
+      const Rect region = intersect(entry.box.bounds, entry.box.clip);
+      if (region.width <= 0.0f || region.height <= 0.0f) continue;
+      const auto minX = hitCellCoordinate(region.x);
+      const auto minY = hitCellCoordinate(region.y);
+      const auto maxX = hitCellCoordinate(std::nextafter(
+        region.x + region.width, -std::numeric_limits<float>::infinity()));
+      const auto maxY = hitCellCoordinate(std::nextafter(
+        region.y + region.height, -std::numeric_limits<float>::infinity()));
+      const std::uint64_t columns = static_cast<std::uint64_t>(maxX - minX + 1);
+      const std::uint64_t rows = static_cast<std::uint64_t>(maxY - minY + 1);
+      if (columns * rows > maximumIndexedCellsPerElement) {
+        hitGlobals.push_back(index);
+        continue;
+      }
+      for (auto y = minY; y <= maxY; ++y) {
+        for (auto x = minX; x <= maxX; ++x) {
+          hitCells[hitCellKey(x, y)].push_back(index);
+        }
+      }
+    }
+  }
+
   void performLayout(Component& component, Rect viewport, float deviceScale) {
     resolved.clear();
     publicBoxes.clear();
@@ -596,6 +640,7 @@ struct Runtime::Impl {
            viewport, component.properties(), true, false, 0);
     publicBoxes.reserve(resolved.size());
     for (const auto& entry : resolved) publicBoxes.push_back(entry.box);
+    buildHitIndex();
     ++stats.layoutPasses;
   }
 
@@ -607,11 +652,22 @@ struct Runtime::Impl {
   }
 
   [[nodiscard]] ElementId hit(Vec2 cursor) const {
+    const auto found = hitCells.find(hitCellKey(hitCellCoordinate(cursor.x),
+                                               hitCellCoordinate(cursor.y)));
+    const std::vector<std::size_t>* local = found == hitCells.end() ? nullptr : &found->second;
     for (const bool overlayPass : {true, false}) {
-      for (auto it = resolved.rbegin(); it != resolved.rend(); ++it) {
-        if (it->box.overlay != overlayPass || !it->box.interactive || !it->enabled) continue;
-        if (it->box.bounds.contains(cursor) && it->box.clip.contains(cursor)) {
-          return it->box.id;
+      std::size_t localCount = local ? local->size() : 0;
+      std::size_t globalCount = hitGlobals.size();
+      while (localCount != 0 || globalCount != 0) {
+        const auto localIndex = localCount != 0 ? (*local)[localCount - 1] : 0;
+        const auto globalIndex = globalCount != 0 ? hitGlobals[globalCount - 1] : 0;
+        const bool takeLocal = globalCount == 0 ||
+          (localCount != 0 && localIndex > globalIndex);
+        const auto index = takeLocal ? (*local)[--localCount] : hitGlobals[--globalCount];
+        const auto& entry = resolved[index];
+        if (entry.box.overlay != overlayPass) continue;
+        if (entry.box.bounds.contains(cursor) && entry.box.clip.contains(cursor)) {
+          return entry.box.id;
         }
       }
     }
