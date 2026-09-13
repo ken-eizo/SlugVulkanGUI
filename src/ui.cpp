@@ -1,9 +1,6 @@
 #include "slugvk/ui.hpp"
 #include "slugvk/vector_atlas.hpp"
 
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -289,24 +286,24 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
   }
   bool changed = false;
   if (focused_ == id && input_) {
-    const bool shift = input_->key(GLFW_KEY_LEFT_SHIFT).down || input_->key(GLFW_KEY_RIGHT_SHIFT).down;
-    const bool command = input_->key(GLFW_KEY_LEFT_CONTROL).down ||
-                         input_->key(GLFW_KEY_RIGHT_CONTROL).down ||
-                         input_->key(GLFW_KEY_LEFT_SUPER).down || input_->key(GLFW_KEY_RIGHT_SUPER).down;
-    if (command && input_->key(GLFW_KEY_A).pressed) edit.selectAll();
-    if (input_->key(GLFW_KEY_LEFT).pressed) edit.moveLeft(shift);
-    if (input_->key(GLFW_KEY_RIGHT).pressed) edit.moveRight(shift);
-    if (input_->key(GLFW_KEY_HOME).pressed) edit.moveHome(shift);
-    if (input_->key(GLFW_KEY_END).pressed) edit.moveEnd(shift);
-    if (input_->key(GLFW_KEY_BACKSPACE).pressed) changed = edit.backspace() || changed;
-    if (input_->key(GLFW_KEY_DELETE).pressed) changed = edit.deleteForward() || changed;
+    const bool shift = input_->key(Key::LeftShift).down || input_->key(Key::RightShift).down;
+    const bool command = input_->key(Key::LeftControl).down ||
+                         input_->key(Key::RightControl).down ||
+                         input_->key(Key::LeftSuper).down || input_->key(Key::RightSuper).down;
+    if (command && input_->key(Key::A).pressed) edit.selectAll();
+    if (input_->key(Key::Left).pressed) edit.moveLeft(shift);
+    if (input_->key(Key::Right).pressed) edit.moveRight(shift);
+    if (input_->key(Key::Home).pressed) edit.moveHome(shift);
+    if (input_->key(Key::End).pressed) edit.moveEnd(shift);
+    if (input_->key(Key::Backspace).pressed) changed = edit.backspace() || changed;
+    if (input_->key(Key::Delete).pressed) changed = edit.deleteForward() || changed;
     if (!command) {
       for (char32_t cp : input_->textInput()) {
         if (cp >= 32) changed = edit.insert(utf8(cp)) || changed;
       }
     }
     if (changed) value = edit.value;
-    if (input_->key(GLFW_KEY_ENTER).pressed || input_->key(GLFW_KEY_ESCAPE).pressed) focused_ = 0;
+    if (input_->key(Key::Enter).pressed || input_->key(Key::Escape).pressed) focused_ = 0;
   }
   if (focused_ == id && edit.hasSelection()) {
     const float advance = std::max(1.0f, skin_.text.size * 0.52f);
@@ -335,7 +332,7 @@ bool UiContext::toggle(WidgetId id, std::string_view text, Rect bounds, bool& va
   const auto state = interaction(id, bounds);
   bool changed = state.clicked;
   if (state.clicked) value = !value;
-  if (focused_ == id && input_ && input_->key(GLFW_KEY_SPACE).pressed) {
+  if (focused_ == id && input_ && input_->key(Key::Space).pressed) {
     value = !value;
     changed = true;
   }

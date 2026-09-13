@@ -30,6 +30,29 @@ struct ButtonState {
 enum class ScrollDirection : std::int8_t { None = 0, Up = 1, Down = -1 };
 enum class InputAction : std::uint8_t { Release = 0, Press = 1, Repeat = 2 };
 
+// Stable platform-independent keys used by SlugVulkan UI. Native adapters map
+// their backend key codes to these values while the legacy integer API remains available.
+enum class Key : std::uint16_t {
+  Unknown = 0,
+  Space,
+  A,
+  Enter,
+  Escape,
+  Backspace,
+  Delete,
+  Left,
+  Right,
+  Home,
+  End,
+  LeftShift,
+  RightShift,
+  LeftControl,
+  RightControl,
+  LeftSuper,
+  RightSuper,
+  Count
+};
+
 struct ScrollState {
   bool started = false;
   bool ended = false;
@@ -59,6 +82,9 @@ public:
   }
   [[nodiscard]] const ButtonState& mouse(MouseButton button) const;
   [[nodiscard]] const ButtonState& key(int key) const;
+  [[nodiscard]] const ButtonState& key(Key key) const {
+    return this->key(static_cast<int>(key));
+  }
   [[nodiscard]] const std::u32string& textInput() const {
     return textInput_;
   }
@@ -102,6 +128,9 @@ public:
   void cursor(Vec2 position) noexcept;
   void mouseButton(MouseButton button, InputAction action) noexcept;
   void key(int keyCode, InputAction action) noexcept;
+  void key(Key key, InputAction action) noexcept {
+    this->key(static_cast<int>(key), action);
+  }
   void scroll(Vec2 delta, double nowSeconds) noexcept;
   void codepoint(std::uint32_t value) noexcept;
   void focusLost() noexcept;

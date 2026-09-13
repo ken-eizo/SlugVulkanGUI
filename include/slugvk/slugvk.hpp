@@ -11,4 +11,6 @@
 #include "slugvk/ui.hpp"
 #include "slugvk/vector_atlas.hpp"
 #include "slugvk/vulkan_renderer.hpp"
+#if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
 #include "slugvk/window.hpp"
+#endif

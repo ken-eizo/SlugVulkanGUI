@@ -10,6 +10,7 @@ option(SLUGVK_ENABLE_VALIDATION "Enable Vulkan validation in debug builds" ON)
 option(SLUGVK_STATIC_MSVC_RUNTIME "Link the standalone MSVC build against the static runtime"
        ${PROJECT_IS_TOP_LEVEL})
 option(SLUGVK_INSTALL "Install the raw static library and public headers" ${PROJECT_IS_TOP_LEVEL})
+option(SLUGVK_ENABLE_GLFW "Build the optional GLFW Window adapter" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,11 +21,13 @@ endif()
 
 find_package(Vulkan REQUIRED)
 
-set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-add_subdirectory(external/glfw)
+if(SLUGVK_ENABLE_GLFW)
+  set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+  add_subdirectory(external/glfw)
+endif()
 
 set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
@@ -89,22 +92,29 @@ add_custom_command(
 )
 add_custom_target(slugvk_shaders DEPENDS "${SLUGVK_EMBEDDED_SHADER_HEADER}")
 
-add_library(slugvk STATIC
+set(SLUGVK_SOURCES
   src/animation.cpp
   src/draw_list.cpp
   src/input.cpp
   src/slugui.cpp
   src/ui.cpp
   src/vector_atlas.cpp
-  src/window.cpp
   src/vulkan_renderer.cpp
   "${SLUGVK_EMBEDDED_SHADER_HEADER}"
 )
+if(SLUGVK_ENABLE_GLFW)
+  list(APPEND SLUGVK_SOURCES src/window.cpp)
+endif()
+add_library(slugvk STATIC ${SLUGVK_SOURCES})
 add_library(SlugVulkan::slugvk ALIAS slugvk)
 add_dependencies(slugvk slugvk_shaders)
 target_include_directories(slugvk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
                                   PRIVATE "${SLUGVK_GENERATED_DIR}")
-target_link_libraries(slugvk PUBLIC slughorn Vulkan::Vulkan PRIVATE glfw)
+target_link_libraries(slugvk PUBLIC slughorn Vulkan::Vulkan)
+if(SLUGVK_ENABLE_GLFW)
+  target_link_libraries(slugvk PRIVATE glfw)
+endif()
+target_compile_definitions(slugvk PUBLIC SLUGVK_ENABLE_GLFW=$<BOOL:${SLUGVK_ENABLE_GLFW}>)
 target_compile_definitions(slugvk PRIVATE
   $<$<BOOL:${SLUGVK_ENABLE_VALIDATION}>:SLUGVK_ENABLE_VALIDATION=1>
 )
@@ -113,6 +123,10 @@ if(MSVC)
   target_compile_options(slugvk PRIVATE /W4 /permissive- /Zc:__cplusplus)
 else()
   target_compile_options(slugvk PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(SLUGVK_BUILD_EXAMPLE AND NOT SLUGVK_ENABLE_GLFW)
+  message(FATAL_ERROR "SLUGVK_BUILD_EXAMPLE requires SLUGVK_ENABLE_GLFW=ON")
 endif()
 
 if(SLUGVK_BUILD_EXAMPLE)

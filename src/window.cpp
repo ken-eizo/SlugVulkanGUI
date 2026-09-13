@@ -19,6 +19,28 @@ Window* windowFrom(GLFWwindow* window) {
   return static_cast<Window*>(glfwGetWindowUserPointer(window));
 }
 
+Key mapGlfwKey(int key) noexcept {
+  switch (key) {
+  case GLFW_KEY_SPACE: return Key::Space;
+  case GLFW_KEY_A: return Key::A;
+  case GLFW_KEY_ENTER: return Key::Enter;
+  case GLFW_KEY_ESCAPE: return Key::Escape;
+  case GLFW_KEY_BACKSPACE: return Key::Backspace;
+  case GLFW_KEY_DELETE: return Key::Delete;
+  case GLFW_KEY_LEFT: return Key::Left;
+  case GLFW_KEY_RIGHT: return Key::Right;
+  case GLFW_KEY_HOME: return Key::Home;
+  case GLFW_KEY_END: return Key::End;
+  case GLFW_KEY_LEFT_SHIFT: return Key::LeftShift;
+  case GLFW_KEY_RIGHT_SHIFT: return Key::RightShift;
+  case GLFW_KEY_LEFT_CONTROL: return Key::LeftControl;
+  case GLFW_KEY_RIGHT_CONTROL: return Key::RightControl;
+  case GLFW_KEY_LEFT_SUPER: return Key::LeftSuper;
+  case GLFW_KEY_RIGHT_SUPER: return Key::RightSuper;
+  default: return Key::Unknown;
+  }
+}
+
 std::runtime_error glfwFailure(const char* operation) {
   const char* description = nullptr;
   const int code = glfwGetError(&description);
@@ -72,7 +94,9 @@ Window::Window(const WindowConfig& config) {
     windowFrom(w)->input_.onMouseButton(button, action);
   });
   glfwSetKeyCallback(window_, [](GLFWwindow* w, int key, int, int action, int) {
-    windowFrom(w)->input_.onKey(key, action);
+    const Key mapped = mapGlfwKey(key);
+    if (mapped != Key::Unknown)
+      windowFrom(w)->input_.onKey(static_cast<int>(mapped), action);
   });
   glfwSetScrollCallback(window_, [](GLFWwindow* w, double x, double y) {
     windowFrom(w)->input_.onScroll(x, y, glfwGetTime());

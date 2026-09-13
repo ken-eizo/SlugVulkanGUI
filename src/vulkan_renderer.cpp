@@ -3,11 +3,13 @@
 #include "slughorn/slughorn.hpp"
 #include "slugvk/platform_surface.hpp"
 #include "slugvk/vector_atlas.hpp"
-#include "slugvk/window.hpp"
 #include "slugvk_embedded_shaders.hpp"
 
+#if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
+#include "slugvk/window.hpp"
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -35,6 +37,7 @@ constexpr const char* portabilitySubsetExtension = "VK_KHR_portability_subset";
 constexpr std::uint32_t analyticRoundedRectShape = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t analyticStrokeSegmentShape = std::numeric_limits<std::uint32_t>::max() - 1U;
 
+#if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
 class GlfwPlatformSurface final : public PlatformSurface {
 public:
   explicit GlfwPlatformSurface(Window& window) : window_(window) {
@@ -79,6 +82,7 @@ private:
   Window& window_;
   std::vector<const char*> extensions_;
 };
+#endif
 constexpr float roundedRectFillCoverage = 0.0f;
 constexpr float roundedRectStrokeRingCoverage = 1.0f;
 constexpr float roundedRectOpaqueBorderCoverage = 2.0f;
@@ -2234,9 +2238,11 @@ struct VulkanRenderer::Impl {
 VulkanRenderer::VulkanRenderer(PlatformSurface& surface, const VectorAtlas& atlas,
                                const RendererConfig& config)
     : impl_(std::make_unique<Impl>(surface, atlas, config)) {}
+#if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
 VulkanRenderer::VulkanRenderer(Window& window, const VectorAtlas& atlas,
                                const RendererConfig& config)
     : impl_(std::make_unique<Impl>(std::make_unique<GlfwPlatformSurface>(window), atlas, config)) {}
+#endif
 VulkanRenderer::~VulkanRenderer() = default;
 void VulkanRenderer::prepareFrame() {
   impl_->prepareFrame();

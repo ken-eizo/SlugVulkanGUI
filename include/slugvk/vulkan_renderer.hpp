@@ -9,7 +9,9 @@
 namespace slugvk {
 
 class VectorAtlas;
+#if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
 class Window;
+#endif
 class PlatformSurface;
 
 struct RendererConfig {
@@ -49,7 +51,9 @@ class VulkanRenderer {
 public:
   VulkanRenderer(PlatformSurface& surface, const VectorAtlas& atlas,
                  const RendererConfig& config = {});
+#if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
   VulkanRenderer(Window& window, const VectorAtlas& atlas, const RendererConfig& config = {});
+#endif
   ~VulkanRenderer();
   VulkanRenderer(const VulkanRenderer&) = delete;
   VulkanRenderer& operator=(const VulkanRenderer&) = delete;
