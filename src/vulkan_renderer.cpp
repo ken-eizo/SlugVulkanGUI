@@ -452,10 +452,18 @@ struct VulkanRenderer::Impl {
   std::size_t currentFrame = 0;
   RenderIR frameIR{};
   struct RetainedGeometry {
-    Buffer instances{};
+    VkDeviceSize offset = 0;
+    VkDeviceSize capacity = 0;
     std::vector<Instance> shadow{};
     std::uint32_t instanceCount = 0;
   };
+  struct FreeRange {
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+  };
+  Buffer retainedArena{};
+  VkDeviceSize retainedArenaUsed = 0;
+  std::vector<FreeRange> retainedFreeRanges{};
   std::vector<RetainedGeometry> retainedTexts{};
   std::vector<RetainedGeometry> retainedDrawLists{};
   std::uint32_t timestampValidBits = 0;
@@ -1931,46 +1939,144 @@ struct VulkanRenderer::Impl {
     }
   }
 
-  std::size_t uploadRetainedGeometry(RetainedGeometry& retained,
-                                     const std::vector<Instance>& instances) {
-    const VkDeviceSize requiredBytes = instances.size() * sizeof(Instance);
-    if (instances.empty()) {
-      retained.shadow.clear();
-      retained.instanceCount = 0;
-      return 0;
-    }
+  static VkDeviceSize alignRetainedBytes(VkDeviceSize value) noexcept {
+    constexpr VkDeviceSize alignment = 16;
+    return (value + alignment - 1) & ~(alignment - 1);
+  }
 
-    const bool needsAllocation = !retained.instances.buffer || requiredBytes > retained.instances.size;
-    if (needsAllocation) {
-      const VkDeviceSize grownCapacity = retained.instances.size == 0
-        ? requiredBytes
-        : std::max(requiredBytes, retained.instances.size + retained.instances.size / 2);
-      Buffer replacement{};
-      createBuffer(grownCapacity,
-                   VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, replacement, false);
-      Buffer staging{};
-      createBuffer(requiredBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                   staging, true);
-      std::memcpy(staging.mapped, instances.data(), static_cast<std::size_t>(requiredBytes));
+  void growRetainedArena(VkDeviceSize requiredCapacity) {
+    if (requiredCapacity <= retainedArena.size) return;
+    VkDeviceSize nextSize = retainedArena.size ? retainedArena.size * 2 : (256U << 10U);
+    while (nextSize < requiredCapacity) nextSize *= 2;
+    Buffer replacement{};
+    createBuffer(nextSize,
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, replacement, false);
+    if (retainedArena.buffer && retainedArenaUsed != 0) {
       VkCommandBuffer command = beginSingleUse();
-      VkBufferCopy copy{0, 0, requiredBytes};
-      vkCmdCopyBuffer(command, staging.buffer, replacement.buffer, 1, &copy);
+      VkBufferMemoryBarrier readable{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+      readable.srcAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+      readable.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      readable.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      readable.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      readable.buffer = retainedArena.buffer;
+      readable.size = retainedArenaUsed;
+      vkCmdPipelineBarrier(command,
+                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &readable, 0, nullptr);
+      VkBufferCopy copy{0, 0, retainedArenaUsed};
+      vkCmdCopyBuffer(command, retainedArena.buffer, replacement.buffer, 1, &copy);
       VkBufferMemoryBarrier ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
       ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
       ready.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
       ready.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       ready.buffer = replacement.buffer;
+      ready.size = retainedArenaUsed;
+      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, nullptr, 1, &ready,
+                           0, nullptr);
+      endSingleUse(command);
+    }
+    destroyBuffer(retainedArena);
+    retainedArena = replacement;
+  }
+
+  VkDeviceSize allocateRetainedRange(VkDeviceSize requestedBytes) {
+    const VkDeviceSize bytes = alignRetainedBytes(requestedBytes);
+    for (std::size_t index = 0; index < retainedFreeRanges.size(); ++index) {
+      auto& range = retainedFreeRanges[index];
+      if (range.size < bytes) continue;
+      const VkDeviceSize offset = range.offset;
+      if (range.size == bytes) {
+        retainedFreeRanges.erase(retainedFreeRanges.begin() + static_cast<std::ptrdiff_t>(index));
+      } else {
+        range.offset += bytes;
+        range.size -= bytes;
+      }
+      return offset;
+    }
+    const VkDeviceSize offset = retainedArenaUsed;
+    const VkDeviceSize required = offset + bytes;
+    growRetainedArena(required);
+    retainedArenaUsed = required;
+    return offset;
+  }
+
+  void freeRetainedRange(VkDeviceSize offset, VkDeviceSize size) {
+    if (size == 0) return;
+    retainedFreeRanges.push_back({offset, size});
+    std::sort(retainedFreeRanges.begin(), retainedFreeRanges.end(),
+              [](const FreeRange& a, const FreeRange& b) { return a.offset < b.offset; });
+    std::vector<FreeRange> merged;
+    merged.reserve(retainedFreeRanges.size());
+    for (const auto& range : retainedFreeRanges) {
+      if (!merged.empty() && merged.back().offset + merged.back().size >= range.offset) {
+        const VkDeviceSize end = std::max(merged.back().offset + merged.back().size,
+                                          range.offset + range.size);
+        merged.back().size = end - merged.back().offset;
+      } else {
+        merged.push_back(range);
+      }
+    }
+    retainedFreeRanges = std::move(merged);
+    while (!retainedFreeRanges.empty()) {
+      const auto& tail = retainedFreeRanges.back();
+      if (tail.offset + tail.size != retainedArenaUsed) break;
+      retainedArenaUsed = tail.offset;
+      retainedFreeRanges.pop_back();
+    }
+  }
+
+  void releaseRetainedGeometry(RetainedGeometry& retained) {
+    freeRetainedRange(retained.offset, retained.capacity);
+    retained.offset = 0;
+    retained.capacity = 0;
+    retained.instanceCount = 0;
+    retained.shadow.clear();
+    retained.shadow.shrink_to_fit();
+  }
+
+  std::size_t uploadRetainedGeometry(RetainedGeometry& retained,
+                                     const std::vector<Instance>& instances) {
+    const VkDeviceSize requiredBytes = instances.size() * sizeof(Instance);
+    if (instances.empty()) {
+      if (retained.capacity != 0) releaseRetainedGeometry(retained);
+      return 0;
+    }
+
+    if (requiredBytes > retained.capacity) {
+      const VkDeviceSize grownCapacity = alignRetainedBytes(
+        retained.capacity == 0 ? requiredBytes
+                               : std::max(requiredBytes, retained.capacity + retained.capacity / 2));
+      const VkDeviceSize oldOffset = retained.offset;
+      const VkDeviceSize oldCapacity = retained.capacity;
+      const VkDeviceSize newOffset = allocateRetainedRange(grownCapacity);
+      Buffer staging{};
+      createBuffer(requiredBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   staging, true);
+      std::memcpy(staging.mapped, instances.data(), static_cast<std::size_t>(requiredBytes));
+      VkCommandBuffer command = beginSingleUse();
+      VkBufferCopy copy{0, newOffset, requiredBytes};
+      vkCmdCopyBuffer(command, staging.buffer, retainedArena.buffer, 1, &copy);
+      VkBufferMemoryBarrier ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+      ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      ready.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+      ready.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      ready.buffer = retainedArena.buffer;
+      ready.offset = newOffset;
       ready.size = requiredBytes;
       vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, nullptr, 1, &ready,
                            0, nullptr);
       endSingleUse(command);
       destroyBuffer(staging);
-      destroyBuffer(retained.instances);
-      retained.instances = replacement;
+      if (oldCapacity != 0) freeRetainedRange(oldOffset, oldCapacity);
+      retained.offset = newOffset;
+      retained.capacity = grownCapacity;
       retained.shadow = instances;
       retained.instanceCount = static_cast<std::uint32_t>(instances.size());
       return static_cast<std::size_t>(requiredBytes);
@@ -1981,10 +2087,7 @@ struct VulkanRenderer::Impl {
     for (std::size_t index = 0; index < instances.size();) {
       const bool changed = index >= retained.shadow.size() ||
         std::memcmp(&instances[index], &retained.shadow[index], sizeof(Instance)) != 0;
-      if (!changed) {
-        ++index;
-        continue;
-      }
+      if (!changed) { ++index; continue; }
       const std::size_t first = index++;
       while (index < instances.size()) {
         const bool nextChanged = index >= retained.shadow.size() ||
@@ -1994,7 +2097,6 @@ struct VulkanRenderer::Impl {
       }
       ranges.push_back({first, index - first});
     }
-
     if (ranges.empty()) {
       retained.shadow = instances;
       retained.instanceCount = static_cast<std::uint32_t>(instances.size());
@@ -2008,7 +2110,6 @@ struct VulkanRenderer::Impl {
       ranges.push_back({0, instances.size()});
       dirtyInstances = instances.size();
     }
-
     const VkDeviceSize stagingBytes = dirtyInstances * sizeof(Instance);
     Buffer staging{};
     createBuffer(stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -2021,18 +2122,19 @@ struct VulkanRenderer::Impl {
       const VkDeviceSize bytes = range.count * sizeof(Instance);
       std::memcpy(static_cast<std::byte*>(staging.mapped) + sourceOffset,
                   instances.data() + range.first, static_cast<std::size_t>(bytes));
-      copies.push_back({sourceOffset, range.first * sizeof(Instance), bytes});
+      copies.push_back({sourceOffset, retained.offset + range.first * sizeof(Instance), bytes});
       sourceOffset += bytes;
     }
     VkCommandBuffer command = beginSingleUse();
-    vkCmdCopyBuffer(command, staging.buffer, retained.instances.buffer,
+    vkCmdCopyBuffer(command, staging.buffer, retainedArena.buffer,
                     static_cast<std::uint32_t>(copies.size()), copies.data());
     VkBufferMemoryBarrier ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     ready.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
     ready.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ready.buffer = retained.instances.buffer;
+    ready.buffer = retainedArena.buffer;
+    ready.offset = retained.offset;
     ready.size = requiredBytes;
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, nullptr, 1, &ready,
@@ -2055,33 +2157,9 @@ struct VulkanRenderer::Impl {
     if (instances.empty())
       return 0;
 
-    Buffer staging{};
-    const VkDeviceSize byteCount = instances.size() * sizeof(Instance);
-    createBuffer(byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 staging, true);
-    std::memcpy(staging.mapped, instances.data(), static_cast<std::size_t>(byteCount));
-
     RetainedGeometry retained;
-    createBuffer(byteCount, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, retained.instances, false);
-    VkCommandBuffer commandBuffer = beginSingleUse();
-    VkBufferCopy copy{0, 0, byteCount};
-    vkCmdCopyBuffer(commandBuffer, staging.buffer, retained.instances.buffer, 1, &copy);
-    VkBufferMemoryBarrier readyForVertexInput{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-    readyForVertexInput.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    readyForVertexInput.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-    readyForVertexInput.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    readyForVertexInput.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    readyForVertexInput.buffer = retained.instances.buffer;
-    readyForVertexInput.size = byteCount;
-    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, nullptr, 1, &readyForVertexInput,
-                         0, nullptr);
-    endSingleUse(commandBuffer);
-    destroyBuffer(staging);
-    retained.instanceCount = static_cast<std::uint32_t>(instances.size());
-    retainedTexts.push_back(retained);
+    uploadRetainedGeometry(retained, instances);
+    retainedTexts.push_back(std::move(retained));
     return static_cast<RetainedTextId>(retainedTexts.size());
   }
 
@@ -2115,12 +2193,9 @@ struct VulkanRenderer::Impl {
     if (id == 0 || id > retainedDrawLists.size())
       throw std::out_of_range("Invalid retained DrawList id");
     auto& retained = retainedDrawLists[id - 1U];
-    if (!retained.instances.buffer && retained.instanceCount == 0) return;
+    if (retained.capacity == 0 && retained.instanceCount == 0) return;
     check(vkQueueWaitIdle(graphicsQueue), "vkQueueWaitIdle(destroy retained DrawList)");
-    destroyBuffer(retained.instances);
-    retained.shadow.clear();
-    retained.shadow.shrink_to_fit();
-    retained.instanceCount = 0;
+    releaseRetainedGeometry(retained);
   }
 
   void compileRenderIR(const DrawList& list, RenderIR& ir, bool compactPrimitives) {
@@ -2269,7 +2344,6 @@ struct VulkanRenderer::Impl {
       vkCmdSetViewport(command, 0, 1, &viewport);
       vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
                               &descriptorSet, 0, nullptr);
-      const VkDeviceSize offset = 0;
       VkPipeline currentPipeline = VK_NULL_HANDLE;
       for (const DrawBatch& batch : frameIR.batches) {
         const VkPipeline desiredPipeline = batch.primitive ? primitivePipeline : pipeline;
@@ -2278,12 +2352,14 @@ struct VulkanRenderer::Impl {
           currentPipeline = desiredPipeline;
         }
         const bool retained = batch.retainedId != 0;
+        const RetainedGeometry* retainedGeometry = retained
+          ? (batch.retainedDrawList ? &retainedDrawLists[batch.retainedId - 1U]
+                                    : &retainedTexts[batch.retainedId - 1U])
+          : nullptr;
         const Buffer& buffer = batch.primitive
           ? frame.primitiveInstances
-          : retained
-            ? (batch.retainedDrawList ? retainedDrawLists[batch.retainedId - 1U].instances
-                                      : retainedTexts[batch.retainedId - 1U].instances)
-            : frame.instances;
+          : retained ? retainedArena : frame.instances;
+        const VkDeviceSize vertexOffset = retainedGeometry ? retainedGeometry->offset : 0;
         VkRect2D scissor{{0, 0}, extent};
         if (retained) {
           const float left = std::clamp(batch.clip.x, 0.0f, static_cast<float>(extent.width));
@@ -2300,7 +2376,7 @@ struct VulkanRenderer::Impl {
                             static_cast<std::uint32_t>(std::ceil(bottom) - std::floor(top))};
         }
         vkCmdSetScissor(command, 0, 1, &scissor);
-        vkCmdBindVertexBuffers(command, 0, 1, &buffer.buffer, &offset);
+        vkCmdBindVertexBuffers(command, 0, 1, &buffer.buffer, &vertexOffset);
         PushConstants push{{static_cast<float>(extent.width), static_cast<float>(extent.height),
                             retained ? batch.scale : 1.0f, retained ? batch.scale : 1.0f},
                             {retained ? batch.translation.x : 0.0f,
@@ -2476,12 +2552,11 @@ struct VulkanRenderer::Impl {
       vkDeviceWaitIdle(device);
     if (device) {
       destroyBuffer(readback);
-      for (auto& retained : retainedTexts)
-        destroyBuffer(retained.instances);
       retainedTexts.clear();
-      for (auto& retained : retainedDrawLists)
-        destroyBuffer(retained.instances);
       retainedDrawLists.clear();
+      retainedFreeRanges.clear();
+      retainedArenaUsed = 0;
+      destroyBuffer(retainedArena);
       for (auto& frame : frames) {
         destroyBuffer(frame.instances);
         destroyBuffer(frame.primitiveInstances);
