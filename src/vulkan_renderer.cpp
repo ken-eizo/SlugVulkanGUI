@@ -496,7 +496,6 @@ struct VulkanRenderer::Impl {
   };
   mutable std::unordered_map<GlyphRunKey, CachedGlyphRun, GlyphRunKeyHash> glyphRunCache{};
   mutable std::uint64_t glyphRunUseCounter = 0;
-  static constexpr std::size_t maximumCachedGlyphRuns = 512;
   std::uint32_t timestampValidBits = 0;
   std::uint64_t submittedFrameCount = 0;
   bool framePrepared = false;
@@ -1252,15 +1251,16 @@ struct VulkanRenderer::Impl {
         queueFamilies.graphics ? queueProperties[*queueFamilies.graphics].timestampValidBits : 0;
     const bool timestampsSupported = config.gpuTimingInterval > 0 && timestampValidBits > 0 &&
                                      deviceProperties.limits.timestampPeriod > 0.0f;
+    const std::size_t initialCapacity = std::max<std::size_t>(1, config.initialVertexCapacity);
     for (auto& frame : frames) {
       check(vkCreateSemaphore(device, &semaphore, nullptr, &frame.imageAvailable),
             "vkCreateSemaphore(acquire)");
       check(vkCreateFence(device, &fence, nullptr, &frame.fence), "vkCreateFence");
-      createBuffer(config.initialVertexCapacity * sizeof(Instance),
+      createBuffer(initialCapacity * sizeof(Instance),
                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                    frame.instances, true);
-      createBuffer(config.initialVertexCapacity * sizeof(PrimitiveInstance),
+      createBuffer(initialCapacity * sizeof(PrimitiveInstance),
                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                    frame.primitiveInstances, true);
@@ -1725,7 +1725,8 @@ struct VulkanRenderer::Impl {
       found->second.lastUsed = ++glyphRunUseCounter;
       return found->second;
     }
-    if (glyphRunCache.size() >= maximumCachedGlyphRuns) {
+    const std::size_t cacheCapacity = std::max<std::size_t>(1, config.glyphRunCacheCapacity);
+    if (glyphRunCache.size() >= cacheCapacity) {
       auto oldest = glyphRunCache.begin();
       for (auto it = std::next(glyphRunCache.begin()); it != glyphRunCache.end(); ++it)
         if (it->second.lastUsed < oldest->second.lastUsed) oldest = it;
@@ -1999,7 +2000,9 @@ struct VulkanRenderer::Impl {
 
   void growRetainedArena(VkDeviceSize requiredCapacity) {
     if (requiredCapacity <= retainedArena.size) return;
-    VkDeviceSize nextSize = retainedArena.size ? retainedArena.size * 2 : (256U << 10U);
+    VkDeviceSize nextSize = retainedArena.size
+      ? retainedArena.size * 2
+      : std::max<VkDeviceSize>(16, static_cast<VkDeviceSize>(config.retainedArenaInitialBytes));
     while (nextSize < requiredCapacity) nextSize *= 2;
     Buffer replacement{};
     createBuffer(nextSize,

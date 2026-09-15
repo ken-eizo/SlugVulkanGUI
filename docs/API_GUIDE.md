@@ -171,8 +171,9 @@ variable fontでは`weight`をFreeTypeの`wght` axisへ渡します。空のcode
 
 現在のlayoutは改行単位のcodepoint layoutです。Left/Center/Right、line height、letter spacing、indent、
 簡易bullet/number marker、weight/italic face選択、互換用synthetic bold、underline/strikethroughを扱います。`Justify` enumは将来用で、
-現時点では語間展開を行いません。UTF-8 caret/selectionと簡易選択表示はありますが、HarfBuzz shaping、
-bidi、IME composition、native candidate window、locale line breakは別のtext layout/editor層が必要です。
+現時点では語間展開を行いません。UTF-8 caret/selectionと簡易選択表示に加え、`InputWriter`経由のIME
+composition/selection/commit/cancel入力を保持できます。HarfBuzz shaping、bidi、native candidate window、
+locale line breakは別のtext layout/editorまたはplatform adapter層が必要です。
 
 ### 4種類のtext宣言
 
@@ -197,7 +198,8 @@ draw.setClip(viewport);
 draw.retainedText(document, pan, zoom);
 ```
 
-保持IDは作成元rendererの寿命内だけ有効で、個別削除・更新APIはまだありません。
+保持IDは作成元renderer/surfaceの寿命内だけ有効です。`updateRetainedText()` / `destroyRetainedText()`があり、
+同一内容は0-byte、部分変更はshared device-local arenaへのdirty range uploadだけを行います。
 `textRunsStatic`が参照する配列と各`TextRun::text`は`draw()`完了まで生存させます。
 
 ## Input
@@ -218,13 +220,14 @@ if (input.scroll().active)  { /* 最後のeventから120 ms以内 */ }
 if (input.scroll().ended)   { /* timeoutしたframe */ }
 ```
 
-keyboard codeは現在GLFW key codeです。Unicode文字入力は`textInput()`、物理key状態は`key(code)`を使い分けます。
+core UIの物理key状態にはplatform非依存`slugvk::Key`を使います。Unicode committed textは`textInput()`、
+IME未確定文字列は`composition()`で取得できます。GLFW backendはnative codeを`Key`へ変換します。
 raw mouse motionはplatformが対応する場合に`setRawMouseMotion(true)`でcursor captureと共に有効化します。
 
 外部hostは`InputWriter`で同じ`InputState`を作れます。frameにつき
 `beginFrame()` → host event変換 → `finishFrame(nowSeconds)`の順に呼びます。
-`cursor()`へ渡す座標はframebuffer pixelです。`focusLost()`は全down stateを解除するため、
-capture/focus喪失時に必ず呼びます。現行`UiContext`のkey codeはGLFW定数と同じ整数値を期待します。
+`cursor()`へ渡す座標はframebuffer pixelです。`composition()` / `commitComposition()` / `cancelComposition()`でIMEを渡し、
+`focusLost()`は全down stateとactive compositionを解除するためcapture/focus喪失時に必ず呼びます。
 
 ## 軽量layoutとtext edit
 
@@ -241,8 +244,9 @@ const auto cells = slugvk::gridColumns(body, columns, 8);
 ```
 
 `TextEditState`はUTF-8 codepoint境界を壊さず、caret/anchor、選択削除、insert、
-backspace/delete、left/right/home/endを扱います。grapheme cluster、IME composition、clipboard、
-undo stackは含みません。`UiContext::textField`はwidget IDごとにこの状態を保持し、Shift選択、
+backspace/delete、left/right/home/endを扱います。grapheme cluster、clipboard、undo stackは含みません。
+IME composition state自体は`InputState`にありますが、candidate UIと`TextEditState`へのpreedit表示統合は上位editor層です。
+`UiContext::textField`はwidget IDごとにこの状態を保持し、Shift選択、
 Ctrl/Cmd+A、caretと選択範囲を描画します。
 
 ## UiContext

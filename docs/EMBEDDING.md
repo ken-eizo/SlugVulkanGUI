@@ -13,14 +13,14 @@ After Effectsのdockable panelのように、外部applicationが所有するnat
 - `VulkanRenderer`: Vulkan instance、physical/logical device、queue、surface、swapchain、
   pipeline、atlas GPU resource、frame synchronization
 
-`VulkanRenderer(PlatformSurface&, ...)`は実装済みで、GLFWを使わない外部所有Viewも接続できます。
-ただし、`HWND`/`NSView`やAfter Effects等の具体adapterはこのrepositoryに含みません。また現時点では
-rendererごとにVulkan deviceを作り、device-level resourceとsurface-level resourceの共有分離も未実装です。
-後半は、実装済みの汎用契約と、残るadapter/device共有の計画を区別して記載します。
+`VulkanRenderer(PlatformSurface&, ...)`に加え、公開境界として`RenderDevice` / `RenderSurface`を実装済みです。
+Windowsでは`Win32PlatformSurface`が`HWND`を直接受け取るため、GLFWなしで外部所有Viewへ接続できます。
+macOSの`NSView/CAMetalLayer`やAfter Effects等のhost固有adapterは別層です。現時点の`RenderDevice`はatlas/configを
+共有する公開facadeで、各`RenderSurface`内部のVkDevice resource共有は今後の最適化余地として残しています。
 
 ## 分離するべき所有単位
 
-計画するbackend分割:
+現在の公開backend境界:
 
 ```text
 Application / plugin adapter
@@ -28,23 +28,23 @@ Application / plugin adapter
    v
 PlatformSurface contract
    |
-   +--> RenderDevice  (VkInstance/device/queue, pipeline, atlas textures)
+   +--> RenderDevice  (VectorAtlas/RendererConfig + surface factory boundary)
    |
    +--> RenderSurface (VkSurfaceKHR/swapchain, extent, per-image sync)
    |
    +--> UiContext     (panelごとのhover/focus/active/model)
 ```
 
-### `RenderDevice`（計画）
+### `RenderDevice`（実装済み公開境界）
 
-- Vulkan instance、physical device、logical device、queue
-- descriptor layout、pipeline cache、shader modules
-- atlas texturesとsampler
-- optional device-wide allocator
+- `VectorAtlas`への非所有参照と`RendererConfig`を保持
+- `PlatformSurface`またはGLFW `Window`から`RenderSurface`を生成
+- renderer実装詳細をapplication/plugin側から隠すstable ownership boundary
 
-同じGPU/atlasを使う複数panelで共有可能にします。共有しない単純構成も許可します。
+`RenderDevice`から複数`RenderSurface`を生成できます。現在は各surface内部の`VulkanRenderer`がVkInstance/VkDevice、
+pipeline、atlas GPU resourceを所有するため、device-level GPU resourceの物理共有はまだ行いません。
 
-### `RenderSurface`（計画）
+### `RenderSurface`（実装済み公開境界）
 
 - host native viewから作る`VkSurfaceKHR`
 - swapchain images/views/framebuffers
@@ -130,12 +130,13 @@ Host event callbacks -> InputWriter/backend queue -> immutable frame snapshot ->
 - Unicode committed text
 - focus gained/lost、capture lost
 
-capture lost時はdown/activeを必ずcancelし、panel外でbuttonが離されてもstuck dragを残しません。IME composition、
-selection、candidate window位置は簡易`textField`ではなく、host/native text serviceと接続する上位editor層の責務です。
+capture lost時はdown/activeを必ずcancelし、panel外でbuttonが離されてもstuck dragを残しません。`InputWriter`は
+composition text、selection range、commit/cancelをhost非依存`CompositionState`へ渡せます。candidate window位置や
+OS text-service連携そのものはhost/native adapter側の責務です。
 
-実装では`focusLost()`が全mouse/key down stateを解除します。`beginFrame()`、event投入、
+実装では`focusLost()`が全mouse/key down stateを解除し、active compositionもcancelします。`beginFrame()`、event投入、
 `finishFrame(nowSeconds)`をframe境界として使い、`cursor()`へはpanel-local framebuffer pixelを渡します。
-`UiContext`が読むkey codeは現在GLFW key code互換の整数です。
+core UIは`slugvk::Key`を使用し、GLFW callbackはnative key codeをこのstable enumへ変換します。
 
 低遅延dragでは、event queueを全部処理した後に最新pointer positionを一度sampleし、UI declaration直前にsnapshotへ
 反映します。古いmove eventを順番に描画する必要はなく、press/release順だけは失いません。
@@ -232,8 +233,9 @@ host SDKのversionごとにnative handle取得方法やthread制約が異なる�
 
 ### Phase 2: 外部surfaceとinput
 
-- 完了: backend専用`InputWriter`、focus loss、frame snapshot test
-- Win32 `HWND` adapterとhidden child-window smoke test
+- 完了: backend専用`InputWriter`、IME composition、focus loss、frame snapshot test
+- 完了: Win32 `HWND` adapter (`Win32PlatformSurface`)
+- 未完了: hidden child-windowを使った実機Win32 smoke test
 - macOS `NSView/CAMetalLayer` adapterとMoltenVK smoke test
 - 具体adapterでのcapture loss、HiDPI、live resize test
 

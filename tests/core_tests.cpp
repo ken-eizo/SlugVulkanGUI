@@ -177,6 +177,12 @@ int main() try {
           "cubic command preserves authored control points and width");
 
   VectorAtlas atlas;
+  const auto lowSpec = RendererConfig::lowSpec();
+  require(lowSpec.vsync && !lowSpec.enableContinuousCorners &&
+              lowSpec.initialVertexCapacity == (1U << 10U) &&
+              lowSpec.retainedArenaInitialBytes == (64U << 10U) &&
+              lowSpec.glyphRunCacheCapacity == 128,
+          "low-spec renderer profile reduces resident working sets");
   RenderDevice logicalDevice(atlas);
   require(&logicalDevice.atlas() == &atlas, "RenderDevice preserves atlas identity");
   static_assert(std::is_move_constructible_v<RenderSurface>);

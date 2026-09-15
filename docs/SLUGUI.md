@@ -220,6 +220,7 @@ compilerがbuild時に構文解析、型検査、stable element/callback ID生�
 - conditional/repeater、virtualized list、focus traversal、accessibility treeは未実装
 - structural tree mutationをcallback中に行う契約は未定義。property変更を使用する
 - style inheritance/theme/token tableは未実装
-- dirty subtree layoutは未実装。現在はproperty変更時にtree全体を再layout
+- geometry property変更時もresolved treeの再配置自体は行うが、measure cacheはproperty→element逆依存で
+  変更要素と祖先だけ無効化する。10,001要素stressでは単一width変更の実measureは2要素
 
 これらはIRの型を無制限に増やす前に、Exampleとunit testで必要性と性能を測って追加します。

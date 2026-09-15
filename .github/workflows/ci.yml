@@ -51,3 +51,46 @@ jobs:
           cmake -S . -B build-embedded -DVulkan_ROOT="$env:VULKAN_SDK" -DSLUGVK_ENABLE_GLFW=OFF -DSLUGVK_BUILD_TESTS=ON -DSLUGVK_BUILD_EXAMPLE=OFF
           cmake --build build-embedded --config Release --parallel
           ctest --test-dir build-embedded -C Release --output-on-failure
+
+  macos:
+    name: macOS Release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LunarG Vulkan SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/vulkan-sdk.zip"
+          source_dir="$RUNNER_TEMP/vulkan-sdk-download"
+          install_root="$RUNNER_TEMP/VulkanSDK"
+          curl -L --fail --retry 3 -o "$archive" "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/mac/vulkan_sdk.zip"
+          mkdir -p "$source_dir"
+          ditto -x -k "$archive" "$source_dir"
+          sdk_app="$(find "$source_dir" -maxdepth 3 -type d -name 'vulkansdk-macOS-*.app' -print -quit)"
+          if [[ -z "$sdk_app" ]]; then echo "Vulkan SDK installer app was not found"; exit 1; fi
+          sdk_binary="$sdk_app/Contents/MacOS/$(basename "$sdk_app" .app)"
+          "$sdk_binary" --root "$install_root" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core
+          glslc_path="$(find "$install_root" -type f -name glslc -print -quit)"
+          if [[ -z "$glslc_path" ]]; then echo "glslc was not installed"; exit 1; fi
+          vulkan_root="$(cd "$(dirname "$glslc_path")/.." && pwd)"
+          echo "VULKAN_SDK=$vulkan_root" >> "$GITHUB_ENV"
+          echo "$vulkan_root/bin" >> "$GITHUB_PATH"
+
+      - name: Build and test GLFW-free Universal configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-macos-ci -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" \
+            -DVulkan_ROOT="$VULKAN_SDK" -DSLUGVK_ENABLE_GLFW=OFF \
+            -DSLUGVK_BUILD_TESTS=ON -DSLUGVK_BUILD_EXAMPLE=OFF
+          cmake --build build-macos-ci --parallel
+          ctest --test-dir build-macos-ci --output-on-failure
+          "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build-macos-ci/generated/shaders/vector.vert.spv
+          "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build-macos-ci/generated/shaders/vector.frag.spv
+          "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build-macos-ci/generated/shaders/primitive.vert.spv
+          "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build-macos-ci/generated/shaders/primitive.frag.spv

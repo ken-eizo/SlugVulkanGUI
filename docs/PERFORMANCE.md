@@ -73,9 +73,9 @@ Windowsのhardware cursorは通常Vulkan contentと別経路でcompositor合成�
 - 内容/layoutは不変で、zoom/pan/clipだけが毎frame変わるdocument
 - 静的な大量background要素
 
-現在の専用保持APIはtextです。`createRetainedText()`は同期uploadを一度行うため、drag中ではなくscene準備時に
-呼びます。zoom/pan frameではglyph layout、dynamic instance upload、CPU glyph cullingがなくなり、48-byte
-push constantとscissorでtransformします。
+保持APIはtextとDrawListの両方にあります。`createRetainedText()` / `createRetainedDrawList()`はscene準備時に使い、
+`update*()`はshared device-local arena内のdirty rangeだけを転送します。同一内容の更新は0-byteです。
+zoom/pan frameでは保持geometryをGPU residentのままtransform/scissorだけ変更できます。
 
 `textStatic()`は文字列copyだけを省き、glyph layoutとinstance uploadは省きません。長文性能対策には
 `retainedText()`を使います。
@@ -92,11 +92,12 @@ buildしてはいけません。頻出候補を事前登録してIDを選ぶか�
 - rendererのCPU staging vectorもcapacityを保持する
 - mapped Vulkan instance bufferは初期capacityから不足時だけ2倍に増やす
 - dynamic instanceはhost-visible/coherent memoryへ1回`memcpy`し、staging submitは行わない
-- retained textだけは作成時にhost stagingからdevice-local bufferへ1回copyする
+- retained text/DrawListは共有device-local arenaへsuballocateし、更新時はdirty contiguous rangeだけcopyする
 - interactive frameにGPU→CPU readbackはない
 
 通常frameでbuffer拡張を起こさないよう、`RendererConfig::initialVertexCapacity`をgalleryや最大dynamic glyph数に
-合わせます。`stats().uploadedBytes`のpeakを観測し、少し余裕を持つ値にしてください。
+合わせます。低メモリ環境では`RendererConfig::lowSpec()`でdynamic capacity、retained arena、GlyphRun cacheを縮小し、
+continuous corner処理も簡略化できます。`stats().uploadedBytes`のpeakを観測し、必要なら個別値を上書きしてください。
 
 ## Textとclip
 

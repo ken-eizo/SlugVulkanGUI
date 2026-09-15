@@ -27,8 +27,25 @@ struct RendererConfig {
   bool enableContinuousCorners = true;
   // Number of quad instances preallocated per frame; buffers grow geometrically when needed.
   std::size_t initialVertexCapacity = 1U << 12U;
+  // Initial device-local retained arena size. It grows geometrically and suballocates resources.
+  std::size_t retainedArenaInitialBytes = 256U << 10U;
+  // Bounded resolved glyph-run cache. Smaller values trade CPU work for lower resident memory.
+  std::size_t glyphRunCacheCapacity = 512;
   // GPU timestamps add query commands. Zero disables them; otherwise sample every Nth submission.
   std::uint32_t gpuTimingInterval = 0;
+
+  // Conservative profile for low-memory / integrated-GPU hosts and battery-sensitive tools.
+  [[nodiscard]] static RendererConfig lowSpec() noexcept {
+    RendererConfig result;
+    result.vsync = true;
+    result.allowTearing = false;
+    result.enableContinuousCorners = false;
+    result.initialVertexCapacity = 1U << 10U;
+    result.retainedArenaInitialBytes = 64U << 10U;
+    result.glyphRunCacheCapacity = 128;
+    result.gpuTimingInterval = 0;
+    return result;
+  }
 };
 
 struct RendererStats {
