@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - perf/v1-foundation
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VULKAN_SDK_VERSION: 1.4.357.0
+
+jobs:
+  windows:
+    name: Windows Release + embedded
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LunarG Vulkan SDK
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path $env:RUNNER_TEMP "VulkanSDK"
+          $installer = Join-Path $env:RUNNER_TEMP "vulkan-sdk.exe"
+          curl.exe -L --fail --retry 3 --output $installer "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/vulkan_sdk.exe"
+          $process = Start-Process -FilePath $installer -ArgumentList '--root', $sdkRoot, '--accept-licenses', '--default-answer', '--confirm-command', 'install', 'copy_only=1' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Vulkan SDK installer failed: $($process.ExitCode)" }
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build and test standalone configuration
+        shell: pwsh
+        run: |
+          cmake -S . -B build-ci -DVulkan_ROOT="$env:VULKAN_SDK" -DSLUGVK_BUILD_TESTS=ON -DSLUGVK_BUILD_EXAMPLE=OFF
+          cmake --build build-ci --config Release --parallel
+          ctest --test-dir build-ci -C Release --output-on-failure
+          & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build-ci\generated\shaders\vector.vert.spv"
+          & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build-ci\generated\shaders\vector.frag.spv"
+          & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build-ci\generated\shaders\primitive.vert.spv"
+          & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build-ci\generated\shaders\primitive.frag.spv"
+
+      - name: Build and test GLFW-free embedded configuration
+        shell: pwsh
+        run: |
+          cmake -S . -B build-embedded -DVulkan_ROOT="$env:VULKAN_SDK" -DSLUGVK_ENABLE_GLFW=OFF -DSLUGVK_BUILD_TESTS=ON -DSLUGVK_BUILD_EXAMPLE=OFF
+          cmake --build build-embedded --config Release --parallel
+          ctest --test-dir build-embedded -C Release --output-on-failure

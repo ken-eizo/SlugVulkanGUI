@@ -285,6 +285,8 @@ struct RuntimeStats {
   std::uint32_t visibleElements = 0;
   std::uint32_t layoutPasses = 0;
   std::uint32_t callbacks = 0;
+  // Number of spatial-index candidates inspected by hit tests this frame.
+  std::uint32_t hitCandidates = 0;
 };
 
 class Runtime {

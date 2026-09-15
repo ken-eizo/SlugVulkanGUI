@@ -735,7 +735,7 @@ struct Runtime::Impl {
     return &resolved[found->second];
   }
 
-  [[nodiscard]] ElementId hit(Vec2 cursor) const {
+  [[nodiscard]] ElementId hit(Vec2 cursor) {
     const auto found = hitCells.find(hitCellKey(hitCellCoordinate(cursor.x),
                                                hitCellCoordinate(cursor.y)));
     const std::vector<std::size_t>* local = found == hitCells.end() ? nullptr : &found->second;
@@ -748,6 +748,7 @@ struct Runtime::Impl {
         const bool takeLocal = globalCount == 0 ||
           (localCount != 0 && localIndex > globalIndex);
         const auto index = takeLocal ? (*local)[--localCount] : hitGlobals[--globalCount];
+        ++stats.hitCandidates;
         const auto& entry = resolved[index];
         if (entry.box.overlay != overlayPass) continue;
         if (entry.box.bounds.contains(cursor) && entry.box.clip.contains(cursor)) {

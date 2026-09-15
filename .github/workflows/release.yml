@@ -43,6 +43,8 @@ jobs:
           ctest --test-dir build -C Release --output-on-failure
           & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build\generated\shaders\vector.vert.spv"
           & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build\generated\shaders\vector.frag.spv"
+          & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build\generated\shaders\primitive.vert.spv"
+          & "$env:VULKAN_SDK\Bin\spirv-val.exe" --target-env vulkan1.1 "build\generated\shaders\primitive.frag.spv"
 
       - name: Package single executable
         shell: pwsh
@@ -99,6 +101,8 @@ jobs:
           ctest --test-dir build --output-on-failure
           "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build/generated/shaders/vector.vert.spv
           "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build/generated/shaders/vector.frag.spv
+          "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build/generated/shaders/primitive.vert.spv
+          "$VULKAN_SDK/bin/spirv-val" --target-env vulkan1.1 build/generated/shaders/primitive.frag.spv
 
       - name: Bundle Vulkan Loader and MoltenVK
         shell: bash
