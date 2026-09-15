@@ -284,6 +284,8 @@ struct RuntimeStats {
   std::uint32_t elements = 0;
   std::uint32_t visibleElements = 0;
   std::uint32_t layoutPasses = 0;
+  // Number of real measure evaluations after persistent-cache hits are excluded.
+  std::uint32_t measureEvaluations = 0;
   std::uint32_t callbacks = 0;
   // Number of spatial-index candidates inspected by hit tests this frame.
   std::uint32_t hitCandidates = 0;

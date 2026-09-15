@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace slugvk::slugui {
 namespace {
@@ -334,76 +335,135 @@ struct Runtime::Impl {
   std::uint64_t layoutPropertyGeneration = 0;
   std::vector<PropertyId> layoutDependencies;
   std::vector<std::uint64_t> layoutObserved;
+  std::vector<std::size_t> changedLayoutDependencies;
+  std::unordered_map<PropertyId, std::vector<const Element*>> layoutDependents;
+  std::unordered_map<const Element*, const Element*> layoutParents;
+  std::unordered_set<const Element*> dirtyMeasureElements;
+  bool fullMeasureInvalidation = true;
+  const Component* treeDepthComponent = nullptr;
+  std::uint64_t treeDepthStructureGeneration = 0;
+  std::size_t cachedTreeDepth = 0;
 
   template <typename T>
-  static void addLayoutDependency(std::vector<PropertyId>& result,
-                                  const ValueSource<T>& source) {
-    if (const auto property = source.propertyId()) result.push_back(*property);
+  static void addLayoutDependency(
+      std::vector<PropertyId>& result, const ValueSource<T>& source,
+      const Element& element,
+      std::unordered_map<PropertyId, std::vector<const Element*>>& dependents) {
+    if (const auto property = source.propertyId()) {
+      result.push_back(*property);
+      dependents[*property].push_back(&element);
+    }
   }
 
-  static void collectLayoutDependencies(const Element& element,
-                                        std::vector<PropertyId>& result) {
-    addLayoutDependency(result, element.visible);
-    addLayoutDependency(result, element.interaction.enabled);
+  static void collectLayoutDependencies(
+      const Element& element, std::vector<PropertyId>& result,
+      std::unordered_map<PropertyId, std::vector<const Element*>>& dependents,
+      std::unordered_map<const Element*, const Element*>& parents,
+      const Element* parent = nullptr) {
+    parents[&element] = parent;
+    addLayoutDependency(result, element.visible, element, dependents);
+    addLayoutDependency(result, element.interaction.enabled, element, dependents);
     const auto& layout = element.layout;
-    addLayoutDependency(result, layout.x);
-    addLayoutDependency(result, layout.y);
-    addLayoutDependency(result, layout.width);
-    addLayoutDependency(result, layout.height);
-    addLayoutDependency(result, layout.minWidth);
-    addLayoutDependency(result, layout.minHeight);
-    addLayoutDependency(result, layout.maxWidth);
-    addLayoutDependency(result, layout.maxHeight);
-    addLayoutDependency(result, layout.preferredWidth);
-    addLayoutDependency(result, layout.preferredHeight);
-    addLayoutDependency(result, layout.grow);
-    addLayoutDependency(result, layout.padding.left);
-    addLayoutDependency(result, layout.padding.top);
-    addLayoutDependency(result, layout.padding.right);
-    addLayoutDependency(result, layout.padding.bottom);
-    addLayoutDependency(result, layout.spacing);
+    addLayoutDependency(result, layout.x, element, dependents);
+    addLayoutDependency(result, layout.y, element, dependents);
+    addLayoutDependency(result, layout.width, element, dependents);
+    addLayoutDependency(result, layout.height, element, dependents);
+    addLayoutDependency(result, layout.minWidth, element, dependents);
+    addLayoutDependency(result, layout.minHeight, element, dependents);
+    addLayoutDependency(result, layout.maxWidth, element, dependents);
+    addLayoutDependency(result, layout.maxHeight, element, dependents);
+    addLayoutDependency(result, layout.preferredWidth, element, dependents);
+    addLayoutDependency(result, layout.preferredHeight, element, dependents);
+    addLayoutDependency(result, layout.grow, element, dependents);
+    addLayoutDependency(result, layout.padding.left, element, dependents);
+    addLayoutDependency(result, layout.padding.top, element, dependents);
+    addLayoutDependency(result, layout.padding.right, element, dependents);
+    addLayoutDependency(result, layout.padding.bottom, element, dependents);
+    addLayoutDependency(result, layout.spacing, element, dependents);
     if (const auto* textVisual = std::get_if<TextVisual>(&element.visual))
-      addLayoutDependency(result, textVisual->text);
+      addLayoutDependency(result, textVisual->text, element, dependents);
     for (const auto& child : element.children)
-      collectLayoutDependencies(child, result);
+      collectLayoutDependencies(child, result, dependents, parents, &element);
   }
 
   static bool sameRect(Rect a, Rect b) noexcept {
     return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
   }
+  void markMeasureDirty(PropertyId property) {
+    const auto found = layoutDependents.find(property);
+    if (found == layoutDependents.end()) return;
+    for (const Element* element : found->second) {
+      while (element) {
+        const bool inserted = dirtyMeasureElements.insert(element).second;
+        const auto parent = layoutParents.find(element);
+        element = parent == layoutParents.end() ? nullptr : parent->second;
+        if (!inserted) break;
+      }
+    }
+  }
+
   [[nodiscard]] bool layoutCurrent(const Component& component, Rect viewport,
                                    float deviceScale) {
     const float normalizedScale = std::max(0.01f, deviceScale);
     if (layoutComponent != &component ||
         layoutStructureGeneration != component.layoutGeneration() ||
         !sameRect(layoutViewport, viewport) || layoutDeviceScale != normalizedScale ||
-        layoutDependencies.size() != layoutObserved.size()) return false;
+        layoutDependencies.size() != layoutObserved.size()) {
+      fullMeasureInvalidation = true;
+      changedLayoutDependencies.clear();
+      dirtyMeasureElements.clear();
+      return false;
+    }
     const auto& properties = component.properties();
     const auto generation = properties.generation();
     if (generation == layoutPropertyGeneration) return true;
+    changedLayoutDependencies.clear();
+    bool layoutChanged = false;
     for (std::size_t i = 0; i < layoutDependencies.size(); ++i) {
-      if (properties.revision(layoutDependencies[i]) != layoutObserved[i]) return false;
+      if (properties.revision(layoutDependencies[i]) == layoutObserved[i]) continue;
+      changedLayoutDependencies.push_back(i);
+      markMeasureDirty(layoutDependencies[i]);
+      layoutChanged = true;
+    }
+    if (layoutChanged) {
+      fullMeasureInvalidation = false;
+      return false;
     }
     layoutPropertyGeneration = generation;
     return true;
   }
 
   void rememberLayoutState(const Component& component, Rect viewport, float deviceScale) {
+    const bool rebuildDependencies = layoutComponent != &component ||
+      layoutStructureGeneration != component.layoutGeneration() || layoutDependencies.empty();
     layoutComponent = &component;
     layoutStructureGeneration = component.layoutGeneration();
     layoutViewport = viewport;
     layoutDeviceScale = std::max(0.01f, deviceScale);
-    layoutDependencies.clear();
-    collectLayoutDependencies(component.root(), layoutDependencies);
-    std::sort(layoutDependencies.begin(), layoutDependencies.end());
-    layoutDependencies.erase(std::unique(layoutDependencies.begin(), layoutDependencies.end()),
-                             layoutDependencies.end());
-    layoutObserved.clear();
-    layoutObserved.reserve(layoutDependencies.size());
     const auto& properties = component.properties();
+    if (rebuildDependencies) {
+      layoutDependencies.clear();
+      layoutDependents.clear();
+      layoutParents.clear();
+      collectLayoutDependencies(component.root(), layoutDependencies,
+                                layoutDependents, layoutParents);
+      std::sort(layoutDependencies.begin(), layoutDependencies.end());
+      layoutDependencies.erase(std::unique(layoutDependencies.begin(), layoutDependencies.end()),
+                               layoutDependencies.end());
+      layoutObserved.clear();
+      layoutObserved.reserve(layoutDependencies.size());
+      for (const auto property : layoutDependencies)
+        layoutObserved.push_back(properties.revision(property));
+    } else {
+      for (const auto index : changedLayoutDependencies) {
+        if (index < layoutObserved.size())
+          layoutObserved[index] = properties.revision(layoutDependencies[index]);
+      }
+    }
     layoutPropertyGeneration = properties.generation();
-    for (const auto property : layoutDependencies)
-      layoutObserved.push_back(properties.revision(property));
+    changedLayoutDependencies.clear();
+    dirtyMeasureElements.clear();
+    fullMeasureInvalidation = false;
   }
 
   [[nodiscard]] std::optional<float> length(const ValueSource<Length>& source,
@@ -485,6 +545,7 @@ struct Runtime::Impl {
     if (const auto cached = measureCache.find(key); cached != measureCache.end()) {
       return cached->second;
     }
+    ++stats.measureEvaluations;
     if (!element.visible.resolve(properties)) {
       measureCache.emplace(key, Measured{});
       return {};
@@ -707,15 +768,29 @@ struct Runtime::Impl {
   }
 
   void performLayout(Component& component, Rect viewport, float deviceScale) {
+    const std::size_t cacheLimit = std::max<std::size_t>(4096, resolved.size() * 8);
+    if (fullMeasureInvalidation || measureCache.size() > cacheLimit) {
+      measureCache.clear();
+    } else if (!dirtyMeasureElements.empty()) {
+      for (auto it = measureCache.begin(); it != measureCache.end();) {
+        if (dirtyMeasureElements.contains(it->first.element)) it = measureCache.erase(it);
+        else ++it;
+      }
+    }
     resolved.clear();
     publicBoxes.clear();
-    measureCache.clear();
     resolvedIndex.clear();
     scale = std::max(0.01f, deviceScale);
     const auto& readOnly = static_cast<const Component&>(component);
     const auto& root = readOnly.root();
     const auto& properties = readOnly.properties();
-    flowScratch.resize(treeDepth(root));
+    if (treeDepthComponent != &component ||
+        treeDepthStructureGeneration != component.layoutGeneration()) {
+      treeDepthComponent = &component;
+      treeDepthStructureGeneration = component.layoutGeneration();
+      cachedTreeDepth = treeDepth(root);
+    }
+    flowScratch.resize(cachedTreeDepth);
     auto rootSize = measure(root, properties, viewport.width, viewport.height);
     if (!length(root.layout.width, properties, viewport.width)) rootSize.width = viewport.width;
     if (!length(root.layout.height, properties, viewport.height)) rootSize.height = viewport.height;

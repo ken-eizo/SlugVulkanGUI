@@ -18,6 +18,9 @@ int main() try {
   constexpr std::uint32_t rows = 100;
   constexpr float stride = 20.0f;
 
+  sui::PropertyStore properties;
+  const auto hotWidth = properties.define<sui::Length>(
+    "stress-hot-width", sui::Length::physical(12.0f));
   auto root = sui::absolute(1, "stress-root");
   root.children.reserve(columns * rows);
   const Paint paint = Paint::solid(Color::fromRgb8(0x304050));
@@ -26,14 +29,16 @@ int main() try {
       auto cell = sui::roundedRectangle(2 + y * columns + x, paint);
       cell.layout.x = sui::Length::physical(x * stride);
       cell.layout.y = sui::Length::physical(y * stride);
-      cell.layout.width = sui::Length::physical(12.0f);
+      cell.layout.width = (x == 50 && y == 50)
+        ? sui::ValueSource<sui::Length>{hotWidth}
+        : sui::ValueSource<sui::Length>{sui::Length::physical(12.0f)};
       cell.layout.height = sui::Length::physical(12.0f);
       cell.interaction = {true, true, 0};
       root.add(std::move(cell));
     }
   }
 
-  sui::Component component(std::move(root));
+  sui::Component component(std::move(root), std::move(properties));
   sui::Runtime runtime;
   DrawList first;
   sui::FrameInput input;
@@ -48,10 +53,20 @@ int main() try {
   input.cursor = {1205.0f, 805.0f};
   const auto steady = runtime.render(component, input, stable, viewport);
   require(steady.layoutPasses == 0, "unchanged large UI must not relayout");
+  require(steady.measureEvaluations == 0,
+          "unchanged large UI must not remeasure any element");
   require(steady.hitCandidates < 256, "steady hit testing must stay spatially bounded");
 
+  component.properties().set(hotWidth, sui::Length::physical(18.0f));
+  DrawList changed;
+  const auto incremental = runtime.render(component, input, changed, viewport);
+  require(incremental.layoutPasses == 1, "geometry change must trigger one layout pass");
+  require(incremental.measureEvaluations <= 3,
+          "single geometry property must not remeasure the full 10k-element tree");
+
   std::cout << "SlugUI stress passed: elements=" << steady.elements
-            << " candidates=" << steady.hitCandidates << '\n';
+            << " candidates=" << steady.hitCandidates
+            << " incrementalMeasures=" << incremental.measureEvaluations << '\n';
   return 0;
 } catch (const std::exception& error) {
   std::cerr << "Stress failure: " << error.what() << '\n';
