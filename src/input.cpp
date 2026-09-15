@@ -60,6 +60,8 @@ void InputState::beginFrame() {
   scroll_.delta = {};
   scroll_.direction = ScrollDirection::None;
   textInput_.clear();
+  composition_.changedThisFrame = false;
+  composition_.committedThisFrame = false;
 }
 
 void InputState::finishFrame(double nowSeconds) {
@@ -131,6 +133,35 @@ void InputState::onCodepoint(std::uint32_t codepoint) {
     textInput_.push_back(static_cast<char32_t>(codepoint));
 }
 
+void InputState::onComposition(std::u32string_view text, std::size_t selectionStart,
+                               std::size_t selectionLength) {
+  composition_.text.assign(text);
+  composition_.selectionStart = std::min(selectionStart, composition_.text.size());
+  composition_.selectionLength = std::min(
+    selectionLength, composition_.text.size() - composition_.selectionStart);
+  composition_.active = !composition_.text.empty();
+  composition_.changedThisFrame = true;
+}
+
+void InputState::onCompositionCommit(std::u32string_view text) {
+  textInput_.append(text);
+  composition_.text.clear();
+  composition_.selectionStart = 0;
+  composition_.selectionLength = 0;
+  composition_.active = false;
+  composition_.changedThisFrame = true;
+  composition_.committedThisFrame = true;
+}
+
+void InputState::onCompositionCancel() {
+  if (!composition_.active && composition_.text.empty()) return;
+  composition_.text.clear();
+  composition_.selectionStart = 0;
+  composition_.selectionLength = 0;
+  composition_.active = false;
+  composition_.changedThisFrame = true;
+}
+
 void InputWriter::beginFrame() noexcept {
   state_.beginFrame();
 }
@@ -159,8 +190,22 @@ void InputWriter::codepoint(std::uint32_t value) noexcept {
   state_.onCodepoint(value);
 }
 
+void InputWriter::composition(std::u32string_view text, std::size_t selectionStart,
+                              std::size_t selectionLength) noexcept {
+  state_.onComposition(text, selectionStart, selectionLength);
+}
+
+void InputWriter::commitComposition(std::u32string_view text) noexcept {
+  state_.onCompositionCommit(text);
+}
+
+void InputWriter::cancelComposition() noexcept {
+  state_.onCompositionCancel();
+}
+
 void InputWriter::focusLost() noexcept {
   state_.focusLostThisFrame_ = true;
+  state_.onCompositionCancel();
   for (auto& state : state_.mouse_) {
     state.released = state.released || state.down;
     state.down = false;

@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace slugvk {
@@ -61,6 +62,15 @@ struct ScrollState {
   ScrollDirection direction = ScrollDirection::None;
 };
 
+struct CompositionState {
+  std::u32string text = {};
+  std::size_t selectionStart = 0;
+  std::size_t selectionLength = 0;
+  bool active = false;
+  bool changedThisFrame = false;
+  bool committedThisFrame = false;
+};
+
 class InputState {
 public:
   static constexpr int keyCount = 512;
@@ -88,6 +98,9 @@ public:
   [[nodiscard]] const std::u32string& textInput() const {
     return textInput_;
   }
+  [[nodiscard]] const CompositionState& composition() const {
+    return composition_;
+  }
   [[nodiscard]] bool focusLostThisFrame() const {
     return focusLostThisFrame_;
   }
@@ -103,6 +116,10 @@ private:
   void onKey(int key, int action);
   void onScroll(double x, double y, double nowSeconds);
   void onCodepoint(std::uint32_t codepoint);
+  void onComposition(std::u32string_view text, std::size_t selectionStart,
+                     std::size_t selectionLength);
+  void onCompositionCommit(std::u32string_view text);
+  void onCompositionCancel();
 
   std::array<ButtonState, static_cast<std::size_t>(MouseButton::Count)> mouse_{};
   std::array<ButtonState, keyCount> keys_{};
@@ -113,6 +130,7 @@ private:
   std::vector<Vec2> rawDeltaSamples_{};
   ScrollState scroll_{};
   std::u32string textInput_{};
+  CompositionState composition_{};
   double lastScrollTime_ = -1.0;
   bool focusLostThisFrame_ = false;
 };
@@ -133,6 +151,10 @@ public:
   }
   void scroll(Vec2 delta, double nowSeconds) noexcept;
   void codepoint(std::uint32_t value) noexcept;
+  void composition(std::u32string_view text, std::size_t selectionStart = 0,
+                   std::size_t selectionLength = 0) noexcept;
+  void commitComposition(std::u32string_view text) noexcept;
+  void cancelComposition() noexcept;
   void focusLost() noexcept;
 
 private:

@@ -72,7 +72,25 @@ int main() try {
   require(input.key(16).released && !input.key(16).down,
           "duplicate modifier samples preserve the release edge");
 
+  inputWriter.composition(U"\u304b\u306a", 1, 1);
+  require(input.composition().active && input.composition().text == U"\u304b\u306a" &&
+              input.composition().selectionStart == 1 && input.composition().selectionLength == 1,
+          "IME composition state is exposed through the platform-independent input API");
+  inputWriter.beginFrame();
+  require(input.composition().active && !input.composition().changedThisFrame,
+          "IME composition persists across frames without creating synthetic changes");
+  inputWriter.commitComposition(U"\u78ba\u5b9a");
+  require(!input.composition().active && input.composition().committedThisFrame &&
+              input.textInput() == U"\u78ba\u5b9a",
+          "IME commit feeds committed codepoints into normal text input");
+  inputWriter.beginFrame();
+  inputWriter.composition(U"\u5019\u88dc", 0, 2);
+  inputWriter.focusLost();
+  require(!input.composition().active && input.composition().changedThisFrame,
+          "focus loss cancels active IME composition");
+
   const Paint sharedShader =
+
       Paint::shader(Color::fromRgb8(0x10e0b0), Color::fromRgb8(0x8040ff), 0.75f);
   require(sharedShader.kind == GradientKind::Shader &&
               std::abs(sharedShader.shaderParameter - 0.75f) < 0.0001f,
