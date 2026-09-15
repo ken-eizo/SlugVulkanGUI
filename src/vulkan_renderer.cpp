@@ -2199,21 +2199,42 @@ struct VulkanRenderer::Impl {
     return static_cast<std::size_t>(stagingBytes);
   }
 
-  RetainedTextId createRetainedText(std::string_view utf8, Rect layoutBounds, TextStyle style) {
-    if (utf8.empty() || style.size <= 0.0f || layoutBounds.width <= 0.0f)
-      return 0;
-    std::vector<Instance> instances;
+  void buildRetainedTextInstances(std::string_view utf8, Rect layoutBounds, TextStyle style,
+                                  std::vector<Instance>& instances) const {
+    instances.clear();
+    if (utf8.empty() || style.size <= 0.0f || layoutBounds.width <= 0.0f) return;
     TextCommand command{{}, utf8, {}, layoutBounds,
                         {-10000000.0f, -10000000.0f, 20000000.0f, 20000000.0f},
                         std::move(style)};
     appendText(instances, command);
-    if (instances.empty())
-      return 0;
+  }
 
+  RetainedTextId createRetainedText(std::string_view utf8, Rect layoutBounds, TextStyle style) {
+    std::vector<Instance> instances;
+    buildRetainedTextInstances(utf8, layoutBounds, std::move(style), instances);
+    if (instances.empty()) return 0;
     RetainedGeometry retained;
     uploadRetainedGeometry(retained, instances);
     retainedTexts.push_back(std::move(retained));
     return static_cast<RetainedTextId>(retainedTexts.size());
+  }
+
+  std::size_t updateRetainedText(RetainedTextId id, std::string_view utf8,
+                                 Rect layoutBounds, TextStyle style) {
+    if (id == 0 || id > retainedTexts.size())
+      throw std::out_of_range("Invalid retained text id");
+    std::vector<Instance> instances;
+    buildRetainedTextInstances(utf8, layoutBounds, std::move(style), instances);
+    return uploadRetainedGeometry(retainedTexts[id - 1U], instances);
+  }
+
+  void destroyRetainedText(RetainedTextId id) {
+    if (id == 0 || id > retainedTexts.size())
+      throw std::out_of_range("Invalid retained text id");
+    auto& retained = retainedTexts[id - 1U];
+    if (retained.capacity == 0 && retained.instanceCount == 0) return;
+    check(vkQueueWaitIdle(graphicsQueue), "vkQueueWaitIdle(destroy retained text)");
+    releaseRetainedGeometry(retained);
   }
 
   RetainedDrawListId createRetainedDrawList(const DrawList& list) {
@@ -2666,6 +2687,13 @@ void VulkanRenderer::prepareFrame() {
 RetainedTextId VulkanRenderer::createRetainedText(std::string_view utf8, Rect layoutBounds,
                                                   TextStyle style) {
   return impl_->createRetainedText(utf8, layoutBounds, std::move(style));
+}
+std::size_t VulkanRenderer::updateRetainedText(RetainedTextId text, std::string_view utf8,
+                                               Rect layoutBounds, TextStyle style) {
+  return impl_->updateRetainedText(text, utf8, layoutBounds, std::move(style));
+}
+void VulkanRenderer::destroyRetainedText(RetainedTextId text) {
+  impl_->destroyRetainedText(text);
 }
 RetainedDrawListId VulkanRenderer::createRetainedDrawList(const DrawList& list) {
   return impl_->createRetainedDrawList(list);

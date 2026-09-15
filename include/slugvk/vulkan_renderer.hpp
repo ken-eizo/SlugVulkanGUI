@@ -65,6 +65,11 @@ public:
   // Resolves and uploads an immutable document once. The returned resource remains valid for
   // this renderer's lifetime and can be transformed cheaply with DrawList::retainedText().
   RetainedTextId createRetainedText(std::string_view utf8, Rect layoutBounds, TextStyle style);
+  // Re-shapes text and sparsely updates the existing retained arena range when possible.
+  std::size_t updateRetainedText(RetainedTextId text, std::string_view utf8,
+                                 Rect layoutBounds, TextStyle style);
+  // Releases retained text storage. IDs remain stable and are not recycled.
+  void destroyRetainedText(RetainedTextId text);
   // Retains an arbitrary static DrawList in device-local memory. Retained commands may be
   // transformed, clipped and faded every frame without rebuilding their instances.
   RetainedDrawListId createRetainedDrawList(const DrawList& list);
