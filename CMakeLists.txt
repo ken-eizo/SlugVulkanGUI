@@ -103,6 +103,7 @@ set(SLUGVK_SOURCES
   src/animation.cpp
   src/draw_list.cpp
   src/input.cpp
+  src/render_device.cpp
   src/slugui.cpp
   src/ui.cpp
   src/vector_atlas.cpp
@@ -112,6 +113,9 @@ set(SLUGVK_SOURCES
 if(SLUGVK_ENABLE_GLFW)
   list(APPEND SLUGVK_SOURCES src/window.cpp)
 endif()
+if(WIN32)
+  list(APPEND SLUGVK_SOURCES src/win32_surface.cpp)
+endif()
 add_library(slugvk STATIC ${SLUGVK_SOURCES})
 add_library(SlugVulkan::slugvk ALIAS slugvk)
 add_dependencies(slugvk slugvk_shaders)
@@ -120,6 +124,9 @@ target_include_directories(slugvk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
 target_link_libraries(slugvk PUBLIC slughorn Vulkan::Vulkan)
 if(SLUGVK_ENABLE_GLFW)
   target_link_libraries(slugvk PRIVATE glfw)
+endif()
+if(WIN32)
+  target_link_libraries(slugvk PRIVATE user32)
 endif()
 target_compile_definitions(slugvk PUBLIC SLUGVK_ENABLE_GLFW=$<BOOL:${SLUGVK_ENABLE_GLFW}>)
 target_compile_definitions(slugvk PRIVATE

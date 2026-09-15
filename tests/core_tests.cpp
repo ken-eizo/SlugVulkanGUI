@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <type_traits>
 
 namespace {
 void require(bool condition, const char* message) {
@@ -176,6 +177,12 @@ int main() try {
           "cubic command preserves authored control points and width");
 
   VectorAtlas atlas;
+  RenderDevice logicalDevice(atlas);
+  require(&logicalDevice.atlas() == &atlas, "RenderDevice preserves atlas identity");
+  static_assert(std::is_move_constructible_v<RenderSurface>);
+#if defined(_WIN32)
+  static_assert(std::is_base_of_v<PlatformSurface, Win32PlatformSurface>);
+#endif
   const ShapeId rectangle = atlas.addPath(Path{}.rect(0, 0, 100, 40));
   const ShapeId rounded = atlas.addPath(Path{}.roundedRect(0, 0, 100, 40, 8, 100));
   StrokeStyle dashed;
