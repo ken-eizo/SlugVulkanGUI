@@ -331,6 +331,7 @@ struct Runtime::Impl {
   std::uint64_t layoutStructureGeneration = 0;
   Rect layoutViewport = {};
   float layoutDeviceScale = 0.0f;
+  std::uint64_t layoutPropertyGeneration = 0;
   std::vector<PropertyId> layoutDependencies;
   std::vector<std::uint64_t> layoutObserved;
 
@@ -371,16 +372,19 @@ struct Runtime::Impl {
     return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
   }
   [[nodiscard]] bool layoutCurrent(const Component& component, Rect viewport,
-                                   float deviceScale) const {
+                                   float deviceScale) {
     const float normalizedScale = std::max(0.01f, deviceScale);
     if (layoutComponent != &component ||
         layoutStructureGeneration != component.layoutGeneration() ||
         !sameRect(layoutViewport, viewport) || layoutDeviceScale != normalizedScale ||
         layoutDependencies.size() != layoutObserved.size()) return false;
     const auto& properties = component.properties();
+    const auto generation = properties.generation();
+    if (generation == layoutPropertyGeneration) return true;
     for (std::size_t i = 0; i < layoutDependencies.size(); ++i) {
       if (properties.revision(layoutDependencies[i]) != layoutObserved[i]) return false;
     }
+    layoutPropertyGeneration = generation;
     return true;
   }
 
@@ -397,6 +401,7 @@ struct Runtime::Impl {
     layoutObserved.clear();
     layoutObserved.reserve(layoutDependencies.size());
     const auto& properties = component.properties();
+    layoutPropertyGeneration = properties.generation();
     for (const auto property : layoutDependencies)
       layoutObserved.push_back(properties.revision(property));
   }
