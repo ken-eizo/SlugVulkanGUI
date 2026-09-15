@@ -25,6 +25,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace slugvk {
@@ -451,6 +452,25 @@ struct VulkanRenderer::Impl {
   std::array<Frame, framesInFlight> frames{};
   std::size_t currentFrame = 0;
   RenderIR frameIR{};
+  struct GlyphRunKey {
+    std::string text;
+    std::string fontName;
+    std::uint16_t weight = 400;
+    bool italic = false;
+    bool operator==(const GlyphRunKey&) const = default;
+  };
+  struct GlyphRunKeyHash {
+    std::size_t operator()(const GlyphRunKey& key) const noexcept {
+      std::size_t hash = std::hash<std::string>{}(key.text);
+      const auto combine = [&hash](std::size_t value) {
+        hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+      };
+      combine(std::hash<std::string>{}(key.fontName));
+      combine(key.weight);
+      combine(key.italic ? 1U : 0U);
+      return hash;
+    }
+  };
   struct RetainedGeometry {
     VkDeviceSize offset = 0;
     VkDeviceSize capacity = 0;
@@ -466,6 +486,17 @@ struct VulkanRenderer::Impl {
   std::vector<FreeRange> retainedFreeRanges{};
   std::vector<RetainedGeometry> retainedTexts{};
   std::vector<RetainedGeometry> retainedDrawLists{};
+  struct CachedGlyph {
+    bool present = false;
+    slughorn::Atlas::Shape shape{};
+  };
+  struct CachedGlyphRun {
+    std::vector<CachedGlyph> glyphs{};
+    std::uint64_t lastUsed = 0;
+  };
+  mutable std::unordered_map<GlyphRunKey, CachedGlyphRun, GlyphRunKeyHash> glyphRunCache{};
+  mutable std::uint64_t glyphRunUseCounter = 0;
+  static constexpr std::size_t maximumCachedGlyphRuns = 512;
   std::uint32_t timestampValidBits = 0;
   std::uint64_t submittedFrameCount = 0;
   bool framePrepared = false;
@@ -1688,12 +1719,37 @@ struct VulkanRenderer::Impl {
     quad.strokeWidths[0] = command.sweepRadians;
   }
 
-  float textWidth(const std::vector<std::uint32_t>& codepoints, const TextStyle& style) const {
+  const CachedGlyphRun& glyphRun(std::string_view text, const TextStyle& style) const {
+    GlyphRunKey key{std::string(text), style.fontName, style.weight, style.italic};
+    if (auto found = glyphRunCache.find(key); found != glyphRunCache.end()) {
+      found->second.lastUsed = ++glyphRunUseCounter;
+      return found->second;
+    }
+    if (glyphRunCache.size() >= maximumCachedGlyphRuns) {
+      auto oldest = glyphRunCache.begin();
+      for (auto it = std::next(glyphRunCache.begin()); it != glyphRunCache.end(); ++it)
+        if (it->second.lastUsed < oldest->second.lastUsed) oldest = it;
+      glyphRunCache.erase(oldest);
+    }
+    CachedGlyphRun run;
+    const auto codepoints = decodeUtf8(text);
+    run.glyphs.reserve(codepoints.size());
+    for (const auto codepoint : codepoints) {
+      const ShapeId glyphId = vectorAtlas.glyph(
+        codepoint, style.fontName, style.weight, style.italic);
+      const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
+      if (glyph) run.glyphs.push_back({true, *glyph});
+      else run.glyphs.push_back({});
+    }
+    run.lastUsed = ++glyphRunUseCounter;
+    return glyphRunCache.emplace(std::move(key), std::move(run)).first->second;
+  }
+
+  float textWidth(const CachedGlyphRun& run, const TextStyle& style) const {
     float width = 0.0f;
-    for (auto codepoint : codepoints) {
-      const auto glyph = vectorAtlas.native().getShape(slughorn::Key(
-        vectorAtlas.glyph(codepoint, style.fontName, style.weight, style.italic)));
-      width += (glyph ? static_cast<float>(glyph->advance) : 0.6f) * style.size + style.letterSpacing;
+    for (const auto& cached : run.glyphs) {
+      const float advance = cached.present ? static_cast<float>(cached.shape.advance) : 0.6f;
+      width += advance * style.size + style.letterSpacing;
     }
     return std::max(0.0f, width - style.letterSpacing);
   }
@@ -1702,7 +1758,7 @@ struct VulkanRenderer::Impl {
     auto scaled = style;
     scaled.size *= scale;
     scaled.letterSpacing *= scale;
-    return textWidth(decodeUtf8(text), scaled);
+    return textWidth(glyphRun(text, style), scaled);
   }
 
   void appendRichText(std::vector<Instance>& instances, const TextCommand& command) const {
@@ -1793,28 +1849,27 @@ struct VulkanRenderer::Impl {
           const float fragmentWidth = textWidth(fragment.text, authored, runScale);
           const float slant = authored.italic &&
             !vectorAtlas.hasFontFace(authored.fontName, true) ? 0.18f : 0.0f;
-          for (const auto codepoint : decodeUtf8(fragment.text)) {
-            const ShapeId glyphId = vectorAtlas.glyph(
-              codepoint, authored.fontName, authored.weight, authored.italic);
-            const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
-            if (!glyph) {
+          const auto& resolvedRun = glyphRun(fragment.text, authored);
+          for (const auto& cached : resolvedRun.glyphs) {
+            if (!cached.present) {
               x += size * 0.6f + spacing;
               continue;
             }
-            const float advance = static_cast<float>(glyph->advance) * size;
-            if (glyph->width > 0 && glyph->height > 0) {
+            const auto& glyph = cached.shape;
+            const float advance = static_cast<float>(glyph.advance) * size;
+            if (glyph.width > 0 && glyph.height > 0) {
               Rect destination{
-                x + static_cast<float>(glyph->bearingX) * size,
-                baseline - static_cast<float>(glyph->bearingY) * size,
-                static_cast<float>(glyph->width) * size,
-                static_cast<float>(glyph->height) * size,
+                x + static_cast<float>(glyph.bearingX) * size,
+                baseline - static_cast<float>(glyph.bearingY) * size,
+                static_cast<float>(glyph.width) * size,
+                static_cast<float>(glyph.height) * size,
               };
               appendResolvedShape(
-                instances, *glyph, destination, authored.paint, command.clip, slant);
+                instances, glyph, destination, authored.paint, command.clip, slant);
               if (authored.bold) {
                 destination.x += std::max(0.55f, size * 0.035f);
                 appendResolvedShape(
-                  instances, *glyph, destination, authored.paint, command.clip, slant);
+                  instances, glyph, destination, authored.paint, command.clip, slant);
               }
             }
             x += advance + spacing;
@@ -1885,10 +1940,10 @@ struct VulkanRenderer::Impl {
         ++lineNumber;
         continue;
       }
-      const auto codepoints = decodeUtf8(line);
+      const auto& resolvedRun = glyphRun(line, command.style);
       const bool needsWidth = command.style.align != HorizontalAlign::Left ||
                               command.style.underline || command.style.strikethrough;
-      const float width = needsWidth ? textWidth(codepoints, command.style) : 0.0f;
+      const float width = needsWidth ? textWidth(resolvedRun, command.style) : 0.0f;
       const float indent = lineNumber == 0 ? std::max(command.style.indent, 0.0f) : 0.0f;
       const float availableWidth = std::max(0.0f, command.bounds.width - indent);
       float x = command.bounds.x + indent;
@@ -1896,25 +1951,23 @@ struct VulkanRenderer::Impl {
       else if (command.style.align == HorizontalAlign::Right) x += availableWidth - width;
       const float baseline = top + command.style.size;
       const float lineX = x;
-      for (auto codepoint : codepoints) {
-        const ShapeId glyphId = vectorAtlas.glyph(
-          codepoint, command.style.fontName, command.style.weight, command.style.italic);
-        const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
-        if (!glyph) {
+      for (const auto& cached : resolvedRun.glyphs) {
+        if (!cached.present) {
           x += command.style.size * 0.6f + command.style.letterSpacing;
           continue;
         }
-        const float advance = static_cast<float>(glyph->advance) * command.style.size;
-        if (glyph->width > 0 && glyph->height > 0) {
-          Rect destination{x + static_cast<float>(glyph->bearingX) * command.style.size,
-                           baseline - static_cast<float>(glyph->bearingY) * command.style.size,
-                           static_cast<float>(glyph->width) * command.style.size,
-                           static_cast<float>(glyph->height) * command.style.size};
-          appendResolvedShape(instances, *glyph, destination, command.style.paint, command.clip,
+        const auto& glyph = cached.shape;
+        const float advance = static_cast<float>(glyph.advance) * command.style.size;
+        if (glyph.width > 0 && glyph.height > 0) {
+          Rect destination{x + static_cast<float>(glyph.bearingX) * command.style.size,
+                           baseline - static_cast<float>(glyph.bearingY) * command.style.size,
+                           static_cast<float>(glyph.width) * command.style.size,
+                           static_cast<float>(glyph.height) * command.style.size};
+          appendResolvedShape(instances, glyph, destination, command.style.paint, command.clip,
                               slant);
           if (command.style.bold) {
             destination.x += std::max(0.55f, command.style.size * 0.035f);
-            appendResolvedShape(instances, *glyph, destination, command.style.paint, command.clip,
+            appendResolvedShape(instances, glyph, destination, command.style.paint, command.clip,
                                 slant);
           }
         }
