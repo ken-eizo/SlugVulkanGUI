@@ -129,7 +129,8 @@ struct Insets {
 
 enum class LayoutKind : std::uint8_t { Absolute, Row, Column, Stack };
 enum class Alignment : std::uint8_t { Start, Center, End, Stretch };
-enum class Justify : std::uint8_t { Start, Center, End, SpaceBetween };
+enum class Constraint : std::uint8_t { Min, Center, Max, Stretch, Scale };
+enum class Justify : std::uint8_t { Start, Center, End, SpaceBetween, SpaceAround, SpaceEvenly };
 
 struct LayoutSpec {
   LayoutKind kind = LayoutKind::Absolute;
@@ -144,15 +145,33 @@ struct LayoutSpec {
   ValueSource<Length> preferredWidth = Length::autoSize();
   ValueSource<Length> preferredHeight = Length::autoSize();
   ValueSource<float> grow = 0.0f;
+  // Figma constraints/anchors for manually positioned children. They are evaluated against
+  // the parent's authored frame size, then mapped into the current resolved size.
+  Constraint horizontalConstraint = Constraint::Min;
+  Constraint verticalConstraint = Constraint::Min;
+  // Excludes this child from a Row/Column parent's flow. Figma's x/y for ABSOLUTE children
+  // are frame-local (before auto-layout padding), not content-box-local.
+  bool absolutePositioned = false;
+  // Figma auto-layout can reverse canvas stacking without changing flow order.
+  bool reverseChildPaintOrder = false;
   Insets padding = {};
   ValueSource<Length> spacing = Length::logical(0.0f);
+  // Figma Auto Layout v5 wrapping: spacing is the primary-axis gap, while
+  // counterSpacing is the gap between wrapped tracks.
+  bool wrap = false;
+  ValueSource<Length> counterSpacing = Length::logical(0.0f);
   Alignment crossAlignment = Alignment::Stretch;
   std::optional<Alignment> alignSelf = {};
   Justify mainAlignment = Justify::Start;
+  Justify counterAlignment = Justify::Start;
 };
 
 enum class ImportFidelity : std::uint8_t {
   Native, Approximated, BakedVector, BakedRaster, Unsupported
+};
+
+enum class FigmaSemanticKind : std::uint8_t {
+  None, ComponentSet, Component, Instance, Slot
 };
 
 struct SourceMetadata {
@@ -160,6 +179,26 @@ struct SourceMetadata {
   std::string documentId;
   std::string nodeId;
   std::string nodeName;
+  std::string providerData;
+  // Typed Figma semantics mirrored from providerData so runtime/tools do not need to parse JSON
+  // just to understand component/variant/instance relationships.
+  std::string nodeType;
+  std::string parentNodeId;
+  std::string componentKey;
+  std::string componentSetId;
+  std::string mainComponentId;
+  FigmaSemanticKind figmaKind = FigmaSemanticKind::None;
+  std::string variantPropertiesJson;
+  // Current VARIANT values on an Instance, derived from modern componentProperties.
+  std::string variantSelectionJson;
+  std::string componentPropertiesJson;
+  std::string componentDefinitionsJson;
+  std::string componentPropertyReferencesJson;
+  std::string overridesJson;
+  std::string exposedInstanceIdsJson;
+  std::string imageFillsJson;
+  float instanceScaleFactor = 1.0f;
+  bool exposedInstance = false;
   ImportFidelity fidelity = ImportFidelity::Native;
 };
 
@@ -176,11 +215,21 @@ struct StrokeVisual {
   std::optional<ValueSource<BorderWidths>> individualWidths = {};
   StrokeAlign align = StrokeAlign::Center;
 };
+enum class ImageScaleMode : std::uint8_t { Fill, Fit, Crop, Tile };
+
+struct ImagePlaceholderSpec {
+  bool enabled = false;
+  float sourceWidth = 0.0f;
+  float sourceHeight = 0.0f;
+  ImageScaleMode scaleMode = ImageScaleMode::Fill;
+};
+
 struct RoundedRectangleVisual {
   StatefulPaint paint = {};
   ValueSource<CornerRadii> radii = CornerRadii{};
   ValueSource<CornerSmoothing> smoothing = CornerSmoothing{};
   StrokeVisual stroke = {};
+  ImagePlaceholderSpec image = {};
 };
 struct ShapeVisual {
   ShapeId shape = 0;

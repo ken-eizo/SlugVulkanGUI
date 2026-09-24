@@ -35,6 +35,25 @@ absolute/relative双方で読み、arcはcubicへ変換します。`viewBoxHeigh
 `addPath()`と`addStroke()`の戻り値`0`は登録失敗です。`build()`後のshape/font追加は
 `std::logic_error`になります。
 
+`addPath(path, FillRule::EvenOdd)`は輪郭を書き換えず、authored fill ruleをatlas metadataとして保持します。
+Vulkan rendererはEric Lengyelのreference shaderと同じE flag (`0x1000`) をglyph metadataへpackし、
+Bezier winding coverageの最終段でeven-oddを評価します。`NonZero`が既定です。
+
+```cpp
+slugvk::Path compound;
+compound.rect(0, 0, 100, 100).rect(25, 25, 50, 50);
+const auto hole = atlas.addPath(compound, slugvk::FillRule::EvenOdd);
+```
+
+### Slug reference rendering contract
+
+`external/Slug`のEric Lengyel reference shadersを、Slug-compatible rendering pathの規範実装として扱います。
+Slug shape/glyphでは元quadratic Bezierをband atlasから直接coverage評価し、固定AA paddingやcoverageの
+二値thresholdへ置き換えません。境界拡張はhalf-pixel dynamic dilation、sample座標補正はinverse
+Jacobianというreference modelを基準にします。現在の通常UI pathはorthographic/axis-aligned transformに
+対する等価な簡約を使い、将来のrotate/skew/perspective対応ではper-vertex outward normalとinverse
+JacobianをそのままGPU vertex dataへ昇格させます。
+
 ### Strokeの既定値と明示override
 
 通常は`StrokeStyle::cap`だけ指定すれば、pathと全dashの両端へ同じcapを使います。必要な場合だけ
@@ -103,6 +122,35 @@ panelより前面にできます。`clear()`はcommandsとoverlay modeをreset�
 `cubicBezier()`はatlas shapeと異なり、4点をframebuffer座標のまま保持します。rendererがframe構築時に
 screen-space誤差に応じて分割し、各区間を解析的AA strokeとしてGPUへ送ります。control pointが毎frame変わる
 editor handle等に向きます。静的curveは`Path::cubicTo()`をatlasへ一度登録する方がCPU処理を省けます。
+
+### VulkanInterop（advanced / opt-in）
+
+通常のUI描画では不要です。既存Vulkan compute/transferとzero-copy連携する場合だけ
+`#include <slugvk/vulkan_interop.hpp>`を追加し、`renderer.vulkanInterop()`から取得します。
+
+```cpp
+slugvk::VulkanInterop& interop = renderer.vulkanInterop();
+const auto device = interop.deviceContext();
+const auto image = interop.registerRgba32fBuffer(buffer, offset, byteRange);
+draw.externalImage(image, bounds, width, height);
+```
+
+外部bufferは`deviceContext().device`から作成した`VkBuffer`でなければなりません。pixel storageは
+float32のA,R,G,Bをpixelごとに4word、隙間なく並べます。bufferの所有権はcallerに残り、登録中は
+有効に保ちます。`unregisterExternalImage()`は現在安全性優先でdevice idleを待ってdescriptorを破棄します。
+
+CPU snapshot用途にはrenderer所有bufferも利用できます。
+
+```cpp
+const auto image = interop.createOwnedRgba32fImage(width, height);
+interop.updateOwnedRgba32fImage(image, argbWords);
+draw.externalImage(image, bounds, width, height);
+```
+
+`setFrameRecorder()`はSlugVulkanの同じcommand bufferへ、UI render pass直前のVulkan commandを記録する
+高度なhookです。callback内でsubmit/wait/throwしたりcommand bufferを保持してはいけません。
+`completedSubmissionSerial()`はblockingせず完了済みsubmissionの上限を返します。Interop IDとcallbackは
+作成元`VulkanRenderer`の寿命内だけ有効です。
 
 ### 絶対pixelの角丸
 

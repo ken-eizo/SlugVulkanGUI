@@ -41,7 +41,8 @@ Figma pluginは公式Plugin APIで選択中のcomponent/frameを読み、plugin 
 | Frame auto layout horizontal | `Row` | Native |
 | Frame auto layout vertical | `Column` | Native |
 | Frame without auto layout | `Absolute`または`Stack` | Native / Approximated |
-| padding / item spacing / sizing mode | padding / spacing / auto・fixed・grow | Native |
+| padding / item spacing / sizing mode | padding / spacing / auto・fixed・grow / min-max | Native |
+| auto-layout内のabsolute child | `position: absolute` + x/y。Row/Column flowから除外 | Native |
 | Rectangle + independent corner radii | `RoundedRectangleVisual` + `CornerRadii` | Native |
 | Rectangle stroke paint / weight / align | `StrokeVisual` + 解析stroke ring | Native |
 | Rectangle side-specific stroke weights | `[top, right, bottom, left]` + 非対称解析ring | Native |
@@ -49,12 +50,13 @@ Figma pluginは公式Plugin APIで選択中のcomponent/frameを読み、plugin 
 | solid / linear / diamond / radial paint | 共通`Paint` | Native |
 | opacity | `Paint::opacity`またはelement opacity拡張 | Native / Approximated |
 | vector fill/center stroke geometry | node相対`path-data` -> `Path` -> `VectorAtlas` | BakedVector |
+| vector winding rule | `path-winding-rules`を`FillRule::NonZero/EvenOdd`としてatlasへ保持し、Slug E flagで直接coverage評価 | Native |
 | vector inside/outside stroke geometry | Figma `outlineStroke()`の確定形状をAOT化 | BakedVector |
 | text family / numeric weight / italic | `TextVisual` / `TextStyle` + explicit font registry | Native |
 | mixed styled text runs | `TextRun[]`（family/size/weight/style/decoration/spacing/line-height/fill） | Native |
 | clip content | `clipsChildren` | Native |
-| component instance | SlugUI component instance（AOT言語段階） | Planned |
-| variant / component property | typed property / enum / boolean | Planned |
+| component instance | 展開済みtree + main-component/source metadata。runtime instance化は次段階 | Approximated |
+| variant / component property | `source-provider-data`へ定義/値を保持し依存変更を再export。typed property化は次段階 | Approximated |
 | variable / style token | design token property table | Planned |
 | blur、shadow、blend mode、mask | 専用effect追加またはasset bake | Approximated / BakedRaster |
 
@@ -76,10 +78,13 @@ format v3 pluginは選択中のnode群をFigmaのpainter順に
 `absoluteBoundingBox`だけで切り落とされません。単一選択も同じwrapper契約を使うため、
 drop先はcomponent名や選択数に依存しません。compilerは既存format v1/v2も引き続き受理します。
 
-- format version comment、stable export ID、元のFigma node ID
-- node名とcomponent/variant由来
+- format version comment、元のFigma document/node ID。Figma由来elementのruntime stable IDは
+  `figma/<document>/<node>`から生成し、rename/re-groupでstate identityを変えない
+- node名とcomponent/variant由来。`source-provider-data`にはnode type、parent、component key、
+  component set、main component、variant/property定義・値をcanonical JSONで保持
 - parent/child順、visible、clip、overlay hint
-- layout mode、size mode、constraints、padding、spacing、alignment
+- layout mode、size mode、min/max constraint、padding、spacing、alignment。cross-axis FILLは
+  `align-self: stretch`、auto-layout内の`layoutPositioning=ABSOLUTE`はflow非参加のx/y配置として保持
 - fill、Rectangle stroke paint/辺別width/align、textのrange別
   family/size/numeric weight/italic/underline/strikethrough/letter spacing/line height/fill/text case
 - vectorのnode相対fill geometry、outline stroke geometry、paint、厳密な相対配置
@@ -139,8 +144,12 @@ src/
 4. 完了: SVG由来vector fill/stroke geometryをSlug `Path`へAOT変換
 5. 完了: vector stroke alignmentのexact outline、辺別Rectangle stroke、absolute placement
 6. 完了: 多数selection、親子重複除去、render bounds root、range別rich text
-7. 次: component/variant/variableをtyped propertyとtokenへ変換
-8. 次: strict fidelity mode、incremental reimport、pixel comparison
+7. 部分完了: component/variant provenance、Figma node ID基準のstable再import identity、
+   dynamic-pageのcurrent PageNode `nodechange`差分refresh、`getMainComponentAsync()`による
+   Instance依存追跡、hidden child/構造変更同期。次はtyped property/instance/token化
+8. 完了: exporter/cache・AOT lexer高速化、同一vector pathのatlas/C++ codegen intern、
+   content-stable generated header + stamped buildによるincremental compile最適化
+9. 次: strict fidelity mode、persistent incremental reimport diff、pixel comparison
 
 最初からFigma全機能の完全再現を目指さず、Nativeと判定したsubsetの一致を自動テストで保証し、
 subsetを段階的に広げます。
@@ -163,8 +172,13 @@ source treeからビルドしたExampleのFigma Importページでは、任意�
 単一selectionと複数selectionの両方を扱えます。Exampleだけがfixtureを置換し、現在の
 Debug/Release構成を別processでAOT再ビルドしてFigmaページを開き直します。同じsessionですでに取り込んだ
 同一bytesのfileは何も変更せず再起動もしません。空のsessionでは同じfileも再度取り込めます。
-変更fileは現在のwindowを閉じる前にcompilerの構文・型検査を通し、
-有効な場合だけ一度置換します。library/runtimeへ
+変更fileは現在のwindowを閉じる前にcompilerでgenerated headerまで一度だけ生成し、構文・型エラーなら
+元fixtureへ即時rollbackします。成功時は同時にCMake用codegen stampを更新し、そのheaderをそのまま
+buildへ渡すため、helper側で同じPython parse/codegenを繰り返しません。生成bytesが同一ならheaderの
+mtimeは維持されるので、見た目/IRが変わらない再exportではC++ compileも発生しません。さらに巨大な
+Figma generated headerは`figma_import_bridge.cpp`だけが
+includeし、このpreview bridgeだけを低最適化でcompileします。`kitchen_sink.cpp`全体をFigma変更のたびに
+再compileしないため、大規模component setでも反復importのcompile latencyを抑えます。library/runtimeへ
 `.slugui` parserは追加していません。build失敗時は元fixtureを復元し、詳細を
 `build/slugui_drop_rebuild.log`へ保存します。配布アプリで任意UIを動的ロードする契約ではなく、
 Figma exporterを反復確認するための開発用導線です。

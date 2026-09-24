@@ -36,6 +36,22 @@ set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
 add_subdirectory(external/freetype)
+
+# SlugVulkan keeps text shaping separate from outline extraction. HarfBuzz owns GSUB/GPOS,
+# script/cluster shaping, while FreeType + Slughorn own exact outline decomposition and Slug
+# coverage. Build only the HarfBuzz core; raster/vector/GPU/subset utilities are unrelated here.
+set(HB_BUILD_UTILS OFF CACHE BOOL "" FORCE)
+set(HB_BUILD_SUBSET OFF CACHE BOOL "" FORCE)
+set(HB_BUILD_RASTER OFF CACHE BOOL "" FORCE)
+set(HB_BUILD_VECTOR OFF CACHE BOOL "" FORCE)
+set(HB_BUILD_GPU OFF CACHE BOOL "" FORCE)
+set(HB_BUILD_GPU_DEMO OFF CACHE STRING "" FORCE)
+set(HB_HAVE_FREETYPE OFF CACHE BOOL "" FORCE)
+set(HB_HAVE_CAIRO OFF CACHE BOOL "" FORCE)
+set(HB_HAVE_GLIB OFF CACHE BOOL "" FORCE)
+set(HB_HAVE_ICU OFF CACHE BOOL "" FORCE)
+set(HB_HAVE_GOBJECT OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/harfbuzz)
 if(NOT TARGET Freetype::Freetype)
   add_library(Freetype::Freetype ALIAS freetype-interface)
 endif()
@@ -121,7 +137,7 @@ add_library(SlugVulkan::slugvk ALIAS slugvk)
 add_dependencies(slugvk slugvk_shaders)
 target_include_directories(slugvk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
                                   PRIVATE "${SLUGVK_GENERATED_DIR}")
-target_link_libraries(slugvk PUBLIC slughorn Vulkan::Vulkan)
+target_link_libraries(slugvk PUBLIC slughorn Vulkan::Vulkan PRIVATE harfbuzz)
 if(SLUGVK_ENABLE_GLFW)
   target_link_libraries(slugvk PRIVATE glfw)
 endif()
@@ -134,7 +150,9 @@ target_compile_definitions(slugvk PRIVATE
 )
 
 if(MSVC)
-  target_compile_options(slugvk PRIVATE /W4 /permissive- /Zc:__cplusplus)
+  # /FS serializes PDB writes inside cl.exe. The example and generated Figma bridge are compiled
+  # concurrently during low-latency imports, so without it MSBuild can fail with C1041.
+  target_compile_options(slugvk PRIVATE /W4 /permissive- /Zc:__cplusplus /FS)
 else()
   target_compile_options(slugvk PRIVATE -Wall -Wextra -Wpedantic)
 endif()
@@ -157,30 +175,53 @@ if(SLUGVK_BUILD_EXAMPLE)
   add_custom_target(slugvk_geist_font DEPENDS "${SLUGVK_GEIST_HEADER}")
   set(SLUGVK_SLUGUI_DEMO_HEADER "${SLUGVK_GENERATED_DIR}/slugui_demo.generated.hpp")
   set(SLUGVK_FIGMA_DEMO_HEADER "${SLUGVK_GENERATED_DIR}/figma_group_31.generated.hpp")
+  set(SLUGVK_SLUGUI_DEMO_STAMP "${SLUGVK_SLUGUI_DEMO_HEADER}.stamp")
+  set(SLUGVK_FIGMA_DEMO_STAMP "${SLUGVK_FIGMA_DEMO_HEADER}.stamp")
   slugvk_compile_slugui(
+    STAMPED
     INPUT "${CMAKE_CURRENT_SOURCE_DIR}/examples/slugui_demo.slugui"
     OUTPUT "${SLUGVK_SLUGUI_DEMO_HEADER}"
     NAMESPACE slugvk::example)
   slugvk_compile_slugui(
+    STAMPED
+    STRIP_SOURCE_METADATA
     INPUT "${CMAKE_CURRENT_SOURCE_DIR}/examples/figma_group_31.slugui"
     OUTPUT "${SLUGVK_FIGMA_DEMO_HEADER}"
     NAMESPACE slugvk::example
     CLASS_NAME Group_31Generated)
   add_custom_target(slugvk_slugui_example_codegen DEPENDS
-    "${SLUGVK_SLUGUI_DEMO_HEADER}"
-    "${SLUGVK_FIGMA_DEMO_HEADER}")
+    "${SLUGVK_SLUGUI_DEMO_STAMP}"
+    "${SLUGVK_FIGMA_DEMO_STAMP}")
   add_executable(slugvk_example MACOSX_BUNDLE
     examples/kitchen_sink.cpp
+    examples/figma_import_bridge.cpp
     "${SLUGVK_GEIST_HEADER}"
     "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/OFL-Geist.txt")
+  # Figma AOT output can contain thousands of construction statements. Keep that generated
+  # code isolated in one tiny translation unit and compile that bridge without optimization.
+  # The generator scopes every child subtree so moved temporaries do not accumulate in one huge
+  # /Od stack frame; this gives fast iterative builds without the former stack-overflow hazard.
+  if(MSVC)
+    target_compile_options(slugvk_example PRIVATE /FS)
+    set_source_files_properties(examples/figma_import_bridge.cpp
+      PROPERTIES COMPILE_OPTIONS "/Od;/Ob0;/bigobj")
+  else()
+    set_source_files_properties(examples/figma_import_bridge.cpp
+      PROPERTIES COMPILE_OPTIONS "-O0")
+  endif()
   target_link_libraries(slugvk_example PRIVATE SlugVulkan::slugvk)
   target_include_directories(slugvk_example PRIVATE "${SLUGVK_GENERATED_DIR}")
+  # The generated Figma header is a BYPRODUCT of the stamp command. Make the bridge object's
+  # dependency explicit so Visual Studio cannot reuse an object built against stale generated UI.
+  set_property(SOURCE examples/figma_import_bridge.cpp APPEND PROPERTY
+    OBJECT_DEPENDS "${SLUGVK_FIGMA_DEMO_HEADER}")
   target_compile_definitions(slugvk_example PRIVATE
     SLUGVK_DEVELOPMENT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     SLUGVK_DEVELOPMENT_BUILD_DIR="${CMAKE_BINARY_DIR}"
     SLUGVK_DEVELOPMENT_CONFIG="$<CONFIG>"
     SLUGVK_CMAKE_COMMAND="${CMAKE_COMMAND}"
     SLUGVK_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+    SLUGVK_FIGMA_GENERATED_HEADER="${SLUGVK_FIGMA_DEMO_HEADER}"
   )
   add_dependencies(slugvk_example slugvk_shaders slugvk_slugui_example_codegen slugvk_geist_font)
   set_source_files_properties(

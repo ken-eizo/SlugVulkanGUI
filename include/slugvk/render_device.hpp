@@ -8,6 +8,7 @@ namespace slugvk {
 
 class VectorAtlas;
 class PlatformSurface;
+class VulkanInterop;
 #if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
 class Window;
 #endif
@@ -36,6 +37,7 @@ public:
   [[nodiscard]] RendererStats stats() const;
   [[nodiscard]] const char* deviceName() const;
   [[nodiscard]] const char* presentModeName() const;
+  [[nodiscard]] VulkanInterop& vulkanInterop() noexcept;
 
 private:
   friend class RenderDevice;

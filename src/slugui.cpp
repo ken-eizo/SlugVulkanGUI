@@ -300,6 +300,7 @@ struct Runtime::Impl {
     const Element* element = nullptr;
     Measured measured;
     float grow = 0.0f;
+    Rect bounds = {};
   };
   struct MeasureKey {
     const Element* element = nullptr;
@@ -380,6 +381,7 @@ struct Runtime::Impl {
     addLayoutDependency(result, layout.padding.right, element, dependents);
     addLayoutDependency(result, layout.padding.bottom, element, dependents);
     addLayoutDependency(result, layout.spacing, element, dependents);
+    addLayoutDependency(result, layout.counterSpacing, element, dependents);
     if (const auto* textVisual = std::get_if<TextVisual>(&element.visual))
       addLayoutDependency(result, textVisual->text, element, dependents);
     for (const auto& child : element.children)
@@ -556,8 +558,11 @@ struct Runtime::Impl {
     const float bottom = inset(element.layout.padding.bottom, properties, parentHeight);
     const float innerWidth = std::max(0.0f, parentWidth - left - right);
     const float innerHeight = std::max(0.0f, parentHeight - top - bottom);
-    const float gap = inset(element.layout.spacing, properties,
-                            element.layout.kind == LayoutKind::Row ? parentWidth : parentHeight);
+    // Figma auto-layout permits negative itemSpacing for overlapping children. Padding uses
+    // inset()'s non-negative clamp, but spacing must preserve the authored sign.
+    const float gap = length(
+      element.layout.spacing, properties,
+      element.layout.kind == LayoutKind::Row ? parentWidth : parentHeight).value_or(0.0f);
 
     Measured result = {};
     if (const auto* textVisual = std::get_if<TextVisual>(&element.visual)) {
@@ -567,35 +572,153 @@ struct Runtime::Impl {
     std::size_t visibleChildren = 0;
     float childrenWidth = 0.0f;
     float childrenHeight = 0.0f;
-    for (const auto& child : element.children) {
-      if (!child.visible.resolve(properties)) continue;
-      const auto childSize = measure(child, properties, innerWidth, innerHeight);
-      ++visibleChildren;
-      if (element.layout.kind == LayoutKind::Row) {
-        childrenWidth += childSize.width;
-        childrenHeight = std::max(childrenHeight, childSize.height);
-      } else if (element.layout.kind == LayoutKind::Column) {
-        childrenWidth = std::max(childrenWidth, childSize.width);
-        childrenHeight += childSize.height;
-      } else {
-        const float x = length(child.layout.x, properties, innerWidth).value_or(0.0f);
-        const float y = length(child.layout.y, properties, innerHeight).value_or(0.0f);
-        childrenWidth = std::max(childrenWidth, x + childSize.width);
-        childrenHeight = std::max(childrenHeight, y + childSize.height);
+    if ((element.layout.kind == LayoutKind::Row || element.layout.kind == LayoutKind::Column) &&
+        element.layout.wrap) {
+      const bool horizontal = element.layout.kind == LayoutKind::Row;
+      const float mainLimit = horizontal ? innerWidth : innerHeight;
+      const float counterGap = length(
+        element.layout.counterSpacing, properties,
+        horizontal ? parentHeight : parentWidth).value_or(gap);
+      float trackMain = 0.0f;
+      float trackCross = 0.0f;
+      float totalCross = 0.0f;
+      float maximumMain = 0.0f;
+      std::size_t trackItems = 0;
+      std::size_t tracks = 0;
+      const auto finishTrack = [&]() {
+        if (trackItems == 0) return;
+        maximumMain = std::max(maximumMain, trackMain);
+        totalCross += trackCross;
+        ++tracks;
+        trackMain = 0.0f;
+        trackCross = 0.0f;
+        trackItems = 0;
+      };
+      for (const auto& child : element.children) {
+        if (!child.visible.resolve(properties) || child.layout.absolutePositioned) continue;
+        const auto childSize = measure(child, properties, innerWidth, innerHeight);
+        const float childMain = horizontal ? childSize.width : childSize.height;
+        const float childCross = horizontal ? childSize.height : childSize.width;
+        const float candidate = trackItems == 0 ? childMain : trackMain + gap + childMain;
+        if (trackItems != 0 && mainLimit > 0.0f && candidate > mainLimit + 0.0001f)
+          finishTrack();
+        if (trackItems != 0) trackMain += gap;
+        trackMain += childMain;
+        trackCross = std::max(trackCross, childCross);
+        ++trackItems;
+        ++visibleChildren;
       }
-    }
-    if (visibleChildren > 1 &&
-        (element.layout.kind == LayoutKind::Row ||
-         element.layout.kind == LayoutKind::Column)) {
-      const float spacing = gap * static_cast<float>(visibleChildren - 1);
-      if (element.layout.kind == LayoutKind::Row) childrenWidth += spacing;
-      else childrenHeight += spacing;
+      finishTrack();
+      if (tracks > 1) totalCross += counterGap * static_cast<float>(tracks - 1);
+      if (horizontal) {
+        childrenWidth = maximumMain;
+        childrenHeight = totalCross;
+      } else {
+        childrenWidth = totalCross;
+        childrenHeight = maximumMain;
+      }
+    } else {
+      for (const auto& child : element.children) {
+        if (!child.visible.resolve(properties)) continue;
+        if ((element.layout.kind == LayoutKind::Row ||
+             element.layout.kind == LayoutKind::Column) &&
+            child.layout.absolutePositioned) {
+          continue;
+        }
+        const auto childSize = measure(child, properties, innerWidth, innerHeight);
+        ++visibleChildren;
+        if (element.layout.kind == LayoutKind::Row) {
+          childrenWidth += childSize.width;
+          childrenHeight = std::max(childrenHeight, childSize.height);
+        } else if (element.layout.kind == LayoutKind::Column) {
+          childrenWidth = std::max(childrenWidth, childSize.width);
+          childrenHeight += childSize.height;
+        } else {
+          const float x = length(child.layout.x, properties, innerWidth).value_or(0.0f);
+          const float y = length(child.layout.y, properties, innerHeight).value_or(0.0f);
+          childrenWidth = std::max(childrenWidth, x + childSize.width);
+          childrenHeight = std::max(childrenHeight, y + childSize.height);
+        }
+      }
+      if (visibleChildren > 1 &&
+          (element.layout.kind == LayoutKind::Row ||
+           element.layout.kind == LayoutKind::Column)) {
+        const float spacing = gap * static_cast<float>(visibleChildren - 1);
+        if (element.layout.kind == LayoutKind::Row) childrenWidth += spacing;
+        else childrenHeight += spacing;
+      }
     }
     result.width = std::max(result.width, childrenWidth + left + right);
     result.height = std::max(result.height, childrenHeight + top + bottom);
     const auto constrained = constrain(element, result, properties, parentWidth, parentHeight);
     measureCache.emplace(key, constrained);
     return constrained;
+  }
+
+  [[nodiscard]] float authoredExtent(const Element& element, bool horizontal,
+                                     const PropertyStore& properties,
+                                     float fallback) const {
+    const auto& fixed = horizontal ? element.layout.width : element.layout.height;
+    if (const auto value = length(fixed, properties, fallback))
+      return std::max(0.0f, *value);
+    const auto& preferred = horizontal
+      ? element.layout.preferredWidth : element.layout.preferredHeight;
+    if (const auto value = length(preferred, properties, fallback))
+      return std::max(0.0f, *value);
+    return std::max(0.0f, fallback);
+  }
+
+  [[nodiscard]] Rect constrainedChildBounds(
+      const Element& parent, const Element& child, Rect parentBounds, Measured childSize,
+      const PropertyStore& properties) const {
+    const float sourceParentWidth = authoredExtent(parent, true, properties, parentBounds.width);
+    const float sourceParentHeight = authoredExtent(parent, false, properties, parentBounds.height);
+    const float sourceX = length(child.layout.x, properties, sourceParentWidth).value_or(0.0f);
+    const float sourceY = length(child.layout.y, properties, sourceParentHeight).value_or(0.0f);
+
+    const auto resolveAxis = [](Constraint constraint, float sourcePosition, float sourceSize,
+                                float sourceParentSize, float actualParentSize) {
+      float position = sourcePosition;
+      float size = sourceSize;
+      const float trailing = sourceParentSize - sourcePosition - sourceSize;
+      switch (constraint) {
+        case Constraint::Center:
+          position = actualParentSize * 0.5f +
+            (sourcePosition + sourceSize * 0.5f - sourceParentSize * 0.5f) -
+            sourceSize * 0.5f;
+          break;
+        case Constraint::Max:
+          position = actualParentSize - trailing - sourceSize;
+          break;
+        case Constraint::Stretch:
+          position = sourcePosition;
+          size = std::max(0.0f, actualParentSize - sourcePosition - trailing);
+          break;
+        case Constraint::Scale:
+          if (sourceParentSize > 0.0001f) {
+            const float ratio = actualParentSize / sourceParentSize;
+            position = sourcePosition * ratio;
+            size = sourceSize * ratio;
+          }
+          break;
+        case Constraint::Min:
+          break;
+      }
+      return std::pair{position, size};
+    };
+
+    const auto horizontal = resolveAxis(
+      child.layout.horizontalConstraint, sourceX, childSize.width,
+      sourceParentWidth, parentBounds.width);
+    const auto vertical = resolveAxis(
+      child.layout.verticalConstraint, sourceY, childSize.height,
+      sourceParentHeight, parentBounds.height);
+    return {
+      parentBounds.x + horizontal.first,
+      parentBounds.y + vertical.first,
+      horizontal.second,
+      vertical.second,
+    };
   }
 
   void append(const Element& element, Rect bounds, Rect inheritedClip,
@@ -632,71 +755,188 @@ struct Runtime::Impl {
       const bool horizontal = element.layout.kind == LayoutKind::Row;
       const float mainSize = horizontal ? inner.width : inner.height;
       const float crossSize = horizontal ? inner.height : inner.width;
-      const float gap = inset(element.layout.spacing, properties, mainSize);
+      const float gap = length(element.layout.spacing, properties, mainSize).value_or(0.0f);
       auto& children = flowScratch[depth];
       children.clear();
       if (children.capacity() < element.children.size()) {
         children.reserve(element.children.size());
       }
-      float used = 0.0f;
-      float totalGrow = 0.0f;
       for (const auto& child : element.children) {
-        if (!child.visible.resolve(properties)) continue;
+        if (!child.visible.resolve(properties) || child.layout.absolutePositioned) continue;
         auto childSize = measure(child, properties, inner.width, inner.height);
         const float grow = std::max(0.0f, child.layout.grow.resolve(properties));
-        used += horizontal ? childSize.width : childSize.height;
-        totalGrow += grow;
         children.push_back({&child, childSize, grow});
       }
-      if (children.size() > 1) used += gap * static_cast<float>(children.size() - 1);
-      const float available = std::max(0.0f, mainSize - used);
-      if (totalGrow > 0.0f) {
-        for (auto& child : children) {
-          const float addition = available * child.grow / totalGrow;
-          if (horizontal) child.measured.width += addition;
-          else child.measured.height += addition;
+
+      struct Track {
+        std::size_t begin = 0;
+        std::size_t end = 0;
+        float used = 0.0f;
+        float cross = 0.0f;
+        float grow = 0.0f;
+      };
+      std::vector<Track> tracks;
+      if (!children.empty()) {
+        Track track;
+        track.begin = 0;
+        for (std::size_t index = 0; index < children.size(); ++index) {
+          auto& child = children[index];
+          const float childMain = horizontal ? child.measured.width : child.measured.height;
+          const float childCross = horizontal ? child.measured.height : child.measured.width;
+          const float candidate = index == track.begin ? childMain : track.used + gap + childMain;
+          if (element.layout.wrap && index != track.begin && mainSize > 0.0f &&
+              candidate > mainSize + 0.0001f) {
+            track.end = index;
+            tracks.push_back(track);
+            track = {};
+            track.begin = index;
+          }
+          if (index != track.begin) track.used += gap;
+          track.used += childMain;
+          track.cross = std::max(track.cross, childCross);
+          track.grow += child.grow;
         }
+        track.end = children.size();
+        tracks.push_back(track);
       }
 
-      float cursor = 0.0f;
-      float actualGap = gap;
-      if (totalGrow == 0.0f) {
-        switch (element.layout.mainAlignment) {
-          case Justify::Center: cursor = available * 0.5f; break;
-          case Justify::End: cursor = available; break;
+      const float counterGap = element.layout.wrap
+        ? length(element.layout.counterSpacing, properties, crossSize).value_or(gap)
+        : 0.0f;
+      float tracksCross = 0.0f;
+      for (const auto& track : tracks)
+        tracksCross += element.layout.wrap ? track.cross : crossSize;
+      if (element.layout.wrap && tracks.size() > 1)
+        tracksCross += counterGap * static_cast<float>(tracks.size() - 1);
+      const float counterAvailable = std::max(0.0f, crossSize - tracksCross);
+      float counterCursor = 0.0f;
+      float actualCounterGap = counterGap;
+      if (element.layout.wrap) {
+        switch (element.layout.counterAlignment) {
+          case Justify::Center: counterCursor = counterAvailable * 0.5f; break;
+          case Justify::End: counterCursor = counterAvailable; break;
           case Justify::SpaceBetween:
-            if (children.size() > 1) {
-              actualGap += available / static_cast<float>(children.size() - 1);
+            if (tracks.size() > 1)
+              actualCounterGap += counterAvailable / static_cast<float>(tracks.size() - 1);
+            break;
+          case Justify::SpaceAround:
+            if (!tracks.empty()) {
+              const float distributed = counterAvailable / static_cast<float>(tracks.size());
+              counterCursor = distributed * 0.5f;
+              actualCounterGap += distributed;
+            }
+            break;
+          case Justify::SpaceEvenly:
+            if (!tracks.empty()) {
+              const float distributed = counterAvailable / static_cast<float>(tracks.size() + 1);
+              counterCursor = distributed;
+              actualCounterGap += distributed;
             }
             break;
           case Justify::Start: break;
         }
       }
 
-      for (auto& child : children) {
-        const auto alignment = child.element->layout.alignSelf.value_or(
-          element.layout.crossAlignment);
-        float childCross = horizontal ? child.measured.height : child.measured.width;
-        const auto explicitCross = horizontal
-          ? length(child.element->layout.height, properties, inner.height)
-          : length(child.element->layout.width, properties, inner.width);
-        if (alignment == Alignment::Stretch && !explicitCross) childCross = crossSize;
-        float crossOffset = 0.0f;
-        if (alignment == Alignment::Center) crossOffset = (crossSize - childCross) * 0.5f;
-        else if (alignment == Alignment::End) crossOffset = crossSize - childCross;
-        crossOffset = std::max(0.0f, crossOffset);
-
-        Rect childBounds;
-        if (horizontal) {
-          childBounds = {inner.x + cursor, inner.y + crossOffset,
-                         child.measured.width, childCross};
-          cursor += child.measured.width + actualGap;
-        } else {
-          childBounds = {inner.x + crossOffset, inner.y + cursor,
-                         childCross, child.measured.height};
-          cursor += child.measured.height + actualGap;
+      for (auto& track : tracks) {
+        const float available = std::max(0.0f, mainSize - track.used);
+        if (track.grow > 0.0f) {
+          for (std::size_t index = track.begin; index < track.end; ++index) {
+            auto& child = children[index];
+            const float addition = available * child.grow / track.grow;
+            if (horizontal) child.measured.width += addition;
+            else child.measured.height += addition;
+          }
         }
-        append(*child.element, childBounds, childClip, properties, enabled, overlay, depth + 1);
+
+        float cursor = 0.0f;
+        float actualGap = gap;
+        if (track.grow == 0.0f) {
+          const auto itemCount = track.end - track.begin;
+          switch (element.layout.mainAlignment) {
+            case Justify::Center: cursor = available * 0.5f; break;
+            case Justify::End: cursor = available; break;
+            case Justify::SpaceBetween:
+              if (itemCount > 1)
+                actualGap += available / static_cast<float>(itemCount - 1);
+              break;
+            case Justify::SpaceAround:
+              if (itemCount > 0) {
+                const float distributed = available / static_cast<float>(itemCount);
+                cursor = distributed * 0.5f;
+                actualGap += distributed;
+              }
+              break;
+            case Justify::SpaceEvenly:
+              if (itemCount > 0) {
+                const float distributed = available / static_cast<float>(itemCount + 1);
+                cursor = distributed;
+                actualGap += distributed;
+              }
+              break;
+            case Justify::Start: break;
+          }
+        }
+
+        const float trackCross = element.layout.wrap ? track.cross : crossSize;
+        for (std::size_t index = track.begin; index < track.end; ++index) {
+          auto& child = children[index];
+          const auto alignment = child.element->layout.alignSelf.value_or(
+            element.layout.crossAlignment);
+          float childCross = horizontal ? child.measured.height : child.measured.width;
+          const auto explicitCross = horizontal
+            ? length(child.element->layout.height, properties, inner.height)
+            : length(child.element->layout.width, properties, inner.width);
+          if (alignment == Alignment::Stretch && !explicitCross) childCross = trackCross;
+          float crossOffset = 0.0f;
+          if (alignment == Alignment::Center) crossOffset = (trackCross - childCross) * 0.5f;
+          else if (alignment == Alignment::End) crossOffset = trackCross - childCross;
+          crossOffset = std::max(0.0f, crossOffset);
+
+          if (horizontal) {
+            child.bounds = {inner.x + cursor, inner.y + counterCursor + crossOffset,
+                            child.measured.width, childCross};
+            cursor += child.measured.width + actualGap;
+          } else {
+            child.bounds = {inner.x + counterCursor + crossOffset, inner.y + cursor,
+                            childCross, child.measured.height};
+            cursor += child.measured.height + actualGap;
+          }
+        }
+        counterCursor += trackCross + actualCounterGap;
+      }
+
+      // Resolve flow first, then choose painter order independently from layout order.
+      // Figma itemReverseZIndex=true means the first source child is on top, but its flow
+      // position must not change.
+      if (element.layout.reverseChildPaintOrder) {
+        std::size_t flowIndex = children.size();
+        for (auto iterator = element.children.rbegin(); iterator != element.children.rend(); ++iterator) {
+          const auto& child = *iterator;
+          if (!child.visible.resolve(properties)) continue;
+          if (child.layout.absolutePositioned) {
+            const auto childSize = measure(child, properties, bounds.width, bounds.height);
+            append(child, constrainedChildBounds(element, child, bounds, childSize, properties),
+                   childClip, properties, enabled, overlay, depth + 1);
+            continue;
+          }
+          if (flowIndex == 0) continue;
+          const auto childBounds = children[--flowIndex].bounds;
+          append(child, childBounds, childClip, properties, enabled, overlay, depth + 1);
+        }
+      } else {
+        std::size_t flowIndex = 0;
+        for (const auto& child : element.children) {
+          if (!child.visible.resolve(properties)) continue;
+          if (child.layout.absolutePositioned) {
+            const auto childSize = measure(child, properties, bounds.width, bounds.height);
+            append(child, constrainedChildBounds(element, child, bounds, childSize, properties),
+                   childClip, properties, enabled, overlay, depth + 1);
+            continue;
+          }
+          if (flowIndex >= children.size()) continue;
+          const auto childBounds = children[flowIndex++].bounds;
+          append(child, childBounds, childClip, properties, enabled, overlay, depth + 1);
+        }
       }
       return;
     }
@@ -706,15 +946,19 @@ struct Runtime::Impl {
         ++stats.elements;
         continue;
       }
-      auto childSize = measure(child, properties, inner.width, inner.height);
-      const float x = length(child.layout.x, properties, inner.width).value_or(0.0f);
-      const float y = length(child.layout.y, properties, inner.height).value_or(0.0f);
       if (element.layout.kind == LayoutKind::Stack) {
+        auto childSize = measure(child, properties, inner.width, inner.height);
+        const float x = length(child.layout.x, properties, inner.width).value_or(0.0f);
+        const float y = length(child.layout.y, properties, inner.height).value_or(0.0f);
         if (!length(child.layout.width, properties, inner.width)) childSize.width = inner.width;
         if (!length(child.layout.height, properties, inner.height)) childSize.height = inner.height;
+        append(child, {inner.x + x, inner.y + y, childSize.width, childSize.height},
+               childClip, properties, enabled, overlay, depth + 1);
+      } else {
+        const auto childSize = measure(child, properties, bounds.width, bounds.height);
+        append(child, constrainedChildBounds(element, child, bounds, childSize, properties),
+               childClip, properties, enabled, overlay, depth + 1);
       }
-      append(child, {inner.x + x, inner.y + y, childSize.width, childSize.height},
-             childClip, properties, enabled, overlay, depth + 1);
     }
   }
 
@@ -899,9 +1143,48 @@ struct Runtime::Impl {
         widths.left = std::max(0.0f, widths.left * scale);
         border.individualWidths = widths;
       }
-      drawList.roundedRect(entry.box.bounds, radii,
-                           paint(rounded->paint, entry, properties, input),
-                           rounded->smoothing.resolve(properties), std::move(border));
+      const auto resolvedPaint = paint(rounded->paint, entry, properties, input);
+      const auto smoothing = rounded->smoothing.resolve(properties);
+      Rect imageBounds = entry.box.bounds;
+      bool fittedImage = false;
+      if (rounded->image.enabled && rounded->image.sourceWidth > 0.0f &&
+          rounded->image.sourceHeight > 0.0f &&
+          rounded->image.scaleMode == ImageScaleMode::Fit &&
+          entry.box.bounds.width > 0.0f && entry.box.bounds.height > 0.0f) {
+        const float fit = std::min(
+          entry.box.bounds.width / rounded->image.sourceWidth,
+          entry.box.bounds.height / rounded->image.sourceHeight);
+        const float width = rounded->image.sourceWidth * fit;
+        const float height = rounded->image.sourceHeight * fit;
+        imageBounds = {
+          entry.box.bounds.x + (entry.box.bounds.width - width) * 0.5f,
+          entry.box.bounds.y + (entry.box.bounds.height - height) * 0.5f,
+          width, height,
+        };
+        fittedImage = std::abs(width - entry.box.bounds.width) > 0.001f ||
+                      std::abs(height - entry.box.bounds.height) > 0.001f;
+      }
+
+      if (fittedImage) {
+        // FIT preserves the source aspect ratio inside the authored node rectangle. The image
+        // placeholder itself has square inner edges; the node's own rounded clip/border remains
+        // represented independently on the outer frame.
+        drawList.roundedRect(imageBounds, 0.0f, resolvedPaint, 0.0f);
+        bool hasBorder = border.width > 0.0001f;
+        if (border.individualWidths) {
+          const auto& widths = *border.individualWidths;
+          hasBorder = hasBorder || widths.top > 0.0001f || widths.right > 0.0001f ||
+                      widths.bottom > 0.0001f || widths.left > 0.0001f;
+        }
+        if (hasBorder) {
+          drawList.roundedRect(
+            entry.box.bounds, radii, Paint::solid(Color::fromRgb8(0x000000), 0.0f),
+            smoothing, std::move(border));
+        }
+      } else {
+        drawList.roundedRect(entry.box.bounds, radii, resolvedPaint,
+                             smoothing, std::move(border));
+      }
     } else if (const auto* shapeVisual = std::get_if<ShapeVisual>(&entry.element->visual)) {
       const auto placed = [&entry](const Rect& placement) {
         return Rect{

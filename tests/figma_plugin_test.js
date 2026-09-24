@@ -20,10 +20,23 @@ assert.ok(uiScript, "plugin UI script should exist");
 new Function(uiScript[1]);
 const messages = [];
 const listeners = {};
+const pageListeners = {};
+const asyncNodeLookup = new Map();
+let outlineStrokeCalls = 0;
 
 const solid = (r, g, b, opacity = 1) => ({
   type: "SOLID", visible: true, opacity, color: { r, g, b },
 });
+
+function providerDataFor(source, nodeId) {
+  const marker = "source-node: " + JSON.stringify(nodeId) + ";";
+  const start = source.indexOf(marker);
+  assert.ok(start >= 0, "missing source metadata for " + nodeId);
+  const match = source.slice(start).match(/source-provider-data: ("(?:\\.|[^"\\])*");/);
+  assert.ok(match, "missing provider data for " + nodeId);
+  return JSON.parse(JSON.parse(match[1]));
+}
+
 const base = (overrides) => Object.assign({
   visible: true,
   opacity: 1,
@@ -38,6 +51,7 @@ const base = (overrides) => Object.assign({
   layoutSizingVertical: "FIXED",
   clone() { return Object.assign({}, this, { remove() {} }); },
   outlineStroke() {
+    ++outlineStrokeCalls;
     return base({
       type: "VECTOR",
       id: String(this.id || "") + ":outline",
@@ -180,7 +194,20 @@ const figma = {
   fileKey: "fixture-file",
   root: { documentColorProfile: "SRGB" },
   flatten(nodes) { ++flattenCalls; return nodes[0]; },
-  currentPage: { selection },
+  getNodeByIdAsync(id) { return Promise.resolve(asyncNodeLookup.get(String(id)) || null); },
+  getImageByHash(hash) {
+    if (String(hash) !== "fixture-image-1920x1080") return null;
+    return {
+      getSizeAsync() { return Promise.resolve({ width: 1920, height: 1080 }); },
+    };
+  },
+  currentPage: {
+    selection,
+    on(event, callback) { pageListeners[event] = callback; },
+    off(event, callback) {
+      if (pageListeners[event] === callback) delete pageListeners[event];
+    },
+  },
   ui: {
     postMessage(message) { messages.push(message); },
     onmessage: null,
@@ -197,6 +224,8 @@ vm.runInNewContext(pluginCode, {
   figma,
   __html__: "<html></html>",
   console,
+  setTimeout(callback) { callback(); return 1; },
+  clearTimeout() {},
 }, { filename: pluginPath });
 
 assert.ok(messages.length > 0, "plugin should post an initial export");
@@ -229,6 +258,27 @@ assert.ok(!exported.diagnostics.some((item) => item.code === "E_VECTOR_GEOMETRY_
 assert.ok(exported.diagnostics.some((item) => item.code === "W_GRADIENT_TRANSFORM"));
 assert.ok(!exported.diagnostics.some((item) => item.code === "W_VECTOR_STROKE_ALIGN"));
 assert.ok(!exported.diagnostics.some((item) => item.code === "E_VECTOR_STROKE_OUTLINE"));
+assert.ok(pageListeners.nodechange, "current-page node edits should trigger an incremental export refresh");
+const initialOutlineCalls = outlineStrokeCalls;
+assert.strictEqual(initialOutlineCalls, 1,
+  "center-aligned vector strokes should use strokeGeometry without outlineStroke mutation");
+figma.ui.onmessage({ type: "refresh" });
+const cachedExport = messages[messages.length - 1];
+assert.ok(cachedExport.stats.vectorCacheHits >= 2);
+assert.strictEqual(outlineStrokeCalls, initialOutlineCalls,
+  "manual refresh must reuse exact vector geometry when source geometry is unchanged");
+
+const messageCountBeforeUnrelatedEdit = messages.length;
+pageListeners.nodechange({
+  nodeChanges: [{ type: "PROPERTY_CHANGE", id: "999:1", properties: ["fills"] }],
+});
+assert.strictEqual(messages.length, messageCountBeforeUnrelatedEdit,
+  "editing an unrelated Figma node must not regenerate the active selection");
+pageListeners.nodechange({
+  nodeChanges: [{ type: "PROPERTY_CHANGE", id: "12:2", properties: ["fills"] }],
+});
+assert.strictEqual(messages.length, messageCountBeforeUnrelatedEdit + 1,
+  "editing a node in the active export subtree must refresh it");
 
 figma.currentPage.selection = [base({
   type: "LINE",
@@ -451,6 +501,7 @@ figma.ui.onmessage({ type: "refresh" });
 const nestedSelection = messages[messages.length - 1];
 assert.strictEqual((nestedSelection.source.match(/Rectangle Selected_Child_/g) || []).length, 1);
 
+let styledSegmentCalls = 0;
 figma.currentPage.selection = [base({
   type: "TEXT",
   id: "80:1",
@@ -467,6 +518,7 @@ figma.currentPage.selection = [base({
   textAlignVertical: "BOTTOM",
   listOptions: { type: "UNORDERED" },
   getStyledTextSegments(fields) {
+    ++styledSegmentCalls;
     assert.ok(fields.includes("fills"));
     assert.ok(fields.includes("fontWeight"));
     return [
@@ -506,10 +558,16 @@ const richText = messages[messages.length - 1];
 assert.match(richText.source, /text-align-vertical: bottom;/);
 assert.match(richText.source, /list-marker: bullet;/);
 assert.match(richText.source, /text: "RED blue";/);
-assert.match(richText.source, /text-runs: \[text-run\("RED", "Geist", 16, 700, false, true, false, 0, 1\.25, #ff0000\), text-run\(" blue", "Geist", 14, 400, true, false, false, 0\.5, 1\.4, #0000ff\)\];/);
+assert.match(richText.source, /text-runs: \[text-run\("RED", "Geist", 16, 700, false, true, false, 0, 1\.25, #ff0000, "Bold"\), text-run\(" blue", "Geist", 14, 400, true, false, false, 0\.5, 1\.4, #0000ff, "Regular Italic"\)\];/);
 assert.doesNotMatch(richText.source, /W_MIXED_FILL/);
 assert.ok(!richText.diagnostics.some((item) => item.code.startsWith("W_MIXED_")),
   JSON.stringify(richText.diagnostics));
+assert.strictEqual(styledSegmentCalls, 1);
+figma.ui.onmessage({ type: "refresh" });
+const cachedRichText = messages[messages.length - 1];
+assert.ok(cachedRichText.stats.textCacheHits >= 1);
+assert.strictEqual(styledSegmentCalls, 1,
+  "manual refresh must reuse styled text segments while the text node is unchanged");
 
 const richDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "slugui-figma-rich-"));
 const richPath = path.join(richDirectory, richText.filename);
@@ -521,10 +579,512 @@ const richCompile = childProcess.spawnSync(python, [
 fs.rmSync(richDirectory, { recursive: true, force: true });
 assert.strictEqual(richCompile.status, 0, richCompile.stderr || richCompile.stdout);
 
+const componentDependencyChild = base({
+  type: "RECTANGLE", id: "90:4", name: "Component Dependency Child",
+  width: 16, height: 16,
+  absoluteBoundingBox: { x: 12, y: 12, width: 16, height: 16 },
+  componentPropertyReferences: { visible: "Disabled" },
+  fills: [solid(0.3, 0.6, 0.9)],
+});
+const slotChild = base({
+  type: "SLOT", id: "90:5", name: "Content Slot",
+  x: 36, y: 8, width: 72, height: 20,
+  absoluteBoundingBox: { x: 36, y: 8, width: 72, height: 20 },
+  componentPropertyReferences: { slotContentId: "ContentSlot" },
+  children: [],
+});
+const component = base({
+  type: "COMPONENT", id: "90:2", name: "Check / On", key: "component-key",
+  x: 10, y: 10, width: 120, height: 32,
+  absoluteBoundingBox: { x: 10, y: 10, width: 120, height: 32 },
+  variantProperties: { State: "On", Tone: "Blue" },
+  componentPropertyDefinitions: {
+    Label: { type: "TEXT", defaultValue: "Label" },
+    Disabled: { type: "BOOLEAN", defaultValue: false },
+    ContentSlot: { type: "SLOT", defaultValue: "", slotSettings: {} },
+    Icon: {
+      type: "INSTANCE_SWAP", defaultValue: "90:icon",
+      preferredValues: [
+        { type: "COMPONENT", key: "preferred-a" },
+        { type: "COMPONENT", key: "preferred-b" },
+        { type: "COMPONENT", key: "preferred-c" },
+      ],
+    },
+  },
+  children: [componentDependencyChild, slotChild],
+});
+componentDependencyChild.parent = component;
+slotChild.parent = component;
+const instance = base({
+  type: "INSTANCE", id: "90:3", name: "Check Instance",
+  x: 10, y: 52, width: 120, height: 32,
+  absoluteBoundingBox: { x: 10, y: 52, width: 120, height: 32 },
+  mainComponent: component,
+  variantProperties: { State: "On", Tone: "Blue" },
+  componentProperties: {
+    State: { type: "VARIANT", value: "On" },
+    Tone: { type: "VARIANT", value: "Blue" },
+    Label: { type: "TEXT", value: "Ready" },
+    Disabled: { type: "BOOLEAN", value: false },
+  },
+  overrides: [{ id: "90:4", overriddenFields: ["fills", "visible"] }],
+  exposedInstances: [{ id: "90:nested" }],
+  isExposedInstance: true,
+  scaleFactor: 1.25,
+  children: [],
+});
+const alternateVariantChild = base({
+  type: "RECTANGLE", id: "90:7", name: "Alternate Variant Child",
+  width: 16, height: 16,
+  absoluteBoundingBox: { x: 12, y: 60, width: 16, height: 16 },
+  fills: [solid(0.8, 0.4, 0.2)],
+});
+const alternateComponent = base({
+  type: "COMPONENT", id: "90:6", name: "Check / Off", key: "component-key-off",
+  x: 10, y: 54, width: 120, height: 32,
+  absoluteBoundingBox: { x: 10, y: 54, width: 120, height: 32 },
+  variantProperties: { State: "Off", Tone: "Blue" },
+  children: [alternateVariantChild],
+});
+alternateVariantChild.parent = alternateComponent;
+const componentSet = base({
+  type: "COMPONENT_SET", id: "90:1", name: "Checkboxes",
+  x: 0, y: 0, width: 140, height: 96,
+  absoluteBoundingBox: { x: 0, y: 0, width: 140, height: 96 },
+  children: [component, alternateComponent],
+});
+component.parent = componentSet;
+alternateComponent.parent = componentSet;
+const instanceHost = { type: "FRAME", id: "90:host", children: [instance], parent: null };
+instance.parent = instanceHost;
+
+figma.currentPage.selection = [componentSet];
+figma.ui.onmessage({ type: "refresh" });
+const componentExport = messages[messages.length - 1];
+const componentData = providerDataFor(componentExport.source, "90:2");
+const componentChildData = providerDataFor(componentExport.source, "90:4");
+const slotData = providerDataFor(componentExport.source, "90:5");
+assert.deepStrictEqual(componentChildData.componentPropertyReferences, { visible: "Disabled" });
+assert.strictEqual(slotData.nodeType, "SLOT");
+assert.deepStrictEqual(slotData.componentPropertyReferences, { slotContentId: "ContentSlot" });
+assert.ok(!componentExport.diagnostics.some(
+  (item) => item.nodeId === "90:5" && item.code === "E_NODE_TYPE"));
+
+figma.currentPage.selection = [instance];
+figma.ui.onmessage({ type: "refresh" });
+const instanceExport = messages[messages.length - 1];
+const instanceData = providerDataFor(instanceExport.source, "90:3");
+assert.strictEqual(componentData.nodeType, "COMPONENT");
+assert.strictEqual(componentData.componentKey, "component-key");
+assert.strictEqual(componentData.componentSetId, "90:1");
+assert.deepStrictEqual(componentData.variantProperties, { State: "On", Tone: "Blue" });
+assert.strictEqual(componentData.componentDefinitions.Label.defaultValue, "Label");
+assert.strictEqual(componentData.componentDefinitions.Icon.preferredValueCount, 3);
+assert.strictEqual(componentData.componentDefinitions.Icon.preferredValues, undefined,
+  "instance-swap discovery candidates must not be duplicated into every exported node");
+assert.strictEqual(instanceData.nodeType, "INSTANCE");
+assert.strictEqual(instanceData.mainComponentId, "90:2");
+assert.strictEqual(instanceData.componentSetId, "90:1");
+assert.strictEqual(instanceData.componentKey, "component-key");
+assert.strictEqual(instanceData.variantProperties, undefined,
+  "Instance variantProperties is deprecated and should not be read by the exporter");
+assert.strictEqual(instanceData.componentProperties.State.value, "On");
+assert.strictEqual(instanceData.componentProperties.Tone.value, "Blue");
+assert.deepStrictEqual(instanceData.variantSelection, { State: "On", Tone: "Blue" });
+assert.strictEqual(instanceData.componentProperties.Label.value, "Ready");
+assert.strictEqual(instanceData.componentDefinitions.Label.defaultValue, "Label");
+assert.deepStrictEqual(instanceData.overrides,
+  [{ id: "90:4", overriddenFields: ["fills", "visible"] }]);
+assert.deepStrictEqual(instanceData.exposedInstanceIds, ["90:nested"]);
+assert.strictEqual(instanceData.isExposedInstance, true);
+assert.strictEqual(instanceData.scaleFactor, 1.25);
+
+// Instance synchronization tracks the main component's descendants, but ignores unrelated
+// document edits so a large selection is not continuously regenerated.
+const beforeUnrelatedEdit = messages.length;
+pageListeners.nodechange({
+  nodeChanges: [{ type: "PROPERTY_CHANGE", id: "unrelated:1", properties: ["fills"] }],
+});
+assert.strictEqual(messages.length, beforeUnrelatedEdit,
+  "unrelated document edits must not regenerate the selected instance");
+pageListeners.nodechange({
+  nodeChanges: [{ type: "PROPERTY_CHANGE", id: "90:7", properties: ["fills"] }],
+});
+assert.strictEqual(messages.length, beforeUnrelatedEdit,
+  "inactive component variants must not regenerate the selected instance");
+pageListeners.nodechange({
+  nodeChanges: [{ type: "PROPERTY_CHANGE", id: "90:4", properties: ["fills"] }],
+});
+assert.strictEqual(messages.length, beforeUnrelatedEdit + 1,
+  "main-component descendant edits must refresh the selected instance");
+
+const autoLayoutFrame = base({
+  type: "FRAME", id: "95:1", name: "Auto Layout With Overlay",
+  x: 100, y: 200, width: 200, height: 80,
+  absoluteBoundingBox: { x: 100, y: 200, width: 200, height: 80 },
+  layoutMode: "HORIZONTAL",
+  itemSpacing: 10,
+  itemReverseZIndex: true,
+  primaryAxisAlignItems: "MIN",
+  counterAxisAlignItems: "MIN",
+  children: [
+    base({
+      type: "RECTANGLE", id: "95:2", name: "Flow Fill",
+      x: 100, y: 200, width: 50, height: 80,
+      absoluteBoundingBox: { x: 100, y: 200, width: 50, height: 80 },
+      layoutSizingHorizontal: "FIXED",
+      layoutSizingVertical: "FILL",
+      fills: [solid(0.2, 0.3, 0.4)],
+    }),
+    base({
+      type: "RECTANGLE", id: "95:3", name: "Floating Badge",
+      x: 150, y: 212, width: 30, height: 20,
+      absoluteBoundingBox: { x: 150, y: 212, width: 30, height: 20 },
+      layoutPositioning: "ABSOLUTE",
+      layoutSizingHorizontal: "FILL",
+      layoutSizingVertical: "FILL",
+      minWidth: 20,
+      maxWidth: 40,
+      fills: [solid(0.8, 0.2, 0.3)],
+    }),
+  ],
+});
+for (const child of autoLayoutFrame.children) child.parent = autoLayoutFrame;
+figma.currentPage.selection = [autoLayoutFrame];
+figma.ui.onmessage({ type: "refresh" });
+const autoLayoutExport = messages[messages.length - 1];
+assert.match(autoLayoutExport.source,
+  /Rectangle Flow_Fill_95_2 \{\n\s+width: 50px;\n\s+align-self: stretch;/);
+assert.match(autoLayoutExport.source,
+  /Rectangle Floating_Badge_95_3 \{\n\s+x: 50px;\n\s+y: 12px;\n\s+position: absolute;\n\s+width: 30px;\n\s+height: 20px;/);
+assert.match(autoLayoutExport.source, /min-width: 20px;/);
+assert.match(autoLayoutExport.source, /max-width: 40px;/);
+assert.match(autoLayoutExport.source, /reverse-paint-order: true;/);
+assert.strictEqual((autoLayoutExport.source.match(/reverse-paint-order:/g) || []).length, 1,
+  "reverse paint order must be emitted once so the AOT parser does not see a duplicate attribute");
+const autoLayoutDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "slugui-figma-layout-"));
+const autoLayoutPath = path.join(autoLayoutDirectory, autoLayoutExport.filename);
+fs.writeFileSync(autoLayoutPath, autoLayoutExport.source, "utf8");
+const autoLayoutCompile = childProcess.spawnSync(python, [
+  path.join(repository, "tools", "slugui_compiler.py"),
+  autoLayoutPath, "--check", "--namespace", "slugvk::figma_fixture",
+], { cwd: repository, encoding: "utf8" });
+fs.rmSync(autoLayoutDirectory, { recursive: true, force: true });
+assert.strictEqual(autoLayoutCompile.status, 0, autoLayoutCompile.stderr || autoLayoutCompile.stdout);
+
+const wrappedFrame = base({
+  type: "FRAME", id: "95:10", name: "Wrapped Hug Layout",
+  x: 0, y: 0, width: 120, height: 70,
+  absoluteBoundingBox: { x: 0, y: 0, width: 120, height: 70 },
+  layoutMode: "HORIZONTAL",
+  layoutWrap: "WRAP",
+  itemSpacing: 8,
+  counterAxisSpacing: 12,
+  counterAxisAlignContent: "SPACE_BETWEEN",
+  primaryAxisAlignItems: "SPACE_EVENLY",
+  counterAxisAlignItems: "CENTER",
+  children: [
+    base({
+      type: "TEXT", id: "95:11", name: "Hug Label",
+      x: 0, y: 0, width: 46, height: 20,
+      absoluteBoundingBox: { x: 0, y: 0, width: 46, height: 20 },
+      layoutSizingHorizontal: "HUG",
+      layoutSizingVertical: "HUG",
+      characters: "Hug me", fontSize: 14, fontWeight: 400,
+      fontName: { family: "Inter", style: "Regular" },
+      fills: [solid(1, 1, 1)],
+    }),
+    base({
+      type: "RECTANGLE", id: "95:12", name: "Fallback Fill",
+      x: 54, y: 0, width: 40, height: 20,
+      absoluteBoundingBox: { x: 54, y: 0, width: 40, height: 20 },
+      layoutSizingHorizontal: undefined,
+      layoutSizingVertical: undefined,
+      layoutGrow: 1,
+      layoutAlign: "STRETCH",
+      fills: [solid(0.2, 0.5, 0.9)],
+    }),
+  ],
+});
+for (const child of wrappedFrame.children) child.parent = wrappedFrame;
+figma.currentPage.selection = [wrappedFrame];
+figma.ui.onmessage({ type: "refresh" });
+const wrappedExport = messages[messages.length - 1];
+assert.match(wrappedExport.source, /wrap: true;/);
+assert.match(wrappedExport.source, /counter-spacing: 12px;/);
+assert.match(wrappedExport.source, /counter-justify: space-between;/);
+assert.match(wrappedExport.source, /justify: space-evenly;/);
+assert.match(wrappedExport.source,
+  /Text Hug_Label_95_11 \{\n\s+preferred-width: 46px;\n\s+preferred-height: 20px;/);
+assert.match(wrappedExport.source,
+  /Rectangle Fallback_Fill_95_12 \{\n\s+grow: 1;\n\s+align-self: stretch;/);
+
+
+// Snapshot fallback must pass the exported layout contract to children. BASELINE cannot be
+// silently treated as MIN because that shifts text-heavy component rows.
+const baselineFrame = base({
+  type: "FRAME", id: "95:20", name: "Baseline Snapshot",
+  x: 300, y: 400, width: 200, height: 80,
+  absoluteBoundingBox: { x: 300, y: 400, width: 200, height: 80 },
+  layoutMode: "HORIZONTAL",
+  counterAxisAlignItems: "BASELINE",
+  fills: [solid(0.05, 0.05, 0.05)],
+  children: [
+    base({
+      type: "TEXT", id: "95:21", name: "Baseline Label",
+      x: 999, y: 999, width: 60, height: 20,
+      absoluteBoundingBox: { x: 310, y: 415, width: 60, height: 20 },
+      characters: "Base", fontSize: 14, fontWeight: 400,
+      fontName: { family: "Inter", style: "Regular" },
+      fills: [solid(1, 1, 1)],
+    }),
+  ],
+});
+baselineFrame.children[0].parent = baselineFrame;
+figma.currentPage.selection = [baselineFrame];
+figma.ui.onmessage({ type: "refresh" });
+const baselineExport = messages[messages.length - 1];
+assert.match(baselineExport.source, /layout: absolute;/);
+assert.match(baselineExport.source,
+  /Text Baseline_Label_95_21 \{\n\s+x: 10px;\n\s+y: 15px;/);
+assert.ok(baselineExport.diagnostics.some((item) => item.code === "W_BASELINE_LAYOUT"));
+
+// Figma relativeTransform is container-parent based across Group/Boolean nodes. Absolute bounds
+// differences are therefore the canonical snapshot coordinates for a direct Group child.
+const coordinateGroupChild = base({
+  type: "RECTANGLE", id: "95:31", name: "Grouped Child",
+  x: 900, y: 700, width: 30, height: 20,
+  absoluteBoundingBox: { x: 120, y: 230, width: 30, height: 20 },
+  constraints: { horizontal: "MAX", vertical: "CENTER" },
+  fills: [solid(0.5, 0.4, 0.3)],
+});
+const coordinateGroup = base({
+  type: "GROUP", id: "95:30", name: "Coordinate Group",
+  x: 1, y: 2, width: 100, height: 80,
+  absoluteBoundingBox: { x: 100, y: 200, width: 100, height: 80 },
+  children: [coordinateGroupChild],
+});
+coordinateGroupChild.parent = coordinateGroup;
+figma.currentPage.selection = [coordinateGroup];
+figma.ui.onmessage({ type: "refresh" });
+const coordinateGroupExport = messages[messages.length - 1];
+assert.match(coordinateGroupExport.source,
+  /Rectangle Grouped_Child_95_31 \{\n\s+x: 20px;\n\s+y: 30px;/);
+assert.match(coordinateGroupExport.source, /constraint-horizontal: max;/);
+assert.match(coordinateGroupExport.source, /constraint-vertical: center;/);
+const coordinateGroupData = providerDataFor(coordinateGroupExport.source, "95:31");
+assert.deepStrictEqual(coordinateGroupData.constraints, { horizontal: "MAX", vertical: "CENTER" });
+
+// Group synchronization must watch hidden descendants and structural changes without reacting
+// to unrelated CREATE/DELETE churn elsewhere on the current page.
+const hiddenChild = base({
+  type: "RECTANGLE", id: "96:2", name: "Initially Hidden",
+  visible: false, x: 10, y: 10, width: 30, height: 20,
+  absoluteBoundingBox: { x: 10, y: 10, width: 30, height: 20 },
+  fills: [solid(0.2, 0.8, 0.3)],
+});
+const watchedGroup = base({
+  type: "GROUP", id: "96:1", name: "Watched Group",
+  x: 0, y: 0, width: 100, height: 80,
+  absoluteBoundingBox: { x: 0, y: 0, width: 100, height: 80 },
+  children: [hiddenChild],
+});
+hiddenChild.parent = watchedGroup;
+figma.currentPage.selection = [watchedGroup];
+figma.ui.onmessage({ type: "refresh" });
+const hiddenExport = messages[messages.length - 1];
+assert.doesNotMatch(hiddenExport.source, /Initially_Hidden_96_2/);
+
+const beforeHiddenReveal = messages.length;
+hiddenChild.visible = true;
+pageListeners.nodechange({
+  nodeChanges: [{
+    type: "PROPERTY_CHANGE", id: "96:2", node: hiddenChild, properties: ["visible"],
+  }],
+});
+assert.strictEqual(messages.length, beforeHiddenReveal + 1);
+assert.match(messages[messages.length - 1].source, /Initially_Hidden_96_2/);
+
+const beforeUnrelatedCreate = messages.length;
+const unrelatedParent = { type: "GROUP", id: "unrelated-parent", children: [] };
+const unrelatedCreated = base({ type: "RECTANGLE", id: "unrelated-created", parent: unrelatedParent });
+pageListeners.nodechange({
+  nodeChanges: [{ type: "CREATE", id: "unrelated-created", node: unrelatedCreated }],
+});
+assert.strictEqual(messages.length, beforeUnrelatedCreate,
+  "unrelated structural edits must not regenerate the selected group");
+
+const createdChild = base({
+  type: "RECTANGLE", id: "96:3", name: "Created Child",
+  x: 45, y: 10, width: 30, height: 20,
+  absoluteBoundingBox: { x: 45, y: 10, width: 30, height: 20 },
+  fills: [solid(0.8, 0.4, 0.2)],
+});
+createdChild.parent = watchedGroup;
+watchedGroup.children.push(createdChild);
+const beforeSelectedCreate = messages.length;
+pageListeners.nodechange({
+  nodeChanges: [{ type: "CREATE", id: "96:3", node: createdChild }],
+});
+assert.strictEqual(messages.length, beforeSelectedCreate + 1);
+assert.match(messages[messages.length - 1].source, /Created_Child_96_3/);
+
 figma.currentPage.selection = [];
 figma.ui.onmessage({ type: "refresh" });
 const empty = messages[messages.length - 1];
 assert.strictEqual(empty.source, "");
 assert.ok(empty.diagnostics.some((item) => item.code === "E_NO_SELECTION"));
 
-console.log("Figma exporter -> .slugui -> AOT compiler integration passed");
+// dynamic-page Figma deprecates InstanceNode.mainComponent in favor of getMainComponentAsync().
+// Verify an instance whose synchronous getter is unavailable still exports component identity.
+const asyncInstance = base({
+  type: "INSTANCE", id: "91:3", name: "Async Component Instance",
+  width: 120, height: 32,
+  absoluteBoundingBox: { x: 0, y: 0, width: 120, height: 32 },
+  componentProperties: { Label: { type: "TEXT", value: "Async" } },
+  children: [],
+  getMainComponentAsync() { return Promise.resolve(component); },
+});
+Object.defineProperty(asyncInstance, "mainComponent", {
+  get() { throw new Error("dynamic-page synchronous mainComponent access is unavailable"); },
+});
+asyncInstance.parent = { type: "FRAME", id: "91:host", children: [asyncInstance], parent: null };
+const beforeAsyncComponent = messages.length;
+figma.currentPage.selection = [asyncInstance];
+figma.ui.onmessage({ type: "refresh" });
+assert.strictEqual(messages.length, beforeAsyncComponent,
+  "async main-component resolution should not emit incomplete provenance");
+
+setImmediate(() => {
+  const asyncExport = messages[messages.length - 1];
+  const asyncData = providerDataFor(asyncExport.source, "91:3");
+  assert.strictEqual(asyncData.mainComponentId, "90:2");
+  assert.strictEqual(asyncData.componentKey, "component-key");
+
+  // A selected instance may itself contain nested instances. All of them must be primed through
+  // the dynamic-page async API or nested component swaps/definition edits lose synchronization.
+  const nestedAsyncInstance = base({
+    type: "INSTANCE", id: "91:5", name: "Nested Async Instance",
+    width: 80, height: 24,
+    absoluteBoundingBox: { x: 8, y: 8, width: 80, height: 24 },
+    children: [],
+    getMainComponentAsync() { return Promise.resolve(component); },
+  });
+  Object.defineProperty(nestedAsyncInstance, "mainComponent", {
+    get() { throw new Error("nested dynamic-page mainComponent requires async access"); },
+  });
+  const outerInstance = base({
+    type: "INSTANCE", id: "91:4", name: "Outer Instance",
+    width: 120, height: 48,
+    absoluteBoundingBox: { x: 0, y: 0, width: 120, height: 48 },
+    mainComponent: component,
+    children: [nestedAsyncInstance],
+  });
+  nestedAsyncInstance.parent = outerInstance;
+  outerInstance.parent = { type: "FRAME", id: "91:outer-host", children: [outerInstance], parent: null };
+  figma.currentPage.selection = [outerInstance];
+  const beforeNestedAsync = messages.length;
+  figma.ui.onmessage({ type: "refresh" });
+  assert.strictEqual(messages.length, beforeNestedAsync,
+    "nested async instances should delay export until all component identities are resolved");
+
+  setImmediate(() => {
+    const nestedExport = messages[messages.length - 1];
+    const nestedData = providerDataFor(nestedExport.source, "91:5");
+    assert.strictEqual(nestedData.mainComponentId, "90:2");
+    assert.strictEqual(nestedData.componentKey, "component-key");
+
+    // Some Figma structural events expose only the created id. Resolve it lazily and inspect its
+    // ancestor chain so additions to a selected group still regenerate without global refreshes.
+    const idOnlyGroup = base({
+      type: "GROUP", id: "97:1", name: "ID Only Group",
+      width: 100, height: 80,
+      absoluteBoundingBox: { x: 0, y: 0, width: 100, height: 80 },
+      children: [],
+    });
+    figma.currentPage.selection = [idOnlyGroup];
+    figma.ui.onmessage({ type: "refresh" });
+    const idOnlyChild = base({
+      type: "RECTANGLE", id: "97:2", name: "ID Only Child",
+      x: 12, y: 10, width: 40, height: 20,
+      absoluteBoundingBox: { x: 12, y: 10, width: 40, height: 20 },
+      fills: [solid(0.3, 0.5, 0.9)],
+    });
+    idOnlyChild.parent = idOnlyGroup;
+    idOnlyGroup.children.push(idOnlyChild);
+    asyncNodeLookup.set(idOnlyChild.id, idOnlyChild);
+    const beforeIdOnlyCreate = messages.length;
+    pageListeners.nodechange({ nodeChanges: [{ type: "CREATE", id: idOnlyChild.id }] });
+    assert.strictEqual(messages.length, beforeIdOnlyCreate,
+      "id-only CREATE resolution is asynchronous");
+
+    setImmediate(() => {
+      assert.strictEqual(messages.length, beforeIdOnlyCreate + 1);
+      assert.match(messages[messages.length - 1].source, /ID_Only_Child_97_2/);
+
+      // Image fills retain source pixel dimensions and placement semantics even while the
+      // current renderer uses a visible geometry-preserving placeholder instead of the bitmap.
+      const imageNode = base({
+        type: "RECTANGLE", id: "98:image", name: "Hero Image",
+        width: 320, height: 180,
+        absoluteBoundingBox: { x: 0, y: 0, width: 320, height: 180 },
+        fills: [{
+          type: "IMAGE", visible: true, opacity: 0.8,
+          imageHash: "fixture-image-1920x1080", scaleMode: "FIT",
+          scalingFactor: 1,
+          rotation: 0,
+          imageTransform: [[1, 0, 0], [0, 1, 0]],
+        }],
+      });
+      const beforeImage = messages.length;
+      figma.currentPage.selection = [imageNode];
+      figma.ui.onmessage({ type: "refresh" });
+      assert.strictEqual(messages.length, beforeImage,
+        "image-size resolution is asynchronous");
+
+      setImmediate(() => {
+        const imageExport = messages[messages.length - 1];
+        assert.match(imageExport.source, /fill: linear\(/);
+        assert.match(imageExport.source, /image-source-width: 1920;/);
+        assert.match(imageExport.source, /image-source-height: 1080;/);
+        assert.match(imageExport.source, /image-scale-mode: fit;/);
+        assert.ok(imageExport.diagnostics.some((item) => item.code === "W_IMAGE_PLACEHOLDER"));
+        const imageData = providerDataFor(imageExport.source, "98:image");
+        assert.strictEqual(imageData.imageFills[0].imageHash, "fixture-image-1920x1080");
+        assert.strictEqual(imageData.imageFills[0].scaleMode, "FIT");
+        assert.strictEqual(imageData.imageFills[0].sourceWidth, 1920);
+        assert.strictEqual(imageData.imageFills[0].sourceHeight, 1080);
+
+        // Large exports stay in the plugin main context during live synchronization. Sending only
+        // a bounded preview avoids repeatedly cloning megabyte-scale source strings into the UI.
+        const hugeText = base({
+          type: "TEXT", id: "98:1", name: "Huge Source",
+          width: 400, height: 40,
+          absoluteBoundingBox: { x: 0, y: 0, width: 400, height: 40 },
+          characters: "x".repeat(210000),
+          fontSize: 14,
+          fontWeight: 400,
+          fontName: { family: "Inter", style: "Regular" },
+          textDecoration: "NONE",
+          fills: [solid(1, 1, 1)],
+        });
+        figma.currentPage.selection = [hugeText];
+        figma.ui.onmessage({ type: "refresh" });
+        const lazyExport = messages[messages.length - 1];
+        assert.strictEqual(lazyExport.type, "export-result");
+        assert.strictEqual(lazyExport.source, "");
+        assert.strictEqual(lazyExport.sourceAvailable, true);
+        assert.ok(lazyExport.sourceLength > 210000);
+        assert.ok(lazyExport.sourcePreview.length <= 200200);
+
+        figma.ui.onmessage({ type: "request-source", action: "download" });
+        const payload = messages[messages.length - 1];
+        assert.strictEqual(payload.type, "source-payload");
+        assert.strictEqual(payload.action, "download");
+        assert.strictEqual(payload.filename, lazyExport.filename);
+        assert.ok(payload.source.length > 210000);
+        console.log("Figma exporter -> .slugui -> AOT compiler integration passed");
+      });
+    });
+  });
+});

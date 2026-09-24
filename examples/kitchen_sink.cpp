@@ -1,5 +1,6 @@
 #include "slugvk/slugvk.hpp"
-#include "figma_group_31.generated.hpp"
+#include "slugvk/vulkan_interop.hpp"
+#include "figma_import_bridge.hpp"
 #include "geist_font.generated.hpp"
 #include "slugui_demo.generated.hpp"
 
@@ -12,8 +13,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <sstream>
+#include <tuple>
 #include <stdexcept>
 #include <vector>
 
@@ -43,7 +46,48 @@ struct Shapes {
   ShapeId taperStroke = 0;
 };
 
-Shapes buildAtlas(VectorAtlas& atlas) {
+using FontRequest = std::tuple<std::string, std::uint16_t, bool>;
+
+void collectComponentFonts(const slugui::Element& element, const slugui::PropertyStore& properties,
+                           std::map<FontRequest, std::vector<std::uint32_t>>& requests) {
+  const auto append = [&](const TextStyle& style, std::string_view text) {
+    if (style.fontName.empty() || style.fontName == "system-ui" || style.fontName == "Geist") return;
+    auto& codepoints = requests[{style.fontName, style.weight, style.italic}];
+    const auto decoded = decodeUtf8(text);
+    codepoints.insert(codepoints.end(), decoded.begin(), decoded.end());
+  };
+  if (const auto* visual = std::get_if<slugui::TextVisual>(&element.visual)) {
+    if (visual->runs.empty()) {
+      append(visual->style, visual->text.resolve(properties));
+    } else {
+      for (const auto& run : visual->runs) append(run.style, run.text);
+    }
+  }
+  for (const auto& child : element.children) collectComponentFonts(child, properties, requests);
+}
+
+void loadComponentSystemFonts(VectorAtlas& atlas, const slugui::Component& component) {
+  std::map<FontRequest, std::vector<std::uint32_t>> requests;
+  collectComponentFonts(component.root(), component.properties(), requests);
+  for (auto& [key, codepoints] : requests) {
+    auto& [family, weight, italic] = key;
+    for (std::uint32_t codepoint = 32; codepoint <= 126; ++codepoint)
+      codepoints.push_back(codepoint);
+    std::sort(codepoints.begin(), codepoints.end());
+    codepoints.erase(std::unique(codepoints.begin(), codepoints.end()), codepoints.end());
+    const std::string path = findSystemFont(family, weight, italic);
+    if (path.empty()) {
+      std::cerr << "Figma font not installed locally: " << family << " "
+                << weight << (italic ? " italic" : "") << '\n';
+      continue;
+    }
+    if (!atlas.loadFont(path, FontFace{family, weight, italic}, codepoints)) {
+      std::cerr << "Could not load Figma font: " << family << " from " << path << '\n';
+    }
+  }
+}
+
+Shapes buildAtlas(VectorAtlas& atlas, const slugui::Component* figmaComponent = nullptr) {
   Shapes shapes;
   shapes.rectangle = atlas.addPath(Path{}.rect(0, 0, 200, 40));
   shapes.circle = atlas.addPath(Path{}.circle(50, 50, 50));
@@ -85,6 +129,7 @@ Shapes buildAtlas(VectorAtlas& atlas) {
       throw std::runtime_error("Embedded Geist variable font could not be loaded");
     }
   }
+  if (figmaComponent) loadComponentSystemFonts(atlas, *figmaComponent);
   atlas.build();
   return shapes;
 }
@@ -314,31 +359,53 @@ bool stageFigmaSource(const std::filesystem::path& source, bool importLoaded, st
     status = "Already loaded: the dropped .slugui is identical";
     return false;
   }
+  if (identical) {
+    // The running executable was already built from this exact source. A fresh preview session
+    // only needs the lightweight relaunch path; do not parse/generate the same file again.
+    status = "Import staged: source is unchanged; reopening the existing preview...";
+    return true;
+  }
+
+  std::error_code cleanupError;
+  std::filesystem::remove(backup, cleanupError);
+  std::filesystem::copy_file(
+    destination, backup, std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::copy_file(
+    source, destination, std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::last_write_time(
+    destination, std::filesystem::file_time_type::clock::now());
+
   const std::filesystem::path compiler =
     std::filesystem::path(SLUGVK_DEVELOPMENT_SOURCE_DIR) /
     "tools" / "slugui_compiler.py";
-  const int validation = runProcess(SLUGVK_PYTHON_EXECUTABLE, {
-    compiler.string(), source.string(), "--check",
+  const std::filesystem::path generated = SLUGVK_FIGMA_GENERATED_HEADER;
+  const int generation = runProcess(SLUGVK_PYTHON_EXECUTABLE, {
+    compiler.string(), destination.string(), "--output", generated.string(),
     "--namespace", "slugvk::example",
     "--class-name", "Group_31Generated",
   });
-  if (validation != 0) {
-    status = validation < 0
-      ? "Drop rejected: the AOT validator could not be started"
+  if (generation != 0) {
+    std::filesystem::copy_file(
+      backup, destination, std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::remove(backup, cleanupError);
+    status = generation < 0
+      ? "Drop rejected: the AOT compiler could not be started"
       : "Drop rejected: .slugui syntax or types are invalid";
     return false;
   }
-  if (!identical) {
-    std::error_code cleanupError;
-    std::filesystem::remove(backup, cleanupError);
-    std::filesystem::copy_file(
-      destination, backup, std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(
-      source, destination, std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::last_write_time(
-      destination, std::filesystem::file_time_type::clock::now());
+
+  // Mark this exact source/compiler revision as checked for CMake's STAMPED SlugUI rule.
+  // The header itself remains content-stable, so an unchanged generated result never forces a
+  // C++ rebuild just because the exporter/source timestamp changed.
+  const std::filesystem::path generatedStamp = generated.string() + ".stamp";
+  {
+    std::ofstream stamp(generatedStamp, std::ios::binary | std::ios::app);
   }
-  status = "Import staged: AOT rebuilding, then replacing this window...";
+  std::error_code stampError;
+  std::filesystem::last_write_time(
+    generatedStamp, std::filesystem::file_time_type::clock::now(), stampError);
+
+  status = "Import staged: generated; compiling the fast preview bridge...";
   return true;
 }
 
@@ -419,11 +486,10 @@ int main(int argc, char** argv) try {
   const bool lowestLatency = !hasArgument("--mailbox");
   VectorAtlas atlas;
   slugvk::example::SlugUiDemoGenerated slugUiDemo(atlas);
-  std::optional<slugvk::example::Group_31Generated> figmaImportDemo;
-  if (importSucceeded) figmaImportDemo.emplace(atlas);
+  auto figmaImportDemo = slugvk::example::buildFigmaImport(atlas, importSucceeded);
   const Vec2 figmaDesignSize = figmaImportDemo
-    ? componentSize(figmaImportDemo->component, {236.0f, 339.0f}) : Vec2{};
-  const Shapes shapes = buildAtlas(atlas);
+    ? componentSize(*figmaImportDemo, {236.0f, 339.0f}) : Vec2{};
+  const Shapes shapes = buildAtlas(atlas, figmaImportDemo ? &*figmaImportDemo : nullptr);
 
   Window window({1500, 950, "SlugVulkan - Vector Renderer + Declarative GUI", true, !smokeTest});
   if (smokeTest) {
@@ -442,6 +508,20 @@ int main(int argc, char** argv) try {
   std::cout << "Present mode: " << renderer.presentModeName() << " | frames in flight: 1\n";
   std::cout << "Vector font: " << atlas.fontFamily() << " " << atlas.fontStyle() << '\n';
   std::cout << "Figma import: " << (figmaImportDemo ? "loaded (drop session)" : "none") << '\n';
+
+  ExternalImageId smokeExternalImage = 0;
+  if (smokeTest) {
+    auto& interop = renderer.vulkanInterop();
+    smokeExternalImage = interop.createOwnedRgba32fImage(2, 2);
+    const std::array<float, 16> pixels{
+      1.0f, 1.0f, 0.1f, 0.1f,
+      1.0f, 0.1f, 1.0f, 0.1f,
+      1.0f, 0.1f, 0.1f, 1.0f,
+      1.0f, 1.0f, 1.0f, 1.0f,
+    };
+    if (!interop.updateOwnedRgba32fImage(smokeExternalImage, pixels))
+      throw std::runtime_error("Could not initialize the VulkanInterop smoke image");
+  }
 
   UiSkin skin;
   skin.rectangle = shapes.rectangle;
@@ -527,6 +607,19 @@ int main(int argc, char** argv) try {
     });
   sui::Runtime slugUiRuntime;
   sui::Runtime figmaRuntime;
+  RetainedDrawListId figmaRetainedDrawList = 0;
+  if (figmaImportDemo) {
+    // Imported Figma documents are static for the lifetime of this preview process. Compile the
+    // full scene graph once, keep its Slug instances in the device-local retained arena, and use
+    // only a translation/scale/clip transform while panning and zooming. Rebuilding thousands of
+    // glyph/shape instances every frame defeats Slug's resolution-independent retained geometry.
+    DrawList retainedSource;
+    figmaRuntime.render(*figmaImportDemo, sui::FrameInput{}, retainedSource,
+                        {0.0f, 0.0f, figmaDesignSize.x, figmaDesignSize.y}, 1.0f);
+    figmaRetainedDrawList = renderer.createRetainedDrawList(retainedSource);
+    if (figmaRetainedDrawList == 0)
+      throw std::runtime_error("Could not retain the imported Figma DrawList");
+  }
 
   Tween<float> motion = tween(0.0f, 1.0f, 1800.0f, Easing::Spring);
   bool reverseMotion = false;
@@ -567,7 +660,8 @@ int main(int argc, char** argv) try {
     }
     const float animated = motion.update(deltaMs);
     if (smokeTest) {
-      if (smokeFrames >= 9) page = DemoPage::TextZoom;
+      if (figmaPreview) page = DemoPage::FigmaImport;
+      else if (smokeFrames >= 9) page = DemoPage::TextZoom;
       else if (smokeFrames >= 6) page = DemoPage::FigmaImport;
       else if (smokeFrames >= 3) page = DemoPage::SlugUi;
     }
@@ -575,6 +669,8 @@ int main(int argc, char** argv) try {
     draw.clear();
     const Vec2 framebuffer = window.framebufferSize();
     draw.setClip({0, 0, framebuffer.x, framebuffer.y});
+    if (smokeExternalImage != 0)
+      draw.externalImage(smokeExternalImage, {2, 2, 12, 12}, 2, 2);
 
     draw.roundedRect({18, 16, framebuffer.x - 36, 74}, 16.0f,
       Paint::gradient(GradientKind::Linear, Color::fromRgb8(0x191f38), Color::fromRgb8(0x242d50), {0, 0}, {1, 0}),
@@ -833,9 +929,16 @@ int main(int argc, char** argv) try {
 
         const float renderScale = fitScale * figmaZoom;
         const Vec2 origin = canvasCenter + figmaPan - designSize * (renderScale * 0.5f);
-        figmaRuntime.render(figmaImportDemo->component, window.input(), draw,
-                            {origin.x, origin.y, designSize.x * renderScale,
-                             designSize.y * renderScale}, renderScale);
+        if (figmaRetainedDrawList != 0) {
+          const Rect previousClip = draw.clip();
+          draw.setClip(canvas);
+          draw.retainedDrawList(figmaRetainedDrawList, origin, renderScale);
+          draw.setClip(previousClip);
+        } else {
+          figmaRuntime.render(*figmaImportDemo, window.input(), draw,
+                              {origin.x, origin.y, designSize.x * renderScale,
+                               designSize.y * renderScale}, renderScale);
+        }
       } else {
         TextStyle empty = textStyle(18);
         empty.align = HorizontalAlign::Center;
@@ -906,6 +1009,8 @@ int main(int argc, char** argv) try {
   window.setRefreshCallback({});
   window.setDropCallback({});
   renderer.waitIdle();
+  if (smokeExternalImage != 0)
+    renderer.vulkanInterop().unregisterExternalImage(smokeExternalImage);
   if (rebuildAfterExit) {
     const auto executable = std::filesystem::absolute(argv[0]);
     if (!launchExampleRebuild(executable))
@@ -920,7 +1025,8 @@ int main(int argc, char** argv) try {
               << finalStats.gpuMilliseconds << " ms GPU, "
               << finalStats.uploadedBytes / 1024.0f << " KiB upload, "
               << liveRefreshCount << " live resize redraws\n";
-    if (finalStats.drawCalls == 0 || finalStats.quads == 0 || finalStats.retainedQuads == 0 || liveRefreshCount == 0)
+    if (finalStats.drawCalls == 0 || finalStats.quads == 0 ||
+        (!figmaPreview && finalStats.retainedQuads == 0) || liveRefreshCount == 0)
       throw std::runtime_error("Smoke test produced an empty GPU batch");
   }
   return 0;

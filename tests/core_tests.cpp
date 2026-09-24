@@ -1,6 +1,9 @@
 #include "slughorn/slughorn.hpp"
 #include "slugvk/slugvk.hpp"
+#include "slugvk/vulkan_interop.hpp"
+#include "slughorn/render.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <iostream>
@@ -34,6 +37,19 @@ int main() try {
   require(editor.insert("7") && editor.value == "7", "typing replaces a selected value");
   editor.insert("\xE3\x81\x82");
   require(editor.backspace() && editor.value == "7", "UTF-8 backspace erases one codepoint");
+  editor.beginTransaction();
+  editor.insert("a");
+  editor.insert("b");
+  editor.insert("c");
+  editor.endTransaction();
+  require(editor.value == "7abc", "one UI frame may contain multiple text mutations");
+  require(editor.undo() && editor.value == "7", "transaction undo restores the whole frame edit");
+  require(editor.redo() && editor.value == "7abc", "transaction redo restores the whole frame edit");
+  editor.selectAll();
+  editor.beginTransaction();
+  editor.insert("\xE6\x97\xA5\xE6\x9C\xAC");
+  editor.endTransaction();
+  require(editor.undo() && editor.value == "7abc", "UTF-8 replacement participates in bounded history");
   require(std::abs(ease(Easing::Linear, 0.25f) - 0.25f) < 0.0001f, "linear easing");
   require(std::abs(ease(Easing::SmoothStep, 0.5f) - 0.5f) < 0.0001f, "smoothstep easing");
   auto decoded = decodeUtf8("A\xE3\x81\x82\xF0\x9F\x98\x80");
@@ -115,6 +131,19 @@ int main() try {
                   GradientKind::Shader,
           "fill and line share Paint");
 
+  static_assert(std::is_trivially_copyable_v<VulkanDeviceContext>);
+  static_assert(std::is_trivially_copyable_v<VulkanFrameContext>);
+  DrawList externalImageList;
+  externalImageList.externalImage(3, {4, 8, 64, 32}, 16, 8);
+  require(externalImageList.commands().size() == 1 &&
+              std::holds_alternative<ExternalImageCommand>(externalImageList.commands().front()),
+          "external image draw command is part of the public display IR");
+  const auto& externalImage =
+      std::get<ExternalImageCommand>(externalImageList.commands().front());
+  require(externalImage.image == 3 && externalImage.width == 16 && externalImage.height == 8 &&
+              externalImage.destination.x == 4 && externalImage.destination.height == 32,
+          "external image draw command preserves image identity and dimensions");
+
   constexpr std::string_view persistentText = "persistent text without a frame copy";
   DrawList staticTextList;
   staticTextList.textStatic(persistentText, {0, 0, 300, 30}, {});
@@ -155,6 +184,27 @@ int main() try {
           individualCorner.border.align == StrokeAlign::Inside &&
           individualCorner.border.paint.start.r == Color::fromRgb8(0xff4080).r,
           "individual corner radius and smoothing overrides");
+
+  // The immediate UI rectangle helper must emit the skin atlas shape instead of recursively
+  // calling itself. This protects the normal example's first Windows refresh callback.
+  UiSkin immediateSkin;
+  immediateSkin.rectangle = 17;
+  UiContext immediateUi(immediateSkin);
+  InputState immediateInput;
+  DrawList immediateList;
+  GridModel immediateGrid{{"Column"}, {{"Cell"}}, 0, 0};
+  immediateUi.beginFrame(immediateInput, immediateList);
+  immediateUi.gridView(hashId("immediate-grid-regression"), {0, 0, 160, 80}, immediateGrid);
+  immediateUi.endFrame();
+  require(!immediateList.commands().empty(), "immediate UI grid emits draw commands");
+  const bool emittedSkinRectangle = std::any_of(
+      immediateList.commands().begin(), immediateList.commands().end(), [](const auto& command) {
+        return std::holds_alternative<DrawCommand>(command) &&
+               std::get<DrawCommand>(command).shape == 17;
+      });
+  require(emittedSkinRectangle,
+          "immediate UI rectangle helper uses the configured rectangle atlas shape");
+
   BorderStyle sideBorder;
   sideBorder.width = 9.0f;
   sideBorder.individualWidths = BorderWidths{1.0f, 2.0f, 3.0f, 4.0f};
@@ -191,6 +241,10 @@ int main() try {
 #endif
   const ShapeId rectangle = atlas.addPath(Path{}.rect(0, 0, 100, 40));
   const ShapeId rounded = atlas.addPath(Path{}.roundedRect(0, 0, 100, 40, 8, 100));
+  Path nestedWinding;
+  nestedWinding.rect(0, 0, 100, 100).rect(25, 25, 50, 50);
+  const ShapeId nestedNonZero = atlas.addPath(nestedWinding, FillRule::NonZero);
+  const ShapeId nestedEvenOdd = atlas.addPath(nestedWinding, FillRule::EvenOdd);
   StrokeStyle dashed;
   dashed.width = 3;
   dashed.cap = LineCap::Round;
@@ -217,7 +271,7 @@ int main() try {
       atlas.addStroke(Path{}.svgPath("m15 14 5-5-5-5 M20 9H9.5a5.5 5.5 0 0 0 0 11H13",
                                     24.0f),
                       svgStroke);
-  require(rectangle && rounded && stroke && taperStroke && relativeSvg,
+  require(rectangle && rounded && nestedNonZero && nestedEvenOdd && stroke && taperStroke && relativeSvg,
           "shape registration");
   const auto svgMetric = atlas.metrics(relativeSvg);
   require(svgMetric && svgMetric->bearingY <= 25.1f &&
@@ -235,6 +289,12 @@ int main() try {
               bandTexture.bytes.size() ==
                 static_cast<std::size_t>(bandTexture.width) * bandTexture.height * 4U,
           "band texture uses compact RG16UI storage");
+  const auto nonZeroSampler = slughorn::render::decode(atlas.native(), slughorn::Key(nestedNonZero));
+  const auto evenOddSampler = slughorn::render::decode(atlas.native(), slughorn::Key(nestedEvenOdd));
+  const float nonZeroCenter = static_cast<float>(nonZeroSampler.renderSampleBanded(50.0f, 50.0f, 4.0f, 4.0f).fill);
+  const float evenOddCenter = static_cast<float>(evenOddSampler.renderSampleBanded(50.0f, 50.0f, 4.0f, 4.0f).fill);
+  require(nonZeroCenter > 0.99f && evenOddCenter < 0.01f,
+          "Slug fill-rule metadata preserves exact nonzero/evenodd coverage");
 
   const std::string fontPath = findDefaultSystemFont();
   if (!fontPath.empty()) {
@@ -250,6 +310,30 @@ int main() try {
     require(fontAtlas.hasFontFace("TestFace", false) &&
             !fontAtlas.hasFontFace("TestFace", true),
             "font face style availability");
+
+    VectorAtlas shapedAtlas;
+    const std::vector<std::uint32_t> shapingCodepoints{
+      static_cast<std::uint32_t>('A'), static_cast<std::uint32_t>('f'),
+      static_cast<std::uint32_t>('i'), static_cast<std::uint32_t>('o'),
+      static_cast<std::uint32_t>('c'), static_cast<std::uint32_t>('e'), 0x0301u};
+    require(shapedAtlas.loadFont(
+              fontPath, FontFace{.family = "ShapeFace", .weight = 400}, shapingCodepoints),
+            "shaping face registration");
+    require(shapedAtlas.prepareText("office", "ShapeFace", 400, false),
+            "HarfBuzz prepares GSUB/GPOS glyphs before atlas build");
+    require(shapedAtlas.prepareText("A\xCC\x81", "ShapeFace", 400, false),
+            "HarfBuzz prepares combining-mark positioning");
+    shapedAtlas.build();
+    const auto shapedOffice = shapedAtlas.shapeText("office", "ShapeFace", 400, false);
+    require(shapedOffice && !shapedOffice->glyphs.empty() && shapedOffice->xAdvance > 0.0f,
+            "prepared text resolves to a positioned glyph run");
+    require(std::all_of(
+              shapedOffice->glyphs.begin(), shapedOffice->glyphs.end(),
+              [](const ShapedGlyph& glyph) { return glyph.shape != 0; }),
+            "every shaped glyph maps to immutable Slug atlas geometry");
+    const auto shapedAccent = shapedAtlas.shapeText("A\xCC\x81", "ShapeFace", 400, false);
+    require(shapedAccent && !shapedAccent->glyphs.empty(),
+            "combining sequence remains shapeable after atlas finalization");
   }
 
   {
@@ -338,6 +422,167 @@ int main() try {
     require(growingBox->bounds.x == 10.0f && growingBox->bounds.y == 34.0f &&
             growingBox->bounds.width == 80.0f && growingBox->bounds.height == 56.0f,
             "SlugUI column grow and stretch layout");
+  }
+
+  {
+    namespace sui = slugui;
+    auto root = sui::row(hashId("figma-wrap-root"));
+    root.layout.wrap = true;
+    root.layout.spacing = sui::Length::physical(10.0f);
+    root.layout.counterSpacing = sui::Length::physical(20.0f);
+    for (int index = 0; index < 3; ++index) {
+      auto child = sui::roundedRectangle(
+          hashId(std::string("figma-wrap-child-") + std::to_string(index)), sharedShader);
+      child.layout.width = sui::Length::physical(40.0f);
+      child.layout.height = sui::Length::physical(10.0f);
+      root.add(std::move(child));
+    }
+    sui::Component component(std::move(root));
+    sui::Runtime runtime;
+    runtime.layout(component, {0, 0, 100, 100}, 1.0f);
+    const auto* first = runtime.find(hashId("figma-wrap-child-0"));
+    const auto* second = runtime.find(hashId("figma-wrap-child-1"));
+    const auto* third = runtime.find(hashId("figma-wrap-child-2"));
+    require(first && second && third, "SlugUI wrap produces all child boxes");
+    require(first->bounds.x == 0.0f && second->bounds.x == 50.0f &&
+            first->bounds.y == 0.0f && second->bounds.y == 0.0f,
+            "SlugUI wrap preserves primary-axis item spacing");
+    require(third->bounds.x == 0.0f && third->bounds.y == 30.0f,
+            "SlugUI wrap starts a new track using counter-axis spacing");
+  }
+
+  {
+    namespace sui = slugui;
+    auto root = sui::row(hashId("figma-absolute-flow-root"));
+    root.layout.spacing = sui::Length::physical(10.0f);
+
+    auto first = sui::roundedRectangle(hashId("figma-flow-first"), sharedShader);
+    first.layout.width = sui::Length::physical(50.0f);
+    first.layout.height = sui::Length::physical(20.0f);
+    root.add(std::move(first));
+
+    auto floating = sui::roundedRectangle(hashId("figma-flow-floating"), sharedShader);
+    floating.layout.absolutePositioned = true;
+    floating.layout.x = sui::Length::physical(120.0f);
+    floating.layout.y = sui::Length::physical(10.0f);
+    floating.layout.width = sui::Length::physical(30.0f);
+    floating.layout.height = sui::Length::physical(20.0f);
+    root.add(std::move(floating));
+
+    auto second = sui::roundedRectangle(hashId("figma-flow-second"), sharedShader);
+    second.layout.width = sui::Length::physical(40.0f);
+    second.layout.height = sui::Length::physical(20.0f);
+    root.add(std::move(second));
+
+    sui::Component component(std::move(root));
+    sui::Runtime runtime;
+    runtime.layout(component, {0, 0, 200, 80}, 1.0f);
+    const auto* firstBox = runtime.find(hashId("figma-flow-first"));
+    const auto* floatingBox = runtime.find(hashId("figma-flow-floating"));
+    const auto* secondBox = runtime.find(hashId("figma-flow-second"));
+    require(firstBox && floatingBox && secondBox,
+            "SlugUI absolute auto-layout children all produce boxes");
+    require(firstBox->bounds.x == 0.0f && secondBox->bounds.x == 60.0f,
+            "absolute child does not consume Row flow or spacing");
+    require(floatingBox->bounds.x == 120.0f && floatingBox->bounds.y == 10.0f &&
+            floatingBox->bounds.width == 30.0f && floatingBox->bounds.height == 20.0f,
+            "absolute child keeps Figma x/y inside a Row parent");
+  }
+
+  {
+    namespace sui = slugui;
+    auto root = sui::row(hashId("figma-focus-parent"));
+    root.layout.preferredWidth = sui::Length::physical(57.0f);
+    root.layout.preferredHeight = sui::Length::physical(32.0f);
+    root.layout.padding.top = sui::Length::physical(7.0f);
+    root.layout.padding.bottom = sui::Length::physical(7.0f);
+    root.layout.crossAlignment = sui::Alignment::Center;
+
+    auto radio = sui::roundedRectangle(hashId("figma-focus-radio"), sharedShader);
+    radio.layout.width = sui::Length::physical(14.0f);
+    radio.layout.height = sui::Length::physical(14.0f);
+    root.add(std::move(radio));
+
+    auto ring = sui::roundedRectangle(hashId("figma-focus-ring"), sharedShader);
+    ring.layout.absolutePositioned = true;
+    ring.layout.x = sui::Length::physical(-4.0f);
+    ring.layout.y = sui::Length::physical(5.0f);
+    ring.layout.width = sui::Length::physical(22.0f);
+    ring.layout.height = sui::Length::physical(22.0f);
+    ring.layout.horizontalConstraint = sui::Constraint::Stretch;
+    ring.layout.verticalConstraint = sui::Constraint::Stretch;
+    root.add(std::move(ring));
+
+    sui::Component component(std::move(root));
+    sui::Runtime runtime;
+    runtime.layout(component, {0, 0, 57, 32}, 1.0f);
+    const auto* ringBox = runtime.find(hashId("figma-focus-ring"));
+    require(ringBox && ringBox->bounds.x == -4.0f && ringBox->bounds.y == 5.0f &&
+            ringBox->bounds.width == 22.0f && ringBox->bounds.height == 22.0f,
+            "Figma absolute child coordinates ignore auto-layout padding");
+
+    runtime.layout(component, {0, 0, 67, 42}, 1.0f);
+    ringBox = runtime.find(hashId("figma-focus-ring"));
+    require(ringBox && ringBox->bounds.x == -4.0f && ringBox->bounds.y == 5.0f &&
+            ringBox->bounds.width == 32.0f && ringBox->bounds.height == 32.0f,
+            "Figma STRETCH constraints preserve authored edge anchors");
+  }
+
+  {
+    namespace sui = slugui;
+    auto image = sui::roundedRectangle(
+      hashId("figma-image-fit"), Paint::solid(Color::fromRgb8(0x406080)));
+    image.layout.width = sui::Length::physical(320.0f);
+    image.layout.height = sui::Length::physical(240.0f);
+    auto& visual = std::get<sui::RoundedRectangleVisual>(image.visual);
+    visual.image.enabled = true;
+    visual.image.sourceWidth = 1920.0f;
+    visual.image.sourceHeight = 1080.0f;
+    visual.image.scaleMode = sui::ImageScaleMode::Fit;
+
+    sui::Component component(std::move(image));
+    sui::Runtime runtime;
+    DrawList list;
+    runtime.render(component, sui::FrameInput{}, list, {0, 0, 320, 240});
+    require(list.commands().size() == 1 &&
+            std::holds_alternative<RoundedRectCommand>(list.commands().front()),
+            "Figma image placeholder lowers to a rounded-rect draw");
+    const auto& imageCommand = std::get<RoundedRectCommand>(list.commands().front());
+    require(std::abs(imageCommand.destination.x) < 0.001f &&
+            std::abs(imageCommand.destination.y - 30.0f) < 0.001f &&
+            std::abs(imageCommand.destination.width - 320.0f) < 0.001f &&
+            std::abs(imageCommand.destination.height - 180.0f) < 0.001f,
+            "Figma FIT image placeholder preserves source aspect and centers it");
+  }
+
+  {
+    namespace sui = slugui;
+    auto root = sui::row(hashId("figma-reverse-z-root"));
+    root.layout.reverseChildPaintOrder = true;
+    root.layout.spacing = sui::Length::physical(-10.0f);
+
+    auto first = sui::roundedRectangle(hashId("figma-reverse-z-first"), sharedShader);
+    first.layout.width = sui::Length::physical(30.0f);
+    first.layout.height = sui::Length::physical(20.0f);
+    root.add(std::move(first));
+
+    auto second = sui::roundedRectangle(hashId("figma-reverse-z-second"), sharedShader);
+    second.layout.width = sui::Length::physical(30.0f);
+    second.layout.height = sui::Length::physical(20.0f);
+    root.add(std::move(second));
+
+    sui::Component component(std::move(root));
+    sui::Runtime runtime;
+    DrawList list;
+    runtime.render(component, sui::FrameInput{}, list, {0, 0, 80, 20});
+    const auto* firstBox = runtime.find(hashId("figma-reverse-z-first"));
+    const auto* secondBox = runtime.find(hashId("figma-reverse-z-second"));
+    require(firstBox && secondBox && firstBox->bounds.x == 0.0f && secondBox->bounds.x == 20.0f,
+            "reverse paint order does not change Figma auto-layout flow positions");
+    require(list.commands().size() == 2 &&
+            std::get<RoundedRectCommand>(list.commands()[0]).destination.x == 20.0f &&
+            std::get<RoundedRectCommand>(list.commands()[1]).destination.x == 0.0f,
+            "Figma itemReverseZIndex reverses canvas stacking without reversing layout");
   }
 
   {

@@ -78,6 +78,17 @@ public:
 所有しないため、既定の`waitForVisibleFramebuffer()`をblockingさせません。standalone GLFW互換層だけが
 最小化解除までeventを待ちます。
 
+### VulkanInterop（実装済みadvanced boundary）
+
+既存hostが同じVulkan device上でcompute/transferを行う場合は`vulkan_interop.hpp`を明示includeし、
+`VulkanRenderer::vulkanInterop()`からdevice/queue context、external RGBA32F buffer、pre-render-pass recorderへ
+アクセスできます。通常のUI/host adapterはこのAPIへ依存させません。
+
+外部bufferの所有権はhost側に残り、登録中は有効である必要があります。renderer所有のCPU snapshot bufferも
+作成可能です。frame recorderはrendererのcommand bufferへ記録するだけで、submit/wait/throwは禁止です。
+この境界によりD3D/AE adapter等の将来backend変換をcore UIへ漏らさず、Vulkan-native hostだけがzero-copy経路を
+opt-inできます。
+
 ## Windows adapter
 
 host SDKが所有するpanel/containerから子`HWND`を取得または作成し、次の一般的な経路を使います。

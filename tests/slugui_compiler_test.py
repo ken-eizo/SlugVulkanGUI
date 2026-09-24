@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -26,6 +27,16 @@ class SlugUiCompilerTest(unittest.TestCase):
         self.assertIn("ValueSource<slugvk::Paint>", first)
         self.assertIn("callback_toggle_popup", first)
         self.assertIn("ImportFidelity::Native", first)
+
+    def test_atomic_output_preserves_unchanged_timestamp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "generated.hpp"
+            self.assertTrue(compiler.write_atomic(output, "first\n"))
+            first_mtime = output.stat().st_mtime_ns
+            self.assertFalse(compiler.write_atomic(output, "first\n"))
+            self.assertEqual(output.stat().st_mtime_ns, first_mtime)
+            self.assertTrue(compiler.write_atomic(output, "second\n"))
+            self.assertEqual(output.read_text(encoding="utf-8"), "second\n")
 
     def test_reference_type_mismatch_is_rejected(self):
         source = """
@@ -156,14 +167,75 @@ component VectorAsset {
         generated = compiler.compile_text(source, "vector.slugui", "test")
         self.assertIn("explicit VectorAsset(slugvk::VectorAtlas& atlas)", generated)
         self.assertGreaterEqual(generated.count("atlas->addPath"), 2)
-        self.assertIn(".lineTo(", generated)
-        self.assertIn(".quadraticTo(", generated)
-        self.assertIn(".cubicTo(", generated)
+        self.assertGreaterEqual(generated.count(".svgPathYDown("), 3)
+        self.assertIn("M1 1 h20 v20 h-20 z", generated)
+        self.assertIn("M4 16 Q10 4 16 16 T28 16", generated)
+        self.assertIn("M2 2 C8 0 20 0 26 2 S30 20 26 26 A4 4 0 0 1 22 30", generated)
+        self.assertNotIn(".lineTo(", generated)
+        self.assertNotIn(".quadraticTo(", generated)
+        self.assertNotIn(".cubicTo(", generated)
         self.assertIn(".strokeShape = asset_", generated)
         self.assertIn(".fillPlacement = slugvk::Rect{", generated)
         self.assertIn(".strokePlacement = slugvk::Rect{", generated)
         self.assertNotIn("parse_svg", generated)
-        self.assertRegex(generated, r"\.moveTo\(1\.0f, -1\.0f\)")
+
+    def test_evenodd_winding_is_normalized_before_atlas_build(self):
+        source = """
+component EvenOddAsset {
+  Shape icon {
+    width: 20px;
+    height: 20px;
+    path-data: "M0 0 L20 0 L20 20 L0 20 Z M5 5 L15 5 L15 15 L5 15 Z";
+    path-winding-rules: evenodd;
+    fill: #ffffff;
+  }
+}
+"""
+        generated = compiler.compile_text(source, "evenodd.slugui", "test")
+        self.assertIn(".svgPathYDown(", generated)
+        self.assertNotIn(".normalizeEvenOdd();", generated)
+        self.assertIn("slugvk::FillRule::EvenOdd", generated)
+        self.assertIn("atlas->addPath", generated)
+
+    def test_mixed_winding_rules_fail_instead_of_approximating(self):
+        source = """
+component MixedWinding {
+  Shape icon {
+    width: 20px;
+    height: 20px;
+    path-data: ["M0 0 L20 0 L20 20 L0 20 Z", "M5 5 L15 5 L15 15 L5 15 Z"];
+    path-winding-rules: [nonzero, evenodd];
+    fill: #ffffff;
+  }
+}
+"""
+        with self.assertRaises(compiler.CompileError) as caught:
+            compiler.compile_text(source, "mixed-winding.slugui", "test")
+        self.assertIn("mixed nonzero/evenodd", caught.exception.message)
+
+    def test_identical_vector_geometry_is_interned_once(self):
+        source = """
+component RepeatedIcons {
+  Absolute root {
+    Shape first {
+      width: 16px;
+      height: 16px;
+      path-data: "M0 0 L16 0 L16 16 L0 16 Z";
+      fill: #ffffff;
+    }
+    Shape second {
+      x: 20px;
+      width: 16px;
+      height: 16px;
+      path-data: "M0 0 L16 0 L16 16 L0 16 Z";
+      fill: #ff0000;
+    }
+  }
+}
+"""
+        generated = compiler.compile_text(source, "repeated-icons.slugui", "test")
+        self.assertEqual(generated.count("atlas->addPath"), 1)
+        self.assertGreaterEqual(generated.count(", asset_0,"), 2)
 
     def test_explicit_vector_placements_override_path_bounds(self):
         source = """
@@ -206,6 +278,7 @@ component FigmaSelectionGenerated {
     Text label {
       text: "Weighted";
       font: "Geist";
+      font-style: "SemiBold";
       font-weight: 650;
     }
   }
@@ -216,6 +289,252 @@ component FigmaSelectionGenerated {
         self.assertIn("struct Group_31Generated", generated)
         self.assertIn('hashId("FigmaSelectionGenerated/selection_root/label")', generated)
         self.assertIn(".style.weight = 650;", generated)
+        self.assertIn('.style.fontStyle = "SemiBold";', generated)
+        self.assertIn('atlas->loadSystemFont("Geist", 650, false', generated)
+        self.assertIn('"SemiBold");', generated)
+        self.assertIn("87u", generated)  # 'W' from the actually used glyph set
+        self.assertIn('atlas->prepareText(', generated)
+        self.assertIn('"Geist", 650, false, "SemiBold"', generated)
+
+    def test_figma_node_id_is_stable_across_rename_and_regroup(self):
+        first = """
+component FirstImport {
+  Absolute old_group {
+    Text old_name {
+      text: "A";
+      source-provider: "figma";
+      source-document: "fixture-file";
+      source-node: "42:7";
+    }
+  }
+}
+"""
+        second = """
+component RenamedImport {
+  Absolute new_group {
+    Absolute extra_group {
+      Text renamed_node {
+        text: "A";
+        source-provider: "figma";
+        source-document: "fixture-file";
+        source-node: "42:7";
+      }
+    }
+  }
+}
+"""
+        first_cpp = compiler.compile_text(first, "first.slugui", "test")
+        second_cpp = compiler.compile_text(second, "second.slugui", "test")
+        stable = 'hashId("figma/fixture-file/42:7")'
+        self.assertIn(stable, first_cpp)
+        self.assertIn(stable, second_cpp)
+        self.assertNotIn('hashId("FirstImport/old_group/old_name")', first_cpp)
+
+    def test_figma_provider_data_is_preserved(self):
+        source = r"""
+component ProviderData {
+  Absolute instance {
+    source-provider: "figma";
+    source-document: "fixture-file";
+    source-node: "90:3";
+    source-provider-data: "{\"componentProperties\":{\"State\":{\"type\":\"VARIANT\",\"value\":\"Focus\"}},\"componentSetId\":\"90:1\",\"constraints\":{\"horizontal\":\"MAX\",\"vertical\":\"CENTER\"},\"mainComponentId\":\"90:2\",\"nodeType\":\"INSTANCE\",\"variantSelection\":{\"State\":\"Focus\"}}";
+  }
+}
+"""
+        generated = compiler.compile_text(source, "provider-data.slugui", "test")
+        self.assertIn(".source.providerData =", generated)
+        self.assertIn(r"componentSetId", generated)
+        self.assertIn(r"mainComponentId", generated)
+        self.assertIn('.source.componentSetId = std::string{"90:1"};', generated)
+        self.assertIn('.source.mainComponentId = std::string{"90:2"};', generated)
+        self.assertIn('.source.nodeType = std::string{"INSTANCE"};', generated)
+        self.assertIn(
+            ".source.figmaKind = slugvk::slugui::FigmaSemanticKind::Instance;", generated)
+        self.assertIn('.source.variantSelectionJson = std::string{', generated)
+        self.assertIn(r'\"State\":\"Focus\"', generated)
+        self.assertIn(".layout.horizontalConstraint = slugvk::slugui::Constraint::Max;", generated)
+        self.assertIn(".layout.verticalConstraint = slugvk::slugui::Constraint::Center;", generated)
+
+    def test_preview_can_strip_figma_source_metadata_without_losing_layout_or_stable_id(self):
+        source = r"""
+component ProviderData {
+  Absolute instance {
+    source-provider: "figma";
+    source-document: "fixture-file";
+    source-node: "90:3";
+    source-provider-data: "{\"constraints\":{\"horizontal\":\"MAX\",\"vertical\":\"CENTER\"},\"nodeType\":\"INSTANCE\",\"mainComponentId\":\"90:2\"}";
+  }
+}
+"""
+        generated = compiler.compile_text(
+            source, "provider-data.slugui", "test", strip_source_metadata=True)
+        self.assertIn('hashId("figma/fixture-file/90:3")', generated)
+        self.assertIn(".layout.horizontalConstraint = slugvk::slugui::Constraint::Max;", generated)
+        self.assertIn(".layout.verticalConstraint = slugvk::slugui::Constraint::Center;", generated)
+        self.assertNotIn(".source.providerData", generated)
+        self.assertNotIn(".source.mainComponentId", generated)
+        self.assertNotIn(".source.nodeType", generated)
+
+    def test_large_provider_data_is_chunked_for_msvc(self):
+        payload = "x" * 20000
+        source = f"""
+component LargeMetadata {{
+  Absolute instance {{
+    source-provider: "figma";
+    source-provider-data: "{payload}";
+  }}
+}}
+"""
+        generated = compiler.compile_text(source, "large-provider-data.slugui", "test")
+        self.assertIn(".source.providerData = std::string{", generated)
+        self.assertIn(".source.providerData.append(", generated)
+        self.assertNotIn('"' + payload + '"', generated)
+
+    def test_legacy_figma_instance_swap_catalog_is_compacted(self):
+        payload = (
+            '{"componentDefinitions":{"Icon":{"type":"INSTANCE_SWAP","defaultValue":"90:icon",'
+            '"preferredValues":[{"type":"COMPONENT","key":"a"},{"type":"COMPONENT","key":"b"}]}},'
+            '"componentProperties":{"Icon":{"type":"INSTANCE_SWAP","value":"90:selected"},'
+            '"State":{"type":"VARIANT","value":"Focus"}},'
+            '"mainComponentId":"90:2","nodeType":"INSTANCE"}'
+        )
+        compacted = compiler.compact_figma_provider_data(payload)
+        self.assertNotIn("preferredValues", compacted)
+        self.assertIn('"preferredValueCount":2', compacted)
+        self.assertIn('"value":"90:selected"', compacted)
+        self.assertIn('"variantSelection":{"State":"Focus"}', compacted)
+        self.assertIn('"mainComponentId":"90:2"', compacted)
+
+    def test_figma_image_placeholder_attributes_are_typed(self):
+        source = """
+component ImagePlaceholder {
+  Rectangle image {
+    width: 320px;
+    height: 240px;
+    image-source-width: 1920;
+    image-source-height: 1080;
+    image-scale-mode: fit;
+    fill: #405060;
+  }
+}
+"""
+        generated = compiler.compile_text(source, "image-placeholder.slugui", "test")
+        self.assertIn(".image.enabled = true;", generated)
+        self.assertIn(".image.sourceWidth = 1920.0f;", generated)
+        self.assertIn(".image.sourceHeight = 1080.0f;", generated)
+        self.assertIn(".image.scaleMode = slugvk::slugui::ImageScaleMode::Fit;", generated)
+
+    def test_figma_stretch_shape_can_use_preferred_extent_for_path_placement(self):
+        source = """
+component StretchVector {
+  Row root {
+    width: 100px;
+    height: 40px;
+    Shape divider {
+      width: 1px;
+      preferred-height: 32px;
+      align-self: stretch;
+      path-data: "M1 0 L0 0 L0 32 L1 32 L1 0 Z";
+      path-placement: [0px, 0px, 1px, 32px];
+      source-provider: "figma";
+    }
+  }
+}
+"""
+        generated = compiler.compile_text(source, "stretch-vector.slugui", "test")
+        self.assertIn("fillPlacement = slugvk::Rect{0.0f, 0.0f, 1.0f, 1.0f}", generated)
+
+    def test_wrap_layout_attributes_are_typed(self):
+        source = """
+component WrapLayout {
+  Row root {
+    wrap: true;
+    spacing: 10px;
+    counter-spacing: 20px;
+    counter-justify: space-between;
+  }
+}
+"""
+        generated = compiler.compile_text(source, "wrap.slugui", "test")
+        self.assertIn(".layout.wrap = true;", generated)
+        self.assertIn(".layout.counterSpacing = slugvk::slugui::Length::logical(20.0f)", generated)
+        self.assertIn(".layout.counterAlignment = slugvk::slugui::Justify::SpaceBetween;", generated)
+
+    def test_figma_constraints_are_typed(self):
+        source = """
+component Constraints {
+  Absolute root {
+    Rectangle child {
+      x: -4px;
+      y: 5px;
+      width: 22px;
+      height: 22px;
+      constraint-horizontal: stretch;
+      constraint-vertical: center;
+    }
+  }
+}
+"""
+        generated = compiler.compile_text(source, "constraints.slugui", "test")
+        self.assertIn(".layout.horizontalConstraint = slugvk::slugui::Constraint::Stretch;", generated)
+        self.assertIn(".layout.verticalConstraint = slugvk::slugui::Constraint::Center;", generated)
+
+    def test_absolute_position_attribute_is_typed(self):
+        source = """
+component AbsoluteChild {
+  Row root {
+    width: 200px;
+    height: 80px;
+    Rectangle floating {
+      position: absolute;
+      x: 120px;
+      y: 10px;
+      width: 30px;
+      height: 20px;
+    }
+  }
+}
+"""
+        generated = compiler.compile_text(source, "absolute-child.slugui", "test")
+        self.assertIn(".layout.absolutePositioned = true;", generated)
+        self.assertIn(".layout.x = slugvk::slugui::Length::logical(120.0f)", generated)
+        self.assertIn(".layout.y = slugvk::slugui::Length::logical(10.0f)", generated)
+
+    def test_reverse_paint_order_attribute_is_typed(self):
+        source = """
+component ReversePaint {
+  Row root {
+    reverse-paint-order: true;
+    Rectangle first { width: 20px; height: 20px; }
+    Rectangle second { width: 20px; height: 20px; }
+  }
+}
+"""
+        generated = compiler.compile_text(source, "reverse-paint.slugui", "test")
+        self.assertIn(".layout.reverseChildPaintOrder = true;", generated)
+
+    def test_generated_child_subtrees_have_bounded_cpp_lifetimes(self):
+        source = """
+component ScopeFixture {
+  Column root {
+    Rectangle first { width: 10px; }
+    Rectangle second { width: 20px; }
+  }
+}
+"""
+        generated = compiler.compile_text(source, "scope-fixture.slugui", "test")
+        self.assertIn(
+            "auto built_node_1 = [&]() -> slugvk::slugui::Element {\n"
+            "      auto node_1 =",
+            generated,
+        )
+        self.assertIn("return node_1;\n    }();\n    node_0.add(std::move(built_node_1));", generated)
+        self.assertIn(
+            "auto built_node_2 = [&]() -> slugvk::slugui::Element {\n"
+            "      auto node_2 =",
+            generated,
+        )
+        self.assertIn("return node_2;\n    }();\n    node_0.add(std::move(built_node_2));", generated)
 
     def test_font_weight_range_is_checked(self):
         source = """

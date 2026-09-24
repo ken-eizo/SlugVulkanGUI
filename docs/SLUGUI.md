@@ -84,6 +84,8 @@ component構築時の`find`用で、render時の参照は整数の`PropertyId`�
 ## layout規則
 
 - `Row` / `Column`: visible childのintrinsic/explicit sizeを測り、余りを正の`grow`比で配分
+- childの`position: absolute`はRow/Columnのmeasure・spacing・growから除外し、親content box基準のx/yで配置。
+  描画順はflow childと混在してもsource順を維持する
 - `crossAlignment`: Start、Center、End、Stretch。childの`alignSelf`があれば上書き
 - `mainAlignment`: Start、Center、End、SpaceBetween
 - `Stack`: width/heightがautoのchildをinner boundsへ広げ、子を同じ領域へ重ねる
@@ -105,9 +107,11 @@ python tools/slugui_compiler.py ui/MyPanel.slugui \
 ```
 
 `--check`は生成せずparse/type checkだけを行い、`--stdout`はheaderを標準出力へ出します。
-出力は一時fileからatomic replaceされ、同じ入力・namespaceから常に同じbytesを生成します。
-Exampleの`examples/slugui_demo.slugui`もCMake custom commandでAOT生成され、そのheaderを実際に
-C++コンパイルしています。
+出力は一時fileからatomic replaceされ、同じ入力・namespaceから常に同じbytesを生成します。既存headerと
+bytesが同じ場合はmtimeも変更しないため、生成結果が同じ再exportでC++を再compileしません。Exampleの
+CMake連携は別の`.stamp`へ「このinput/compiler revisionは検査済み」を記録し、headerのmtimeを
+content-stableにしたままPython AOT自体の不要な再実行も避けます。`examples/slugui_demo.slugui`も
+この経路でAOT生成され、そのheaderを実際にC++コンパイルしています。
 
 subproject利用では同じ処理をCMake関数から呼べます。
 
@@ -116,10 +120,15 @@ add_subdirectory(external/SlugVulkan)
 include(external/SlugVulkan/cmake/SlugUI.cmake)
 
 slugvk_compile_slugui(
+  STAMPED
   INPUT "${CMAKE_CURRENT_SOURCE_DIR}/ui/MyPanel.slugui"
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/MyPanel.slugui.hpp"
   NAMESPACE my_app::generated)
 ```
+
+`STAMPED`は大きいgenerated headerをincludeするtarget向けのincremental-build modeです。
+headerが同じbytesならmtimeを維持しつつ`.stamp`だけを更新するため、不要なPython AOTとC++再compileを
+両方避けます。通常のcustom command互換が必要なら省略できます。
 
 `CLASS_NAME`またはCLIの`--class-name`は生成C++型だけを固定します。入力component名とstable IDは
 変えないため、単一selectionとFigmaの複数selectionを同じhost slotへ差し替えられます。
@@ -172,6 +181,8 @@ property型は`bool`、`int`、`float`、`string`、`color`、`paint`、`length`
 `callback_<name>`としてC++からhandlerを登録できます。
 
 length suffixは`px`（論理px）、`ppx`（framebuffer物理px）、`%`、`auto`です。
+`position: absolute`はRow/Column内のchildだけをflowから外す軽量なitem指定で、通常の
+`Absolute` containerとは別です。min/max width/height、grow、align-selfとも併用できます。
 paintはcolor literal、`solid`、`linear`、`diamond`、`radial`、`shader`を扱います。
 Rectangleの`stroke`にも同じPaintを使用でき、`stroke-width`は論理px、
 `stroke-align`は`inside` / `center` / `outside`です。stroke ringは解析シェーダーで
@@ -216,7 +227,8 @@ compilerがbuild時に構文解析、型検査、stable element/callback ID生�
 - paragraph spacing、paragraph別list nesting、OpenType feature override、hyperlink、
   decorationの個別offset/thickness/color、HarfBuzz shaping/bidiはまだnative再現しない
 - Figma APIからgeometryを取得できないvectorは明示placeholderになる。
-  variables/component variantsのproperty化は未実装
+  component/instance/variantのsource provenanceと依存変更refreshは実装済みだが、
+  component instanceそのものとvariables/component variantsのtyped property化は未実装
 - conditional/repeater、virtualized list、focus traversal、accessibility treeは未実装
 - structural tree mutationをcallback中に行う契約は未定義。property変更を使用する
 - style inheritance/theme/token tableは未実装

@@ -43,9 +43,55 @@ std::size_t byteOffsetForCodepoint(std::string_view value, std::size_t target) {
   }
   return offset;
 }
+
+struct TextPosition { std::size_t line = 0; std::size_t column = 0; };
+
+TextPosition textPositionForOffset(std::string_view value, std::size_t offset) {
+  TextPosition position;
+  offset = std::min(offset, value.size());
+  std::size_t i = 0;
+  while (i < offset) {
+    if (value[i] == '\n') { ++position.line; position.column = 0; ++i; continue; }
+    ++position.column;
+    ++i;
+    while (i < offset && (static_cast<unsigned char>(value[i]) & 0xc0U) == 0x80U) ++i;
+  }
+  return position;
+}
+
+std::size_t byteOffsetForTextPosition(std::string_view value, std::size_t targetLine,
+                                      std::size_t targetColumn) {
+  std::size_t line = 0, column = 0, i = 0;
+  while (i < value.size() && line < targetLine) {
+    if (value[i++] == '\n') ++line;
+  }
+  if (line != targetLine) return value.size();
+  while (i < value.size() && value[i] != '\n' && column < targetColumn) {
+    ++i;
+    while (i < value.size() && (static_cast<unsigned char>(value[i]) & 0xc0U) == 0x80U) ++i;
+    ++column;
+  }
+  return i;
+}
+
+std::size_t textLineCount(std::string_view value) {
+  return 1U + static_cast<std::size_t>(std::count(value.begin(), value.end(), '\n'));
+}
 }
 
 UiContext::UiContext(UiSkin skin) : skin_(std::move(skin)) {}
+
+void UiContext::focusText(WidgetId id, std::string_view value,
+                          std::size_t caretByteOffset) {
+  auto& edit = textEdits_[id];
+  if (edit.value != value) edit.reset(value, false);
+  auto caret = std::min(caretByteOffset, edit.value.size());
+  while (caret > 0 && caret < edit.value.size() &&
+         (static_cast<unsigned char>(edit.value[caret]) & 0xc0U) == 0x80U)
+    --caret;
+  edit.caret = edit.anchor = caret;
+  focused_ = id;
+}
 
 void UiContext::beginFrame(const InputState& inputState, DrawList& drawList) {
   input_ = &inputState;
@@ -95,6 +141,11 @@ Interaction UiContext::interactionImpl(WidgetId id, Rect bounds, bool overlay) {
 void UiContext::rounded(Rect bounds, Paint paint, float radiusPx) {
   draw_->roundedRect(bounds, radiusPx >= 0.0f ? radiusPx : skin_.cornerRadius,
                      paint, skin_.continuousCornersPercent);
+}
+
+void UiContext::rectangle(Rect bounds, Paint paint) {
+  if (skin_.rectangle != 0) draw_->shape(skin_.rectangle, bounds, paint);
+  else draw_->roundedRect(bounds, 0.0f, paint, 0.0f);
 }
 
 void UiContext::controlBackground(Rect bounds, const Interaction& state, bool selected) {
@@ -274,7 +325,7 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
   controlBackground(bounds, state, focused_ == id);
   auto& edit = textEdits_[id];
   if (state.pressed) {
-    edit.reset(value, false);
+    if (edit.value != value) edit.reset(value, false);
     const float advance = std::max(1.0f, skin_.text.size * 0.52f);
     const auto codepoints = decodeUtf8(value);
     const auto clicked = static_cast<std::size_t>(std::clamp(
@@ -290,7 +341,23 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
     const bool command = input_->key(Key::LeftControl).down ||
                          input_->key(Key::RightControl).down ||
                          input_->key(Key::LeftSuper).down || input_->key(Key::RightSuper).down;
+    edit.beginTransaction();
+    if (command && input_->key(Key::Z).pressed && !shift) changed = edit.undo() || changed;
+    if (command && (input_->key(Key::Y).pressed ||
+                    (shift && input_->key(Key::Z).pressed)))
+      changed = edit.redo() || changed;
     if (command && input_->key(Key::A).pressed) edit.selectAll();
+    if (command && input_->key(Key::C).pressed && edit.hasSelection() && clipboard_.write)
+      clipboard_.write(edit.value.substr(edit.selectionBegin(), edit.selectionEnd() - edit.selectionBegin()));
+    if (command && input_->key(Key::X).pressed && edit.hasSelection() && clipboard_.write) {
+      clipboard_.write(edit.value.substr(edit.selectionBegin(), edit.selectionEnd() - edit.selectionBegin()));
+      changed = edit.deleteSelection() || changed;
+    }
+    if (command && input_->key(Key::V).pressed && clipboard_.read) {
+      auto pasted = clipboard_.read();
+      for (auto& character : pasted) if (character == '\n' || character == '\r' || character == '\t') character = ' ';
+      changed = edit.insert(pasted) || changed;
+    }
     if (input_->key(Key::Left).pressed) edit.moveLeft(shift);
     if (input_->key(Key::Right).pressed) edit.moveRight(shift);
     if (input_->key(Key::Home).pressed) edit.moveHome(shift);
@@ -302,6 +369,7 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
         if (cp >= 32) changed = edit.insert(utf8(cp)) || changed;
       }
     }
+    edit.endTransaction();
     if (changed) value = edit.value;
     if (input_->key(Key::Enter).pressed || input_->key(Key::Escape).pressed) focused_ = 0;
   }
@@ -322,9 +390,255 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
   if (focused_ == id && (frame_ / 30U) % 2U == 0U) {
     const float approximateX = bounds.x + 9.0f +
       static_cast<float>(decodeUtf8(value.substr(0, edit.caret)).size()) * skin_.text.size * 0.52f;
-    draw_->shape(skin_.rectangle, {std::min(approximateX, bounds.x + bounds.width - 5.0f), bounds.y + 6.0f,
+    rectangle( {std::min(approximateX, bounds.x + bounds.width - 5.0f), bounds.y + 6.0f,
                                    1.5f, bounds.height - 12.0f}, skin_.accent);
   }
+  return changed;
+}
+
+bool UiContext::textArea(WidgetId id, Rect bounds, std::string& value, Vec2& scroll,
+                         std::string_view placeholder, TextAreaOptions options) {
+  const auto state = interaction(id, bounds);
+  controlBackground(bounds, state, focused_ == id);
+  auto& edit = textEdits_[id];
+  const float advance = std::max(1.0f, skin_.text.size * 0.52f);
+  const float lineHeight = std::max(16.0f, skin_.text.size * 1.45f);
+  const auto layoutLines = textLineCount(value);
+  const float gutterWidth = options.showLineNumbers
+      ? std::max(34.0f, (static_cast<float>(std::to_string(layoutLines).size()) + 1.5f) * advance)
+      : 0.0f;
+  const Rect inner{bounds.x + 8.0f + gutterWidth, bounds.y + 6.0f,
+                   std::max(0.0f, bounds.width - 16.0f - gutterWidth),
+                   std::max(0.0f, bounds.height - 12.0f)};
+
+  if (state.pressed) {
+    if (edit.value != value) edit.reset(value, false);
+    const auto line = static_cast<std::size_t>(std::max(
+        0.0f, std::floor((state.cursor.y - inner.y + scroll.y) / lineHeight)));
+    const auto column = static_cast<std::size_t>(std::max(
+        0.0f, std::floor((state.cursor.x - inner.x + scroll.x) / advance + 0.5f)));
+    edit.caret = edit.anchor = byteOffsetForTextPosition(value, line, column);
+  } else if (focused_ != id && edit.value != value) {
+    edit.reset(value, false);
+  }
+
+  if (state.hovered && input_ && std::abs(input_->scroll().delta.y) > 0.0001f)
+    scroll.y -= input_->scroll().delta.y * lineHeight * 3.0f;
+
+  bool changed = false;
+  if (focused_ == id && input_) {
+    const bool shift = input_->key(Key::LeftShift).down || input_->key(Key::RightShift).down;
+    const bool command = input_->key(Key::LeftControl).down ||
+                         input_->key(Key::RightControl).down ||
+                         input_->key(Key::LeftSuper).down || input_->key(Key::RightSuper).down;
+    edit.beginTransaction();
+    if (command && input_->key(Key::Z).pressed && !shift) changed = edit.undo() || changed;
+    if (command && (input_->key(Key::Y).pressed ||
+                    (shift && input_->key(Key::Z).pressed)))
+      changed = edit.redo() || changed;
+    if (command && input_->key(Key::A).pressed) edit.selectAll();
+    if (command && input_->key(Key::C).pressed && edit.hasSelection() && clipboard_.write)
+      clipboard_.write(edit.value.substr(edit.selectionBegin(), edit.selectionEnd() - edit.selectionBegin()));
+    if (command && input_->key(Key::X).pressed && edit.hasSelection() && clipboard_.write) {
+      clipboard_.write(edit.value.substr(edit.selectionBegin(), edit.selectionEnd() - edit.selectionBegin()));
+      changed = edit.deleteSelection() || changed;
+    }
+    if (command && input_->key(Key::V).pressed && clipboard_.read) {
+      const auto raw = clipboard_.read();
+      std::string pasted; pasted.reserve(raw.size());
+      for (std::size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '\r') {
+          if (i + 1 < raw.size() && raw[i + 1] == '\n') ++i;
+          pasted.push_back('\n');
+        } else if (raw[i] != '\0') pasted.push_back(raw[i]);
+      }
+      changed = edit.insert(pasted) || changed;
+    }
+    if (input_->key(Key::Left).pressed) edit.moveLeft(shift);
+    if (input_->key(Key::Right).pressed) edit.moveRight(shift);
+    if (input_->key(Key::Up).pressed || input_->key(Key::Down).pressed) {
+      const auto current = textPositionForOffset(edit.value, edit.caret);
+      const auto targetLine = input_->key(Key::Up).pressed
+          ? (current.line == 0 ? 0 : current.line - 1)
+          : current.line + 1;
+      edit.caret = byteOffsetForTextPosition(edit.value, targetLine, current.column);
+      if (!shift) edit.anchor = edit.caret;
+    }
+    if (input_->key(Key::Home).pressed) {
+      const auto current = textPositionForOffset(edit.value, edit.caret);
+      edit.caret = byteOffsetForTextPosition(edit.value, current.line, 0);
+      if (!shift) edit.anchor = edit.caret;
+    }
+    if (input_->key(Key::End).pressed) {
+      const auto current = textPositionForOffset(edit.value, edit.caret);
+      edit.caret = byteOffsetForTextPosition(edit.value, current.line,
+                                              static_cast<std::size_t>(-1));
+      if (!shift) edit.anchor = edit.caret;
+    }
+    if (input_->key(Key::Backspace).pressed) changed = edit.backspace() || changed;
+    if (input_->key(Key::Delete).pressed) changed = edit.deleteForward() || changed;
+    if (!command && input_->key(Key::Enter).pressed) changed = edit.insert("\n") || changed;
+    if (input_->key(Key::Tab).pressed) changed = edit.insert("  ") || changed;
+    if (!command) {
+      for (char32_t cp : input_->textInput()) {
+        if (cp >= 32) changed = edit.insert(utf8(cp)) || changed;
+      }
+    }
+    if (input_->key(Key::Escape).pressed) focused_ = 0;
+    edit.endTransaction();
+    if (changed) value = edit.value;
+  }
+
+  const auto lines = textLineCount(value);
+  float longest = 0.0f;
+  std::size_t currentColumns = 0;
+  for (std::size_t i = 0; i <= value.size(); ++i) {
+    if (i == value.size() || value[i] == '\n') {
+      longest = std::max(longest, static_cast<float>(currentColumns) * advance);
+      currentColumns = 0;
+    } else if ((static_cast<unsigned char>(value[i]) & 0xc0U) != 0x80U) ++currentColumns;
+  }
+  const float contentHeight = static_cast<float>(lines) * lineHeight;
+  const float contentWidth = longest + 4.0f;
+  scroll.x = std::clamp(scroll.x, 0.0f, std::max(0.0f, contentWidth - inner.width));
+  scroll.y = std::clamp(scroll.y, 0.0f, std::max(0.0f, contentHeight - inner.height));
+
+  const auto caret = textPositionForOffset(value, edit.caret);
+  if (focused_ == id) {
+    const float caretX = static_cast<float>(caret.column) * advance;
+    const float caretY = static_cast<float>(caret.line) * lineHeight;
+    if (caretX < scroll.x) scroll.x = caretX;
+    if (caretX + advance > scroll.x + inner.width)
+      scroll.x = std::max(0.0f, caretX + advance - inner.width);
+    if (caretY < scroll.y) scroll.y = caretY;
+    if (caretY + lineHeight > scroll.y + inner.height)
+      scroll.y = std::max(0.0f, caretY + lineHeight - inner.height);
+  }
+
+  const Rect previousClip = draw_->clip();
+  if (options.showLineNumbers && gutterWidth > 0.0f) {
+    const Rect gutter{bounds.x + 4.0f, inner.y, gutterWidth, inner.height};
+    draw_->setClip(gutter);
+    TextStyle gutterStyle = skin_.text;
+    gutterStyle.align = HorizontalAlign::Right;
+    gutterStyle.verticalAlign = VerticalAlign::Top;
+    gutterStyle.lineHeight = lineHeight / std::max(1.0f, gutterStyle.size);
+    const auto firstLine = static_cast<std::size_t>(std::max(
+        0.0f, std::floor(scroll.y / lineHeight)));
+    const auto visibleLines = static_cast<std::size_t>(std::ceil(
+        inner.height / std::max(1.0f, lineHeight))) + 2U;
+    const auto lastLine = std::min(lines, firstLine + visibleLines);
+    for (std::size_t line = firstLine; line < lastLine; ++line) {
+      TextStyle lineStyle = gutterStyle;
+      if (focused_ == id && line == caret.line) lineStyle.paint = skin_.accent;
+      draw_->text(std::to_string(line + 1U),
+                  {gutter.x, inner.y + static_cast<float>(line) * lineHeight - scroll.y,
+                   std::max(0.0f, gutter.width - 6.0f), lineHeight}, lineStyle);
+    }
+    draw_->setClip(previousClip);
+    Paint separator = skin_.muted;
+    separator.opacity *= 0.30f;
+    rectangle(
+                 {inner.x - 4.0f, inner.y, 1.0f, inner.height}, separator);
+  }
+  draw_->setClip(inner);
+  if (focused_ == id) {
+    Paint activeLine = skin_.hovered;
+    activeLine.opacity *= 0.24f;
+    rectangle(
+                 {inner.x, inner.y + static_cast<float>(caret.line) * lineHeight - scroll.y,
+                  inner.width, lineHeight},
+                 activeLine);
+  }
+  if (focused_ == id && edit.hasSelection()) {
+    const auto begin = textPositionForOffset(value, edit.selectionBegin());
+    const auto end = textPositionForOffset(value, edit.selectionEnd());
+    Paint selection = skin_.accent;
+    selection.opacity *= 0.42f;
+    for (std::size_t line = begin.line; line <= end.line; ++line) {
+      const std::size_t firstColumn = line == begin.line ? begin.column : 0;
+      std::size_t lastColumn = line == end.line ? end.column : static_cast<std::size_t>(-1);
+      if (lastColumn == static_cast<std::size_t>(-1)) {
+        const auto lineStart = byteOffsetForTextPosition(value, line, 0);
+        const auto lineEnd = byteOffsetForTextPosition(value, line, lastColumn);
+        lastColumn = textPositionForOffset(value, lineEnd).column;
+        (void)lineStart;
+      }
+      rounded({inner.x + static_cast<float>(firstColumn) * advance - scroll.x,
+               inner.y + static_cast<float>(line) * lineHeight - scroll.y,
+               std::max(2.0f, static_cast<float>(lastColumn - firstColumn) * advance),
+               lineHeight}, selection, 1.0f);
+      if (line == end.line) break;
+    }
+  }
+
+  TextStyle areaStyle = skin_.text;
+  areaStyle.verticalAlign = VerticalAlign::Top;
+  areaStyle.lineHeight = lineHeight / std::max(1.0f, areaStyle.size);
+  if (value.empty()) {
+    TextStyle fadedStyle = areaStyle;
+    fadedStyle.paint = skin_.muted;
+    draw_->text(std::string(placeholder), inner, fadedStyle);
+  } else {
+    draw_->text(value,
+                {inner.x - scroll.x, inner.y - scroll.y,
+                 std::max(inner.width + scroll.x, contentWidth + 8.0f),
+                 std::max(inner.height + scroll.y, contentHeight + lineHeight)}, areaStyle);
+  }
+
+  if (focused_ == id) {
+    const float x = inner.x + static_cast<float>(caret.column) * advance - scroll.x;
+    const float y = inner.y + static_cast<float>(caret.line) * lineHeight - scroll.y;
+    Paint caretPaint = skin_.accent;
+    caretPaint.opacity = 1.0f;
+    rectangle(
+                 {x - 0.5f, y + 1.0f, 3.0f, lineHeight - 2.0f},
+                 caretPaint);
+  }
+  if (focused_ == id && input_ && input_->composition().active) {
+    std::string composition;
+    for (char32_t cp : input_->composition().text) composition += utf8(cp);
+    TextStyle preedit = areaStyle;
+    preedit.paint = skin_.accent;
+    draw_->text(std::move(composition),
+                {inner.x + static_cast<float>(caret.column) * advance - scroll.x,
+                 inner.y + static_cast<float>(caret.line) * lineHeight - scroll.y,
+                 inner.width, lineHeight}, preedit);
+  }
+  if (options.showScrollIndicators) {
+    Paint track = skin_.muted;
+    track.opacity *= 0.18f;
+    Paint thumb = focused_ == id ? skin_.accent : skin_.muted;
+    thumb.opacity *= 0.72f;
+    if (inner.height > 1.0f && contentHeight > inner.height + 0.5f) {
+      const float maxScroll = contentHeight - inner.height;
+      const float thumbHeight = std::min(
+          inner.height, std::max(12.0f, inner.height * inner.height / contentHeight));
+      const float travel = std::max(0.0f, inner.height - thumbHeight);
+      const float position = maxScroll > 0.0f ? scroll.y / maxScroll : 0.0f;
+      const Rect trackRect{inner.x + std::max(0.0f, inner.width - 3.0f),
+                           inner.y, 3.0f, inner.height};
+      rectangle( trackRect, track);
+      rectangle(
+                   {trackRect.x, trackRect.y + travel * std::clamp(position, 0.0f, 1.0f),
+                    trackRect.width, thumbHeight}, thumb);
+    }
+    if (inner.width > 1.0f && contentWidth > inner.width + 0.5f) {
+      const float maxScroll = contentWidth - inner.width;
+      const float thumbWidth = std::min(
+          inner.width, std::max(12.0f, inner.width * inner.width / contentWidth));
+      const float travel = std::max(0.0f, inner.width - thumbWidth);
+      const float position = maxScroll > 0.0f ? scroll.x / maxScroll : 0.0f;
+      const Rect trackRect{inner.x,
+                           inner.y + std::max(0.0f, inner.height - 3.0f),
+                           inner.width, 3.0f};
+      rectangle( trackRect, track);
+      rectangle(
+                   {trackRect.x + travel * std::clamp(position, 0.0f, 1.0f), trackRect.y,
+                    thumbWidth, trackRect.height}, thumb);
+    }
+  }
+  draw_->setClip(previousClip);
   return changed;
 }
 
@@ -427,7 +741,7 @@ bool UiContext::gridView(WidgetId id, Rect bounds, GridModel& model, float rowHe
   const float columnWidth = bounds.width / static_cast<float>(model.headers.size());
   for (std::size_t c = 0; c < model.headers.size(); ++c) {
     Rect cell{bounds.x + columnWidth * static_cast<float>(c), bounds.y, columnWidth, rowHeight};
-    draw_->shape(skin_.rectangle, cell, skin_.panel);
+    rectangle( cell, skin_.panel);
     label(model.headers[c], cell, HorizontalAlign::Center);
   }
   bool changed = false;
@@ -443,7 +757,7 @@ bool UiContext::gridView(WidgetId id, Rect bounds, GridModel& model, float rowHe
         changed = true;
       }
       if (state.hovered || (model.selectedRow == static_cast<int>(r) && model.selectedColumn == static_cast<int>(c)))
-        draw_->shape(skin_.rectangle, cell, state.hovered ? skin_.hovered : skin_.active);
+        rectangle( cell, state.hovered ? skin_.hovered : skin_.active);
       if (c < model.rows[r].size()) label(model.rows[r][c], cell);
     }
   }

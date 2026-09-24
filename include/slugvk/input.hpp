@@ -36,13 +36,16 @@ enum class InputAction : std::uint8_t { Release = 0, Press = 1, Repeat = 2 };
 enum class Key : std::uint16_t {
   Unknown = 0,
   Space,
-  A,
+  A, C, V, X, Y, Z,
   Enter,
   Escape,
+  Tab,
   Backspace,
   Delete,
   Left,
   Right,
+  Up,
+  Down,
   Home,
   End,
   LeftShift,
@@ -51,6 +54,7 @@ enum class Key : std::uint16_t {
   RightControl,
   LeftSuper,
   RightSuper,
+  K,
   Count
 };
 

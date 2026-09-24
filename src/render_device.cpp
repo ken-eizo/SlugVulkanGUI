@@ -1,6 +1,7 @@
 #include "slugvk/render_device.hpp"
 
 #include "slugvk/platform_surface.hpp"
+#include "slugvk/vulkan_interop.hpp"
 #include "slugvk/vector_atlas.hpp"
 #if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
 #include "slugvk/window.hpp"
@@ -49,6 +50,7 @@ void RenderSurface::waitIdle() { renderer_->waitIdle(); }
 RendererStats RenderSurface::stats() const { return renderer_->stats(); }
 const char* RenderSurface::deviceName() const { return renderer_->deviceName(); }
 const char* RenderSurface::presentModeName() const { return renderer_->presentModeName(); }
+VulkanInterop& RenderSurface::vulkanInterop() noexcept { return renderer_->vulkanInterop(); }
 
 RenderDevice::RenderDevice(const VectorAtlas& atlas, RendererConfig config)
     : atlas_(&atlas), config_(config) {}

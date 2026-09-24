@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -24,133 +25,123 @@ class CompileError(Exception):
         self.token = token
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Token:
     kind: str
     value: str
-    line: int
-    column: int
+    offset: int
+    source: str = field(repr=False, compare=False)
+
+    @property
+    def line(self) -> int:
+        # Successful compiles never need source locations. Resolve them lazily only when a
+        # diagnostic is actually formatted instead of updating line/column for every token.
+        return self.source.count("\n", 0, self.offset) + 1
+
+    @property
+    def column(self) -> int:
+        previous = self.source.rfind("\n", 0, self.offset)
+        return self.offset + 1 if previous < 0 else self.offset - previous
 
 
 class Lexer:
-    SYMBOLS = set("{}[]():;=,$%")
+    # The original lexer advanced one Python character at a time. Figma exports are dominated by
+    # metadata and SVG path strings, so that approach spent most of AOT time in _peek/_take.
+    # One compiled scanner keeps the same grammar/error locations while moving the hot loop to C.
+    _TOKEN_RE = re.compile(
+        r'(?P<SPACE>\s+)'
+        r'|(?P<LINE>//[^\r\n]*(?:\r?\n|$))'
+        r'|(?P<BLOCK>/\*.*?\*/)'
+        r'|(?P<STRING>"(?:\\[^\r\n]|[^"\\\r\n])*")'
+        r'|(?P<COLOR>#[0-9A-Fa-f]*)'
+        r'|(?P<NUMBER>[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+        r'|(?P<IDENT>(?:[^\W\d]|_)[\w-]*)'
+        r'|(?P<SYMBOL>[{}\[\]():;=,$%])',
+        re.DOTALL | re.UNICODE,
+    )
 
     def __init__(self, source: str):
         self.source = source
-        self.index = 0
-        self.line = 1
-        self.column = 1
-
-    def _peek(self, offset: int = 0) -> str:
-        position = self.index + offset
-        return self.source[position] if position < len(self.source) else ""
-
-    def _take(self) -> str:
-        value = self._peek()
-        if not value:
-            return ""
-        self.index += 1
-        if value == "\n":
-            self.line += 1
-            self.column = 1
-        else:
-            self.column += 1
-        return value
-
-    def _skip_space_and_comments(self) -> None:
-        while True:
-            while self._peek() and self._peek().isspace():
-                self._take()
-            if self._peek() == "/" and self._peek(1) == "/":
-                while self._peek() and self._take() != "\n":
-                    pass
-                continue
-            if self._peek() == "/" and self._peek(1) == "*":
-                start = Token("", "", self.line, self.column)
-                self._take()
-                self._take()
-                while self._peek() and not (self._peek() == "*" and self._peek(1) == "/"):
-                    self._take()
-                if not self._peek():
-                    raise CompileError("unterminated block comment", start)
-                self._take()
-                self._take()
-                continue
-            return
 
     def tokens(self) -> list[Token]:
+        source = self.source
+        length = len(source)
+        position = 0
         result: list[Token] = []
-        while True:
-            self._skip_space_and_comments()
-            line, column = self.line, self.column
-            current = self._peek()
-            if not current:
-                result.append(Token("EOF", "", line, column))
-                return result
-            if current in self.SYMBOLS:
-                result.append(Token(current, self._take(), line, column))
+        append = result.append
+        match_token = self._TOKEN_RE.match
+
+        while position < length:
+            token_offset = position
+            match = match_token(source, position)
+            if match is None:
+                if source.startswith("/*", position):
+                    raise CompileError(
+                        "unterminated block comment", Token("", "", token_offset, source))
+                if source[position] == '"':
+                    newline = source.find("\n", position + 1)
+                    quote = source.find('"', position + 1)
+                    message = ("newline in string literal"
+                               if newline >= 0 and (quote < 0 or newline < quote)
+                               else "unterminated string literal")
+                    raise CompileError(message, Token("STRING", "", token_offset, source))
+                current = source[position]
+                raise CompileError(
+                    f"unexpected character {current!r}",
+                    Token("", current, token_offset, source))
+
+            kind = match.lastgroup or ""
+            raw = match.group(0)
+            end = match.end()
+
+            if kind == "NUMBER":
+                # Preserve the old targeted diagnostics for partially-authored numeric literals.
+                if end < length and source[end] == ".":
+                    raise CompileError(
+                        "expected digits after decimal point",
+                        Token("NUMBER", raw + ".", token_offset, source))
+                if end < length and source[end] in "eE":
+                    tail = source[end]
+                    if end + 1 < length and source[end + 1] in "+-":
+                        tail += source[end + 1]
+                    raise CompileError(
+                        "invalid number exponent",
+                        Token("NUMBER", raw + tail, token_offset, source))
+
+            position = end
+            if kind in ("SPACE", "LINE", "BLOCK"):
                 continue
-            if current == "#":
-                self._take()
-                digits = ""
-                while self._peek() and self._peek().lower() in "0123456789abcdef":
-                    digits += self._take()
+
+            if kind == "SYMBOL":
+                append(Token(raw, raw, token_offset, source))
+                continue
+            if kind == "COLOR":
+                digits = raw[1:]
                 if len(digits) not in (6, 8):
-                    raise CompileError("colors must use #RRGGBB or #RRGGBBAA", Token("COLOR", digits, line, column))
-                result.append(Token("COLOR", digits.lower(), line, column))
+                    raise CompileError(
+                        "colors must use #RRGGBB or #RRGGBBAA",
+                        Token("COLOR", digits, token_offset, source))
+                append(Token("COLOR", digits.lower(), token_offset, source))
                 continue
-            if current == '"':
-                start = self.index
-                self._take()
-                escaped = False
-                while self._peek():
-                    value = self._take()
-                    if value == '"' and not escaped:
-                        break
-                    if value == "\n" and not escaped:
-                        raise CompileError("newline in string literal", Token("STRING", "", line, column))
-                    escaped = value == "\\" and not escaped
-                    if value != "\\":
-                        escaped = False
+            if kind == "STRING":
+                if "\\" not in raw:
+                    decoded = raw[1:-1]
                 else:
-                    raise CompileError("unterminated string literal", Token("STRING", "", line, column))
-                raw = self.source[start:self.index]
-                try:
-                    decoded = json.loads(raw)
-                except json.JSONDecodeError as error:
-                    raise CompileError(f"invalid string escape: {error.msg}", Token("STRING", "", line, column)) from error
-                result.append(Token("STRING", decoded, line, column))
+                    try:
+                        decoded = json.loads(raw)
+                    except json.JSONDecodeError as error:
+                        raise CompileError(
+                            f"invalid string escape: {error.msg}",
+                            Token("STRING", "", token_offset, source)) from error
+                append(Token("STRING", decoded, token_offset, source))
                 continue
-            if current.isdigit() or (current in "+-" and self._peek(1).isdigit()):
-                value = self._take()
-                while self._peek().isdigit():
-                    value += self._take()
-                if self._peek() == ".":
-                    value += self._take()
-                    if not self._peek().isdigit():
-                        raise CompileError("expected digits after decimal point", Token("NUMBER", value, line, column))
-                    while self._peek().isdigit():
-                        value += self._take()
-                if self._peek().lower() == "e":
-                    value += self._take()
-                    if self._peek() in "+-":
-                        value += self._take()
-                    if not self._peek().isdigit():
-                        raise CompileError("invalid number exponent", Token("NUMBER", value, line, column))
-                    while self._peek().isdigit():
-                        value += self._take()
-                result.append(Token("NUMBER", value, line, column))
-                continue
-            if current.isalpha() or current == "_":
-                value = self._take()
-                while self._peek() and (self._peek().isalnum() or self._peek() in "_-"):
-                    value += self._take()
-                result.append(Token("IDENT", value, line, column))
-                continue
-            raise CompileError(f"unexpected character {current!r}", Token("", current, line, column))
+            append(Token(kind, raw, token_offset, source))
+
+        append(Token("EOF", "", length, source))
+        return result
 
 
-@dataclass
+@dataclass(slots=True)
 class Value:
     kind: str
     value: object
@@ -158,7 +149,7 @@ class Value:
     arguments: list["Value"] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class PropertyDecl:
     type_name: str
     name: str
@@ -166,14 +157,14 @@ class PropertyDecl:
     token: Token
 
 
-@dataclass
+@dataclass(slots=True)
 class Attribute:
     name: str
     value: Value
     token: Token
 
 
-@dataclass
+@dataclass(slots=True)
 class ElementDecl:
     kind: str
     name: str
@@ -182,7 +173,7 @@ class ElementDecl:
     token: Token
 
 
-@dataclass
+@dataclass(slots=True)
 class ComponentDecl:
     name: str
     properties: list[PropertyDecl]
@@ -201,15 +192,17 @@ class Parser:
         self.index = 0
 
     def _peek(self, offset: int = 0) -> Token:
-        return self.tokens[min(self.index + offset, len(self.tokens) - 1)]
+        # The token stream always ends in EOF. Parser lookahead never steps beyond EOF, so a
+        # bounds-clamping min() on every peek only adds overhead to the hottest parser path.
+        return self.tokens[self.index + offset]
 
     def _take(self) -> Token:
-        value = self._peek()
+        value = self.tokens[self.index]
         self.index += 1
         return value
 
     def _accept(self, kind: str, value: str | None = None) -> Token | None:
-        token = self._peek()
+        token = self.tokens[self.index]
         if token.kind == kind and (value is None or token.value == value):
             self.index += 1
             return token
@@ -359,6 +352,12 @@ def cpp_identifier(value: str) -> str:
 
 
 def cpp_string(value: str) -> str:
+    # Figma metadata, names, and SVG paths are overwhelmingly printable ASCII. Keep that hot
+    # path in CPython's C-level replace implementation; only Unicode/control bytes need the
+    # byte-by-byte octal escape path required for deterministic source encoding.
+    if value.isascii() and (not value or value.isprintable()):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
     escaped: list[str] = []
     for byte in value.encode("utf-8"):
         if byte == 0x22:
@@ -376,6 +375,70 @@ def cpp_string(value: str) -> str:
         else:
             escaped.append(f"\\{byte:03o}")
     return '"' + "".join(escaped) + '"'
+
+
+def cpp_string_chunks(value: str, max_utf8_bytes: int = 2048) -> list[str]:
+    encoded_size = len(value.encode("utf-8"))
+    if encoded_size <= max_utf8_bytes:
+        return [cpp_string(value)]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+    for character in value:
+        size = len(character.encode("utf-8"))
+        if current and current_bytes + size > max_utf8_bytes:
+            chunks.append(cpp_string("".join(current)))
+            current.clear()
+            current_bytes = 0
+        current.append(character)
+        current_bytes += size
+    if current:
+        chunks.append(cpp_string("".join(current)))
+    return chunks
+
+
+def compact_figma_provider_data(value: str) -> str:
+    """Remove repeated discovery-only component catalogs from legacy Figma exports.
+
+    Current exporter versions already emit preferredValueCount instead of duplicating every
+    INSTANCE_SWAP candidate key on every instance. Older .slugui files may contain hundreds of
+    preferredValues per node, bloating generated C++ without affecting the selected UI state.
+    """
+    if '"preferredValues"' not in value and '"componentProperties"' not in value:
+        return value
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return value
+    if not isinstance(payload, dict):
+        return value
+    changed = False
+    component_properties = payload.get("componentProperties")
+    if isinstance(component_properties, dict) and "variantSelection" not in payload:
+        variant_selection = {
+            name: prop.get("value")
+            for name, prop in component_properties.items()
+            if isinstance(prop, dict) and prop.get("type") == "VARIANT" and "value" in prop
+        }
+        if variant_selection:
+            payload["variantSelection"] = variant_selection
+            changed = True
+
+    definitions = payload.get("componentDefinitions")
+    if not isinstance(definitions, dict):
+        return (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if changed else value)
+    for definition in definitions.values():
+        if not isinstance(definition, dict):
+            continue
+        preferred = definition.get("preferredValues")
+        if isinstance(preferred, list):
+            definition["preferredValueCount"] = len(preferred)
+            del definition["preferredValues"]
+            changed = True
+    if not changed:
+        return value
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def cpp_float(raw: str) -> str:
@@ -557,6 +620,7 @@ class Generator:
         "preferred-height": ("preferredHeight", "length"),
         "grow": ("grow", "float"),
         "spacing": ("spacing", "length"),
+        "counter-spacing": ("counterSpacing", "length"),
     }
     PROPERTY_EXPECTED = {
         "bool": "bool",
@@ -572,11 +636,13 @@ class Generator:
     }
 
     def __init__(self, component: ComponentDecl, namespace: str,
-                 class_name: str | None = None, legacy_figma_coordinates: bool = False):
+                 class_name: str | None = None, legacy_figma_coordinates: bool = False,
+                 strip_source_metadata: bool = False):
         self.component = component
         self.namespace = namespace
         self.class_name = class_name or cpp_identifier(component.name)
         self.legacy_figma_coordinates = legacy_figma_coordinates
+        self.strip_source_metadata = strip_source_metadata
         self.properties = {prop.name: prop for prop in component.properties}
         self.property_members = {name: cpp_identifier(name) for name in self.properties}
         if len(set(self.property_members.values())) != len(self.property_members):
@@ -584,6 +650,7 @@ class Generator:
         self.callbacks: dict[str, str] = {}
         self.node_counter = 0
         self.asset_counter = 0
+        self.path_assets: dict[tuple[str, ...], tuple[str, Bounds]] = {}
 
     def _value(self, value: Value, expected: str) -> str:
         if value.kind == "reference":
@@ -629,6 +696,12 @@ class Generator:
     def _line(self, lines: list[str], indent: int, text: str) -> None:
         lines.append("  " * indent + text)
 
+    def _assign_string(self, lines: list[str], indent: int, target: str, value: str) -> None:
+        chunks = cpp_string_chunks(value)
+        self._line(lines, indent, f"{target} = std::string{{{chunks[0]}}};")
+        for chunk in chunks[1:]:
+            self._line(lines, indent, f"{target}.append({chunk});")
+
     @staticmethod
     def _path_strings(value: Value, label: str) -> list[str]:
         values = value.arguments if value.kind == "list" else [value]
@@ -636,8 +709,47 @@ class Generator:
             raise CompileError(f"{label} expects a path string or non-empty string list", value.token)
         return [str(item.value) for item in values]
 
-    def _path_asset(self, attribute: Attribute, lines: list[str],
-                    indent: int) -> tuple[str, Bounds]:
+    @staticmethod
+    def _path_winding_rules(element: ElementDecl, attribute: Attribute,
+                            count: int) -> tuple[str, ...]:
+        companion_name = (
+            "path-winding-rules" if attribute.name == "path-data"
+            else "stroke-winding-rules"
+        )
+        companion = next(
+            (candidate for candidate in element.attributes if candidate.name == companion_name),
+            None,
+        )
+        if companion is None:
+            return tuple("nonzero" for _ in range(count))
+        values = companion.value.arguments if companion.value.kind == "list" else [companion.value]
+        if len(values) != count:
+            raise CompileError(
+                f"{companion_name} must contain one rule per {attribute.name} entry",
+                companion.token,
+            )
+        result: list[str] = []
+        for value in values:
+            if value.kind not in ("enum", "string"):
+                raise CompileError(f"{companion_name} expects nonzero/evenodd names", value.token)
+            rule = str(value.value).lower().replace("-", "").replace("_", "")
+            if rule not in ("nonzero", "evenodd"):
+                raise CompileError(f"unknown winding rule '{value.value}'", value.token)
+            result.append(rule)
+        return tuple(result)
+
+    def _path_asset_key(self, element: ElementDecl,
+                        attribute: Attribute) -> tuple[tuple[str, str], ...]:
+        path_strings = tuple(self._path_strings(attribute.value, attribute.name))
+        winding_rules = self._path_winding_rules(element, attribute, len(path_strings))
+        return tuple(zip(path_strings, winding_rules))
+
+    def _emit_path_asset(self, element: ElementDecl, attribute: Attribute,
+                         lines: list[str], indent: int) -> tuple[str, Bounds]:
+        key = self._path_asset_key(element, attribute)
+        cached = self.path_assets.get(key)
+        if cached is not None:
+            return cached
         index = self.asset_counter
         self.asset_counter += 1
         asset = f"asset_{index}"
@@ -646,33 +758,54 @@ class Generator:
         self._line(lines, indent, "if (atlas != nullptr) {")
         self._line(lines, indent + 1, f"slugvk::Path {path};")
         all_operations = []
-        for data in self._path_strings(attribute.value, attribute.name):
+        winding_rules = {winding_rule for _, winding_rule in key}
+        if len(winding_rules) > 1:
+            raise CompileError(
+                "mixed nonzero/evenodd rules in one Shape are not representable as one Slug "
+                "shape; export them as separate vector layers", attribute.token)
+        fill_rule = next(iter(winding_rules), "nonzero")
+        for path_index, (data, winding_rule) in enumerate(key):
             try:
                 operations = parse_svg_path(data)
             except SvgPathError as error:
                 raise CompileError(f"invalid SVG path data: {error}", attribute.token) from error
             all_operations.extend(operations)
-            for operation in operations:
-                # SVG/Figma paths use a y-down coordinate system. Slug's atlas is y-up; negating
-                # every authored y coordinate here preserves the source orientation without adding
-                # runtime transforms or per-instance state.
-                values = list(operation.values)
-                for coordinate in range(1, len(values), 2):
-                    values[coordinate] = -values[coordinate]
-                arguments = ", ".join(
-                    cpp_float(f"{value:.9g}") for value in values
-                )
-                call = f"{path}.{operation.name}({arguments});" if arguments else (
-                    f"{path}.{operation.name}();"
-                )
-                self._line(lines, indent + 1, call)
+            subpath = f"{path}_part_{path_index}"
+            data_variable = f"{subpath}_data"
+            self._line(lines, indent + 1, f"slugvk::Path {subpath};")
+            self._line(lines, indent + 1, f"std::string {data_variable};")
+            # Keep validated SVG compact in generated C++. Expanding every command into a separate
+            # moveTo/cubicTo statement makes large Figma documents tens of megabytes larger and
+            # turns MSVC parsing into the dominant import cost.
+            self._assign_string(lines, indent + 1, data_variable, data)
+            self._line(lines, indent + 1, f"{subpath}.svgPathYDown({data_variable});")
+            self._line(lines, indent + 1, f"{path}.addPath({subpath});")
         bounds = operation_bounds(all_operations)
         if bounds is None or bounds.width <= 0.0 or bounds.height <= 0.0:
             raise CompileError("SVG path data has no two-dimensional drawable bounds",
                                attribute.token)
-        self._line(lines, indent + 1, f"{asset} = atlas->addPath({path});")
+        rule = ("slugvk::FillRule::EvenOdd" if fill_rule == "evenodd"
+                else "slugvk::FillRule::NonZero")
+        self._line(lines, indent + 1, f"{asset} = atlas->addPath({path}, {rule});")
         self._line(lines, indent, "}")
-        return asset, bounds
+        result = (asset, bounds)
+        self.path_assets[key] = result
+        return result
+
+    def _prepare_path_assets(self, element: ElementDecl, lines: list[str], indent: int) -> None:
+        for attribute in element.attributes:
+            if attribute.name in ("path-data", "stroke-path-data"):
+                self._emit_path_asset(element, attribute, lines, indent)
+        for child in element.children:
+            self._prepare_path_assets(child, lines, indent)
+
+    def _path_asset(self, element: ElementDecl,
+                    attribute: Attribute) -> tuple[str, Bounds]:
+        key = self._path_asset_key(element, attribute)
+        asset = self.path_assets.get(key)
+        if asset is None:
+            raise AssertionError("path assets must be prepared before node generation")
+        return asset
 
     @staticmethod
     def _fixed_scalar(element: ElementDecl, name: str) -> float | None:
@@ -702,6 +835,18 @@ class Generator:
         if extent is None or extent < 0.0 or (extent == 0.0 and not allow_zero):
             return None
         return extent
+
+    @classmethod
+    def _authored_extent(cls, element: ElementDecl, name: str,
+                         allow_zero: bool = False) -> float | None:
+        # Figma FILL/HUG nodes intentionally omit width/height from layout, but vector
+        # path-placement still needs the source node's authored extent for normalization.
+        # preferred-{width,height} is the non-constraining source-size channel used by
+        # current exporters; fixed width/height remains authoritative when present.
+        extent = cls._fixed_extent(element, name, allow_zero)
+        if extent is not None:
+            return extent
+        return cls._fixed_extent(element, "preferred-" + name, allow_zero)
 
     @staticmethod
     def _is_figma_element(element: ElementDecl) -> bool:
@@ -738,9 +883,9 @@ class Generator:
     def _recovered_figma_owner(self, element: ElementDecl) -> tuple[float, float, float, float] | None:
         if not self._is_figma_element(element):
             return None
-        width = self._fixed_extent(element, "width", allow_zero=True)
-        height = self._fixed_extent(element, "height", allow_zero=True)
-        if width is None or height is None or (width > 0.0 and height > 0.0):
+        width = self._authored_extent(element, "width", allow_zero=True)
+        height = self._authored_extent(element, "height", allow_zero=True)
+        if width is not None and height is not None and width > 0.0 and height > 0.0:
             return None
         placements = [
             self._placement_values(attribute) for attribute in element.attributes
@@ -752,11 +897,23 @@ class Generator:
         top = min(value[1] for value in placements)
         right = max(value[0] + value[2] for value in placements)
         bottom = max(value[1] + value[3] for value in placements)
-        return left, top, right - left, bottom - top
+        # Older Figma exports omitted FILL/HUG extents entirely. Recover only the missing
+        # axes from the authored geometry union; keep any explicit axis authoritative.
+        origin_x = 0.0
+        origin_y = 0.0
+        if width is None or width <= 0.0:
+            origin_x = left
+            width = right - left
+        if height is None or height <= 0.0:
+            origin_y = top
+            height = bottom - top
+        if width <= 0.0 or height <= 0.0:
+            return None
+        return origin_x, origin_y, width, height
 
     def _path_placement(self, element: ElementDecl, bounds: Bounds) -> str | None:
-        width = self._fixed_extent(element, "width")
-        height = self._fixed_extent(element, "height")
+        width = self._authored_extent(element, "width")
+        height = self._authored_extent(element, "height")
         if width is None or height is None:
             return None
         values = (
@@ -773,12 +930,13 @@ class Generator:
                                  attribute: Attribute | None) -> str | None:
         if attribute is None:
             return None
-        width = self._fixed_extent(element, "width", allow_zero=True)
-        height = self._fixed_extent(element, "height", allow_zero=True)
-        if width is None or height is None:
-            raise CompileError(f"{attribute.name} requires fixed width and height", attribute.token)
         parsed = self._placement_values(attribute)
+        width = self._authored_extent(element, "width", allow_zero=True)
+        height = self._authored_extent(element, "height", allow_zero=True)
         recovered_owner = self._recovered_figma_owner(element)
+        if (width is None or height is None) and recovered_owner is None:
+            raise CompileError(
+                f"{attribute.name} requires authored width and height", attribute.token)
         if recovered_owner is not None:
             parsed[0] -= recovered_owner[0]
             parsed[1] -= recovered_owner[1]
@@ -829,6 +987,30 @@ class Generator:
             self._line(lines, indent,
                        f"{variable}.layout.kind = slugvk::slugui::LayoutKind::{enum_value};")
             return True
+        if name == "position":
+            positioned = self._enum(value, {
+                "absolute": "true", "flow": "false", "auto": "false",
+            }, "position")
+            self._line(lines, indent,
+                       f"{variable}.layout.absolutePositioned = {positioned};")
+            return True
+        if name in ("constraint-horizontal", "constraint-vertical"):
+            enum_value = self._enum(value, {
+                "min": "Min", "center": "Center", "max": "Max",
+                "stretch": "Stretch", "scale": "Scale",
+            }, "constraint")
+            member = "horizontalConstraint" if name == "constraint-horizontal" else "verticalConstraint"
+            self._line(lines, indent,
+                       f"{variable}.layout.{member} = slugvk::slugui::Constraint::{enum_value};")
+            return True
+        if name == "reverse-paint-order":
+            self._line(lines, indent,
+                       f"{variable}.layout.reverseChildPaintOrder = {self._value(value, 'bool')};")
+            return True
+        if name == "wrap":
+            self._line(lines, indent,
+                       f"{variable}.layout.wrap = {self._value(value, 'bool')};")
+            return True
         if name in ("cross-align", "align-self"):
             enum_value = self._enum(value, {
                 "start": "Start", "center": "Center", "end": "End", "stretch": "Stretch",
@@ -837,13 +1019,16 @@ class Generator:
             self._line(lines, indent,
                        f"{variable}.layout.{member} = slugvk::slugui::Alignment::{enum_value};")
             return True
-        if name == "justify":
+        if name in ("justify", "counter-justify"):
             enum_value = self._enum(value, {
                 "start": "Start", "center": "Center", "end": "End",
                 "space-between": "SpaceBetween", "spacebetween": "SpaceBetween",
+                "space-around": "SpaceAround", "spacearound": "SpaceAround",
+                "space-evenly": "SpaceEvenly", "spaceevenly": "SpaceEvenly",
             }, "justification")
+            member = "mainAlignment" if name == "justify" else "counterAlignment"
             self._line(lines, indent,
-                       f"{variable}.layout.mainAlignment = slugvk::slugui::Justify::{enum_value};")
+                       f"{variable}.layout.{member} = slugvk::slugui::Justify::{enum_value};")
             return True
         if name == "visible":
             self._line(lines, indent, f"{variable}.visible = {self._value(value, 'bool')};")
@@ -873,12 +1058,18 @@ class Generator:
             "source-document": "documentId",
             "source-node": "nodeId",
             "source-name": "nodeName",
+            "source-provider-data": "providerData",
         }
         if name in source_members:
             if value.kind != "string":
                 raise CompileError(f"{name} expects a string", value.token)
-            self._line(lines, indent,
-                       f"{variable}.source.{source_members[name]} = {cpp_string(str(value.value))};")
+            if self.strip_source_metadata:
+                return True
+            string_value = str(value.value)
+            if name == "source-provider-data":
+                string_value = compact_figma_provider_data(string_value)
+            self._assign_string(
+                lines, indent, f"{variable}.source.{source_members[name]}", string_value)
             return True
         if name == "fidelity":
             enum_value = self._enum(value, {
@@ -887,8 +1078,9 @@ class Generator:
                 "baked-raster": "BakedRaster", "bakedraster": "BakedRaster",
                 "unsupported": "Unsupported",
             }, "fidelity")
-            self._line(lines, indent,
-                       f"{variable}.source.fidelity = slugvk::slugui::ImportFidelity::{enum_value};")
+            if not self.strip_source_metadata:
+                self._line(lines, indent,
+                           f"{variable}.source.fidelity = slugvk::slugui::ImportFidelity::{enum_value};")
             return True
         return False
 
@@ -908,13 +1100,14 @@ class Generator:
         concatenated = ""
         visual = f"std::get<slugvk::slugui::TextVisual>({variable}.visual)"
         for index, value in enumerate(values):
-            if value.kind != "call" or value.value != "text-run" or len(value.arguments) != 10:
+            if value.kind != "call" or value.value != "text-run" or len(value.arguments) not in (10, 11):
                 raise CompileError(
                     "each text-runs item must be text-run(text, font, size, weight, italic, "
-                    "underline, strikethrough, letter-spacing, line-height, paint)",
+                    "underline, strikethrough, letter-spacing, line-height, paint[, font-style])",
                     value.token)
             (text, font, size, weight, italic, underline, strikethrough,
-             letter_spacing, line_height, paint) = value.arguments
+             letter_spacing, line_height, paint) = value.arguments[:10]
+            font_style = value.arguments[10] if len(value.arguments) == 11 else None
             if text.kind != "string" or font.kind != "string":
                 raise CompileError("text-run text and font must be strings", value.token)
             if weight.kind != "number":
@@ -928,6 +1121,11 @@ class Generator:
             self._line(lines, indent + 1, f"auto {style} = {visual}.style;")
             self._line(lines, indent + 1,
                        f"{style}.fontName = {cpp_string(str(font.value))};")
+            if font_style is not None:
+                if font_style.kind != "string":
+                    raise CompileError("text-run font-style must be a string", font_style.token)
+                self._line(lines, indent + 1,
+                           f"{style}.fontStyle = {cpp_string(str(font_style.value))};")
             self._line(lines, indent + 1,
                        f"{style}.size = {literal_cpp(size, 'float')};")
             self._line(lines, indent + 1,
@@ -1027,9 +1225,37 @@ class Generator:
                 raise CompileError(f"{name} requires Shape", attribute.token)
             self._path_strings(value, name)
             return True
+        if name in ("path-winding-rules", "stroke-winding-rules"):
+            if element.kind != "Shape":
+                raise CompileError(f"{name} requires Shape", attribute.token)
+            # Parsed together with path-data/stroke-path-data when the atlas asset is prepared.
+            return True
         if name in ("path-placement", "stroke-placement"):
             if element.kind != "Shape":
                 raise CompileError(f"{name} requires Shape", attribute.token)
+            return True
+        if name in ("image-source-width", "image-source-height"):
+            if element.kind != "Rectangle":
+                raise CompileError(f"{name} requires Rectangle", attribute.token)
+            if value.kind != "number":
+                raise CompileError(f"{name} expects a number", value.token)
+            numeric = float(str(value.value))
+            if not math.isfinite(numeric) or numeric < 0.0:
+                raise CompileError(f"{name} must be finite and non-negative", value.token)
+            member = "sourceWidth" if name == "image-source-width" else "sourceHeight"
+            self._line(lines, indent, f"{visual}.image.enabled = true;")
+            self._line(lines, indent,
+                       f"{visual}.image.{member} = {cpp_float(f'{numeric:.9g}')};")
+            return True
+        if name == "image-scale-mode":
+            if element.kind != "Rectangle":
+                raise CompileError("image-scale-mode requires Rectangle", attribute.token)
+            enum_value = self._enum(value, {
+                "fill": "Fill", "fit": "Fit", "crop": "Crop", "tile": "Tile",
+            }, "image scale mode")
+            self._line(lines, indent, f"{visual}.image.enabled = true;")
+            self._line(lines, indent,
+                       f"{visual}.image.scaleMode = slugvk::slugui::ImageScaleMode::{enum_value};")
             return True
         if name == "radius":
             if element.kind != "Rectangle":
@@ -1063,6 +1289,11 @@ class Generator:
             if value.kind != "string":
                 raise CompileError("font expects a string", value.token)
             self._line(lines, indent, f"{style}.fontName = {cpp_string(str(value.value))};")
+            return True
+        if name == "font-style":
+            if value.kind != "string":
+                raise CompileError("font-style expects a string", value.token)
+            self._line(lines, indent, f"{style}.fontStyle = {cpp_string(str(value.value))};")
             return True
         if name == "font-weight":
             if value.kind != "number":
@@ -1117,34 +1348,53 @@ class Generator:
             raise CompileError(f"unknown element kind '{element.kind}'", element.token)
         variable = f"node_{self.node_counter}"
         self.node_counter += 1
-        stable_id = f"{self.component.name}/"
-        if path:
-            stable_id += path + "/"
-        stable_id += element.name
-        path_attribute = next(
-            (attribute for attribute in element.attributes if attribute.name == "path-data"), None)
-        stroke_path_attribute = next(
-            (attribute for attribute in element.attributes
-              if attribute.name == "stroke-path-data"), None)
-        fill_placement_attribute = next(
-            (attribute for attribute in element.attributes
-             if attribute.name == "path-placement"), None)
-        stroke_placement_attribute = next(
-            (attribute for attribute in element.attributes
-             if attribute.name == "stroke-placement"), None)
-        shape_attribute = next(
-            (attribute for attribute in element.attributes if attribute.name == "shape"), None)
+        attributes = {attribute.name: attribute for attribute in element.attributes}
+        provider = attributes.get("source-provider")
+        document = attributes.get("source-document")
+        source_node = attributes.get("source-node")
+        figma_metadata: dict[str, object] = {}
+        provider_data_attribute = attributes.get("source-provider-data")
+        if (provider is not None and provider.value.kind == "string" and
+                provider.value.value == "figma" and
+                provider_data_attribute is not None and
+                provider_data_attribute.value.kind == "string"):
+            try:
+                parsed_metadata = json.loads(str(provider_data_attribute.value.value))
+                if isinstance(parsed_metadata, dict):
+                    figma_metadata = parsed_metadata
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if (provider is not None and provider.value.kind == "string" and
+                provider.value.value == "figma" and
+                document is not None and document.value.kind == "string" and
+                source_node is not None and source_node.value.kind == "string" and
+                str(source_node.value.value)):
+            # Figma node IDs are the synchronization identity. Names and group nesting are
+            # presentation details and may change during design edits without resetting UI state.
+            stable_id = (
+                f"figma/{document.value.value}/{source_node.value.value}"
+            )
+        else:
+            stable_id = f"{self.component.name}/"
+            if path:
+                stable_id += path + "/"
+            stable_id += element.name
+        path_attribute = attributes.get("path-data")
+        stroke_path_attribute = attributes.get("stroke-path-data")
+        fill_placement_attribute = attributes.get("path-placement")
+        stroke_placement_attribute = attributes.get("stroke-placement")
+        shape_attribute = attributes.get("shape")
         if element.kind != "Shape" and (path_attribute or stroke_path_attribute):
             offending = path_attribute or stroke_path_attribute
             raise CompileError(f"{offending.name} requires Shape", offending.token)
         if path_attribute and shape_attribute:
             raise CompileError("Shape cannot specify both shape and path-data", shape_attribute.token)
         fill_asset, fill_bounds = (
-            self._path_asset(path_attribute, lines, indent)
+            self._path_asset(element, path_attribute)
             if path_attribute else ("0", None)
         )
         stroke_asset, stroke_bounds = (
-            self._path_asset(stroke_path_attribute, lines, indent)
+            self._path_asset(element, stroke_path_attribute)
             if stroke_path_attribute else ("0", None)
         )
         arguments = f"slugvk::hashId({cpp_string(stable_id)}), {cpp_string(element.name)}"
@@ -1193,6 +1443,85 @@ class Generator:
             raise CompileError(
                 f"attribute '{attribute.name}' is not valid on {element.kind}", attribute.token,
             )
+
+        # Mirror key Figma semantics into typed metadata for normal generated components.
+        # Preview/runtime-only codegen may strip them because layout/visual compatibility has
+        # already been lowered into typed fields and the original .slugui remains lossless.
+        if figma_metadata and not self.strip_source_metadata:
+            string_fields = {
+                "nodeType": "nodeType",
+                "parentNodeId": "parentNodeId",
+                "componentKey": "componentKey",
+                "componentSetId": "componentSetId",
+                "mainComponentId": "mainComponentId",
+            }
+            for source_key, member in string_fields.items():
+                value = figma_metadata.get(source_key)
+                if isinstance(value, str) and value:
+                    self._assign_string(lines, indent, f"{variable}.source.{member}", value)
+
+            node_type = str(figma_metadata.get("nodeType", "")).upper()
+            figma_kinds = {
+                "COMPONENT_SET": "ComponentSet",
+                "COMPONENT": "Component",
+                "INSTANCE": "Instance",
+                "SLOT": "Slot",
+            }
+            if node_type in figma_kinds:
+                self._line(
+                    lines, indent,
+                    f"{variable}.source.figmaKind = "
+                    f"slugvk::slugui::FigmaSemanticKind::{figma_kinds[node_type]};")
+
+            json_fields = {
+                "variantProperties": "variantPropertiesJson",
+                "variantSelection": "variantSelectionJson",
+                "componentProperties": "componentPropertiesJson",
+                "componentDefinitions": "componentDefinitionsJson",
+                "componentPropertyReferences": "componentPropertyReferencesJson",
+                "overrides": "overridesJson",
+                "exposedInstanceIds": "exposedInstanceIdsJson",
+                "imageFills": "imageFillsJson",
+            }
+            for source_key, member in json_fields.items():
+                value = figma_metadata.get(source_key)
+                if value is not None:
+                    encoded = json.dumps(
+                        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    self._assign_string(lines, indent, f"{variable}.source.{member}", encoded)
+
+            scale_factor = figma_metadata.get("scaleFactor")
+            if isinstance(scale_factor, (int, float)) and math.isfinite(float(scale_factor)):
+                self._line(lines, indent,
+                    f"{variable}.source.instanceScaleFactor = {cpp_float(f'{float(scale_factor):.9g}')};")
+            exposed = figma_metadata.get("isExposedInstance")
+            if isinstance(exposed, bool):
+                self._line(lines, indent,
+                    f"{variable}.source.exposedInstance = {'true' if exposed else 'false'};")
+
+        # Legacy exporter compatibility: older Figma .slugui files stored constraints only in
+        # source-provider-data. Recover them so existing dropped files get the same anchor
+        # semantics as new exports with explicit constraint-horizontal/vertical attributes.
+        if "constraint-horizontal" not in attributes or "constraint-vertical" not in attributes:
+            constraints = figma_metadata.get("constraints") if figma_metadata else None
+            mapping = {
+                "MIN": "Min", "CENTER": "Center", "MAX": "Max",
+                "STRETCH": "Stretch", "SCALE": "Scale",
+            }
+            if isinstance(constraints, dict):
+                if "constraint-horizontal" not in attributes:
+                    value = mapping.get(str(constraints.get("horizontal", "")).upper())
+                    if value:
+                        self._line(lines, indent,
+                            f"{variable}.layout.horizontalConstraint = "
+                            f"slugvk::slugui::Constraint::{value};")
+                if "constraint-vertical" not in attributes:
+                    value = mapping.get(str(constraints.get("vertical", "")).upper())
+                    if value:
+                        self._line(lines, indent,
+                            f"{variable}.layout.verticalConstraint = "
+                            f"slugvk::slugui::Constraint::{value};")
+
         recovered_owner = self._recovered_figma_owner(element)
         if element.kind == "Shape" and recovered_owner is not None:
             base_x = self._fixed_scalar(element, "x") or 0.0
@@ -1211,9 +1540,81 @@ class Generator:
             self._emit_text_runs(element, variable, lines, indent)
         child_path = f"{path}/{element.name}" if path else element.name
         for child in element.children:
-            child_variable = self._node(child, child_path, lines, indent)
-            self._line(lines, indent, f"{variable}.add(std::move({child_variable}));")
+            # Put every child subtree in a non-inlined lambda. MSVC /Od reserves stack and unwind
+            # state for lexical locals until the containing function returns even after braces.
+            # A separate callable bounds each generated node's temporaries to its own stack frame,
+            # keeping large Figma component sets fast to compile without a giant runtime stack.
+            child_index = self.node_counter
+            built_variable = f"built_node_{child_index}"
+            self._line(
+                lines, indent,
+                f"auto {built_variable} = [&]() -> slugvk::slugui::Element {{",
+            )
+            child_variable = self._node(child, child_path, lines, indent + 1)
+            self._line(lines, indent + 1, f"return {child_variable};")
+            self._line(lines, indent, "}();")
+            self._line(lines, indent, f"{variable}.add(std::move({built_variable}));")
         return variable
+
+    def _font_requests(
+            self) -> dict[tuple[str, int, bool, str], tuple[set[int], set[str]]]:
+        requests: dict[tuple[str, int, bool, str], tuple[set[int], set[str]]] = {}
+
+        def add(family: str, weight: int, italic: bool, text: str,
+                font_style: str = "") -> None:
+            if not family or family == "system-ui":
+                return
+            key = (family, max(1, min(1000, weight)), italic, font_style)
+            points, samples = requests.setdefault(key, (set(), set()))
+            points.update(ord(character) for character in text if character)
+            if text:
+                samples.add(text)
+
+        def walk(element: ElementDecl) -> None:
+            attributes = {attribute.name: attribute.value for attribute in element.attributes}
+            if element.kind == "Text":
+                font = attributes.get("font")
+                family = str(font.value) if font and font.kind == "string" else "system-ui"
+                style_value = attributes.get("font-style")
+                font_style = str(style_value.value) if style_value and style_value.kind == "string" else ""
+                weight_value = attributes.get("font-weight")
+                weight = 400
+                if weight_value and weight_value.kind == "number":
+                    try:
+                        weight = int(round(float(str(weight_value.value))))
+                    except ValueError:
+                        weight = 400
+                italic_value = attributes.get("italic")
+                italic = bool(italic_value.value) if italic_value and italic_value.kind == "bool" else False
+                text_value = attributes.get("text")
+                if text_value and text_value.kind == "string":
+                    add(family, weight, italic, str(text_value.value), font_style)
+
+                run_value = attributes.get("text-runs")
+                if run_value and run_value.kind == "list":
+                    for run in run_value.arguments:
+                        if run.kind != "call" or str(run.value) != "text-run" or len(run.arguments) < 5:
+                            continue
+                        run_text, run_font, _size, run_weight, run_italic = run.arguments[:5]
+                        if run_text.kind != "string" or run_font.kind != "string":
+                            continue
+                        parsed_weight = 400
+                        if run_weight.kind == "number":
+                            try:
+                                parsed_weight = int(round(float(str(run_weight.value))))
+                            except ValueError:
+                                pass
+                        parsed_italic = bool(run_italic.value) if run_italic.kind == "bool" else False
+                        run_style = ""
+                        if len(run.arguments) >= 11 and run.arguments[10].kind == "string":
+                            run_style = str(run.arguments[10].value)
+                        add(str(run_font.value), parsed_weight, parsed_italic,
+                            str(run_text.value), run_style)
+            for child in element.children:
+                walk(child)
+
+        walk(self.component.root)
+        return requests
 
     def generate(self, source_name: str) -> str:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.component.name):
@@ -1226,6 +1627,26 @@ class Generator:
 
         build_lines: list[str] = []
         self._line(build_lines, 2, "(void)atlas;")
+        font_sample_index = 0
+        for (family, weight, italic, font_style), (codepoints, samples) in sorted(
+                self._font_requests().items()):
+            if not codepoints:
+                continue
+            points = ", ".join(f"{codepoint}u" for codepoint in sorted(codepoints))
+            self._line(
+                build_lines, 2,
+                f"if (atlas) (void)atlas->loadSystemFont({cpp_string(family)}, {weight}, "
+                f"{'true' if italic else 'false'}, std::vector<std::uint32_t>{{{points}}}, "
+                f"{cpp_string(font_style)});")
+            for sample in sorted(samples):
+                variable = f"font_sample_{font_sample_index}"
+                font_sample_index += 1
+                self._line(build_lines, 2, f"std::string {variable};")
+                self._assign_string(build_lines, 2, variable, sample)
+                self._line(
+                    build_lines, 2,
+                    f"if (atlas) (void)atlas->prepareText({variable}, {cpp_string(family)}, "
+                    f"{weight}, {'true' if italic else 'false'}, {cpp_string(font_style)});")
         self._line(build_lines, 2, "Built result;")
         for prop in self.component.properties:
             if prop.initial.kind == "reference":
@@ -1238,6 +1659,11 @@ class Generator:
                 f"result.{member} = result.properties.define<{PROPERTY_CPP[prop.type_name]}>("
                 f"{cpp_string(prop.name)}, {initial});",
             )
+
+        # Intern identical Figma vector geometry once per generated component. Component sets
+        # commonly repeat the same icons in every variant; sharing the atlas asset cuts Python
+        # parse work, generated C++ size, C++ compile time, and runtime atlas memory together.
+        self._prepare_path_assets(self.component.root, build_lines, 2)
         root_variable = self._node(self.component.root, "", build_lines, 2)
         self._line(build_lines, 2, f"result.root = std::move({root_variable});")
         self._line(build_lines, 2, "return result;")
@@ -1319,21 +1745,66 @@ class Generator:
 
 
 def compile_text(source: str, source_name: str, namespace: str,
-                 class_name: str | None = None) -> str:
+                 class_name: str | None = None,
+                 strip_source_metadata: bool = False) -> str:
     component = parse_source(source)
     header = re.search(r"(?m)^\s*//\s*SlugUI exchange format\s+(\d+)\s*,", source)
     legacy_figma_coordinates = header is not None and int(header.group(1)) == 1
     return Generator(
-        component, namespace, class_name, legacy_figma_coordinates).generate(source_name)
+        component, namespace, class_name, legacy_figma_coordinates,
+        strip_source_metadata).generate(source_name)
 
 
-def write_atomic(path: Path, content: str) -> None:
+def write_atomic(path: Path, content: str) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = content.encode("utf-8")
+    try:
+        # Keeping the timestamp stable is important: CMake/MSBuild then skips recompiling every
+        # translation unit that includes an unchanged generated SlugUI header.
+        if path.read_bytes() == encoded:
+            return False
+    except (FileNotFoundError, PermissionError):
+        pass
+
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
-            output.write(content)
-        os.replace(temporary, path)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(encoded)
+        # A concurrent MSVC compile can keep an included generated header open without FILE_SHARE_DELETE
+        # for several seconds. Wait for that reader rather than failing the import or overwriting the
+        # file in place (which could give the compiler a partially-written header).
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                return True
+            except PermissionError:
+                # Another concurrent codegen may have already installed the exact bytes we wanted.
+                try:
+                    if path.read_bytes() == encoded:
+                        os.unlink(temporary)
+                        return False
+                except (FileNotFoundError, PermissionError):
+                    pass
+                if attempt == 9:
+                    # Visual Studio/IntelliSense commonly keeps generated headers open with
+                    # read/write sharing but without delete sharing, which blocks os.replace()
+                    # indefinitely. The owning build cannot compile this header until this custom
+                    # command completes, so use an in-place rewrite only as the final Windows
+                    # sharing-mode fallback after a short atomic-replace grace period.
+                    with path.open("r+b", buffering=0) as output:
+                        view = memoryview(encoded)
+                        offset = 0
+                        while offset < len(view):
+                            written = output.write(view[offset:])
+                            if not written:
+                                raise OSError("short write while updating generated SlugUI header")
+                            offset += written
+                        output.truncate(len(encoded))
+                        os.fsync(output.fileno())
+                    os.unlink(temporary)
+                    return True
+                time.sleep(0.05)
+        return True
     except BaseException:
         try:
             os.unlink(temporary)
@@ -1350,6 +1821,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("-o", "--output", type=Path, help="generated C++ header")
     parser.add_argument("--namespace", default="slugvk::generated", help="generated C++ namespace")
     parser.add_argument("--class-name", help="generated C++ class name override")
+    parser.add_argument(
+        "--strip-source-metadata", action="store_true",
+        help="omit source/provider metadata from generated runtime C++ while preserving stable IDs")
     parser.add_argument("--check", action="store_true", help="parse and type-check without writing")
     parser.add_argument("--stdout", action="store_true", help="write generated C++ to stdout")
     arguments = parser.parse_args(argv)
@@ -1358,7 +1832,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         source = arguments.input.read_text(encoding="utf-8")
         generated = compile_text(
-            source, arguments.input.name, arguments.namespace, arguments.class_name)
+            source, arguments.input.name, arguments.namespace, arguments.class_name,
+            arguments.strip_source_metadata)
         if arguments.stdout:
             sys.stdout.write(generated)
         elif not arguments.check:

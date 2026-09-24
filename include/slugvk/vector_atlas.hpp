@@ -25,6 +25,32 @@ struct FontFace {
   std::string family;
   std::uint16_t weight = 0;
   bool italic = false;
+  std::string style;
+};
+
+struct FontFaceMetrics {
+  float capHeight = 0.7f;
+  float xHeight = 0.5f;
+  float ascender = 0.8f;
+  float descender = 0.2f;
+  float lineGap = 0.0f;
+};
+
+struct ShapedGlyph {
+  ShapeId shape = 0;
+  std::uint32_t glyphIndex = 0;
+  std::uint32_t cluster = 0; // UTF-8 byte offset into the source text.
+  float xAdvance = 0.0f;     // normalized em units.
+  float yAdvance = 0.0f;
+  float xOffset = 0.0f;
+  float yOffset = 0.0f;
+};
+
+struct ShapedTextRun {
+  std::vector<ShapedGlyph> glyphs;
+  float xAdvance = 0.0f;
+  float yAdvance = 0.0f;
+  bool rightToLeft = false;
 };
 
 class Path {
@@ -44,6 +70,10 @@ public:
   // icon sources (for example Lucide's 24x24 paths) as their canonical data
   // instead of flattening them into disconnected runtime line segments.
   Path& svgPath(std::string_view data, float viewBoxHeight = 0.0f);
+  // Parse SVG/Figma y-down path data into Slug's y-up atlas space by reflecting y about 0.
+  // This avoids exploding validated path strings into thousands of generated C++ calls.
+  Path& svgPathYDown(std::string_view data);
+  Path& addPath(const Path& other);
   Path& close();
   Path& rect(float x, float y, float width, float height);
   Path& roundedRect(float x, float y, float width, float height, float radius,
@@ -69,7 +99,7 @@ public:
   VectorAtlas(const VectorAtlas&) = delete;
   VectorAtlas& operator=(const VectorAtlas&) = delete;
 
-  ShapeId addPath(const Path& path);
+  ShapeId addPath(const Path& path, FillRule fillRule = FillRule::NonZero);
   ShapeId addStroke(const Path& path, const StrokeStyle& style);
   // Registers a stroked path without discarding its authored square-viewBox padding.
   // This is intended for SVG icon atlases whose state variants must keep one stable quad.
@@ -80,6 +110,16 @@ public:
                 const std::vector<std::uint32_t>& codepoints = {});
   bool loadFontMemory(std::span<const std::uint8_t> fontData, FontFace face = {},
                       const std::vector<std::uint32_t>& codepoints = {});
+  // Resolves a platform-installed font by family/weight/style and registers only the glyphs
+  // requested by the imported UI. Intended for Figma-authored font families.
+  bool loadSystemFont(std::string_view family, std::uint16_t weight = 400, bool italic = false,
+                      const std::vector<std::uint32_t>& codepoints = {},
+                      std::string_view style = {});
+  // Shapes text with HarfBuzz before atlas finalization and registers exactly the glyph indices
+  // produced by GSUB/GPOS. This keeps static Figma/SlugUI documents compact: no whole-font atlas.
+  bool prepareText(std::string_view text, std::string_view fontName = "system-ui",
+                   std::uint16_t weight = 400, bool italic = false,
+                   std::string_view style = {});
   void build();
 
   [[nodiscard]] bool built() const;
@@ -89,20 +129,40 @@ public:
   [[nodiscard]] ShapeId glyph(std::uint32_t codepoint,
                               std::string_view fontName = "system-ui",
                               std::uint16_t weight = 400,
-                              bool italic = false) const;
-  [[nodiscard]] bool hasFontFace(std::string_view fontName, bool italic) const;
+                              bool italic = false,
+                              std::string_view style = {}) const;
+  // Returns a fully positioned HarfBuzz run when all shaped glyphs were prepared in the atlas.
+  // Dynamic/unprepared text returns nullopt so callers can use the legacy codepoint fallback.
+  [[nodiscard]] std::optional<ShapedTextRun> shapeText(
+      std::string_view text, std::string_view fontName = "system-ui",
+      std::uint16_t weight = 400, bool italic = false,
+      std::string_view style = {}) const;
+  [[nodiscard]] bool hasFontFace(std::string_view fontName, bool italic,
+                                 std::string_view style = {}) const;
+  [[nodiscard]] std::optional<FontFaceMetrics> fontMetrics(
+      std::string_view fontName, std::uint16_t weight = 400, bool italic = false,
+      std::string_view style = {}) const;
+  [[nodiscard]] float kerning(std::uint32_t leftCodepoint, std::uint32_t rightCodepoint,
+                              std::string_view fontName,
+                              std::uint16_t weight = 400, bool italic = false,
+                              std::string_view style = {}) const;
   [[nodiscard]] const slughorn::Atlas& native() const;
 
 private:
   ShapeId addStrokeImpl(const Path& path, const StrokeStyle& style,
                         std::optional<float> squareViewBoxSize);
   bool loadFontFace(void* nativeFace, FontFace face,
-                    const std::vector<std::uint32_t>& codepoints);
+                    const std::vector<std::uint32_t>& codepoints,
+                    std::shared_ptr<const std::vector<std::uint8_t>> fontData);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
 
 std::vector<std::uint32_t> decodeUtf8(std::string_view text);
+// Resolve an installed font by its Figma/CSS family name and requested face. The path may be
+// empty when the family is not installed locally.
+std::string findSystemFont(std::string_view family, std::uint16_t weight = 400,
+                           bool italic = false);
 std::string findDefaultSystemFont();
 
 } // namespace slugvk

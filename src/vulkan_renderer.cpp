@@ -1,4 +1,5 @@
 #include "slugvk/vulkan_renderer.hpp"
+#include "slugvk/vulkan_interop.hpp"
 
 #include "slughorn/slughorn.hpp"
 #include "slugvk/platform_surface.hpp"
@@ -37,6 +38,7 @@ constexpr std::size_t framesInFlight = 1;
 constexpr const char* portabilitySubsetExtension = "VK_KHR_portability_subset";
 constexpr std::uint32_t analyticRoundedRectShape = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t analyticStrokeSegmentShape = std::numeric_limits<std::uint32_t>::max() - 1U;
+constexpr std::uint32_t externalImageShape = std::numeric_limits<std::uint32_t>::max() - 3U;
 
 #if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
 class GlfwPlatformSurface final : public PlatformSurface {
@@ -366,6 +368,7 @@ struct DrawBatch {
   Rect clip = {};
   float opacity = 1.0f;
   bool primitive = false;
+  ExternalImageId externalImage = 0;
 };
 
 // Private lowering target between public DrawList commands and GPU buffers.
@@ -437,6 +440,17 @@ struct VulkanRenderer::Impl {
   VkSampler sampler = VK_NULL_HANDLE;
   Texture curveTexture{};
   Texture bandTexture{};
+  Buffer externalImageFallback{};
+  struct ExternalImageResource {
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    Buffer ownedBuffer{};
+    VkDeviceSize range = 0;
+    bool live = false;
+  };
+  std::vector<ExternalImageResource> externalImages{};
+  VulkanFrameRecorder frameRecorder = nullptr;
+  void* frameRecorderContext = nullptr;
 
   VkCommandPool commandPool = VK_NULL_HANDLE;
   std::array<VkCommandBuffer, framesInFlight> commandBuffers{};
@@ -455,6 +469,7 @@ struct VulkanRenderer::Impl {
   struct GlyphRunKey {
     std::string text;
     std::string fontName;
+    std::string fontStyle;
     std::uint16_t weight = 400;
     bool italic = false;
     bool operator==(const GlyphRunKey&) const = default;
@@ -466,6 +481,7 @@ struct VulkanRenderer::Impl {
         hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
       };
       combine(std::hash<std::string>{}(key.fontName));
+      combine(std::hash<std::string>{}(key.fontStyle));
       combine(key.weight);
       combine(key.italic ? 1U : 0U);
       return hash;
@@ -488,16 +504,27 @@ struct VulkanRenderer::Impl {
   std::vector<RetainedGeometry> retainedDrawLists{};
   struct CachedGlyph {
     bool present = false;
+    std::uint32_t codepoint = 0;
     slughorn::Atlas::Shape shape{};
+    float xAdvance = 0.0f;
+    float yAdvance = 0.0f;
+    float xOffset = 0.0f;
+    float yOffset = 0.0f;
   };
   struct CachedGlyphRun {
     std::vector<CachedGlyph> glyphs{};
+    float xAdvance = 0.0f;
+    float yAdvance = 0.0f;
+    bool shaped = false;
+    bool rightToLeft = false;
     std::uint64_t lastUsed = 0;
   };
   mutable std::unordered_map<GlyphRunKey, CachedGlyphRun, GlyphRunKeyHash> glyphRunCache{};
   mutable std::uint64_t glyphRunUseCounter = 0;
   std::uint32_t timestampValidBits = 0;
   std::uint64_t submittedFrameCount = 0;
+  std::uint64_t completedSubmissionSerial = 0;
+  std::array<std::uint64_t, framesInFlight> frameSubmissionSerial{};
   bool framePrepared = false;
   std::uint32_t preparedImageIndex = 0;
   VkResult preparedAcquireResult = VK_SUCCESS;
@@ -524,6 +551,10 @@ struct VulkanRenderer::Impl {
       createDevice();
       createCommandPool();
       createTextures();
+      createBuffer(4 * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   externalImageFallback, true);
+      std::memset(externalImageFallback.mapped, 0, 4 * sizeof(float));
       createDescriptorResources();
       createSwapchainResources();
       createFrames();
@@ -837,46 +868,202 @@ struct VulkanRenderer::Impl {
     check(vkCreateSampler(device, &info, nullptr, &sampler), "vkCreateSampler");
   }
 
-  void createDescriptorResources() {
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
-    for (std::uint32_t i = 0; i < bindings.size(); ++i) {
-      bindings[i].binding = i;
-      bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-      bindings[i].descriptorCount = 1;
-      bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    layout.bindingCount = static_cast<std::uint32_t>(bindings.size());
-    layout.pBindings = bindings.data();
-    check(vkCreateDescriptorSetLayout(device, &layout, nullptr, &descriptorSetLayout),
-          "vkCreateDescriptorSetLayout");
-    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
-    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pool.maxSets = 1;
-    pool.poolSizeCount = 1;
-    pool.pPoolSizes = &size;
-    check(vkCreateDescriptorPool(device, &pool, nullptr, &descriptorPool),
-          "vkCreateDescriptorPool");
-    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocate.descriptorPool = descriptorPool;
-    allocate.descriptorSetCount = 1;
-    allocate.pSetLayouts = &descriptorSetLayout;
-    check(vkAllocateDescriptorSets(device, &allocate, &descriptorSet), "vkAllocateDescriptorSets");
+  void writeImageDescriptorSet(VkDescriptorSet target, VkBuffer buffer,
+                               VkDeviceSize offset, VkDeviceSize range) {
     VkDescriptorImageInfo curve{sampler, curveTexture.view,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkDescriptorImageInfo band{sampler, bandTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    std::array<VkWriteDescriptorSet, 2> writes{};
-    for (std::uint32_t i = 0; i < writes.size(); ++i) {
+    VkDescriptorImageInfo band{sampler, bandTexture.view,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorBufferInfo pixels{buffer, offset, range};
+    std::array<VkWriteDescriptorSet, 3> writes{};
+    for (std::uint32_t i = 0; i < 2; ++i) {
       writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-      writes[i].dstSet = descriptorSet;
+      writes[i].dstSet = target;
       writes[i].dstBinding = i;
       writes[i].descriptorCount = 1;
       writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     }
     writes[0].pImageInfo = &curve;
     writes[1].pImageInfo = &band;
-    vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0,
-                           nullptr);
+    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[2].dstSet = target;
+    writes[2].dstBinding = 2;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[2].pBufferInfo = &pixels;
+    vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()),
+                           writes.data(), 0, nullptr);
+  }
+
+  static std::array<VkDescriptorPoolSize, 2> imageDescriptorPoolSizes() {
+    return {{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}}};
+  }
+
+  void createDescriptorResources() {
+    std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+    for (std::uint32_t i = 0; i < 2; ++i) {
+      bindings[i].binding = i;
+      bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      bindings[i].descriptorCount = 1;
+      bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    bindings[2].binding = 2;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layout.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layout.pBindings = bindings.data();
+    check(vkCreateDescriptorSetLayout(device, &layout, nullptr, &descriptorSetLayout),
+          "vkCreateDescriptorSetLayout");
+
+    const auto sizes = imageDescriptorPoolSizes();
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = 1;
+    pool.poolSizeCount = static_cast<std::uint32_t>(sizes.size());
+    pool.pPoolSizes = sizes.data();
+    check(vkCreateDescriptorPool(device, &pool, nullptr, &descriptorPool),
+          "vkCreateDescriptorPool");
+    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocate.descriptorPool = descriptorPool;
+    allocate.descriptorSetCount = 1;
+    allocate.pSetLayouts = &descriptorSetLayout;
+    check(vkAllocateDescriptorSets(device, &allocate, &descriptorSet),
+          "vkAllocateDescriptorSets");
+    writeImageDescriptorSet(descriptorSet, externalImageFallback.buffer, 0,
+                            externalImageFallback.size);
+  }
+
+  ExternalImageId registerExternalImage(VkBuffer buffer, VkDeviceSize offset,
+                                        VkDeviceSize range) {
+    if (buffer == VK_NULL_HANDLE || range == 0)
+      throw std::invalid_argument("External RGBA32F buffer must be valid and non-empty");
+    ExternalImageResource resource;
+    const auto sizes = imageDescriptorPoolSizes();
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = 1;
+    pool.poolSizeCount = static_cast<std::uint32_t>(sizes.size());
+    pool.pPoolSizes = sizes.data();
+    check(vkCreateDescriptorPool(device, &pool, nullptr, &resource.pool),
+          "vkCreateDescriptorPool(external image)");
+    try {
+      VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+      allocate.descriptorPool = resource.pool;
+      allocate.descriptorSetCount = 1;
+      allocate.pSetLayouts = &descriptorSetLayout;
+      check(vkAllocateDescriptorSets(device, &allocate, &resource.descriptorSet),
+            "vkAllocateDescriptorSets(external image)");
+      writeImageDescriptorSet(resource.descriptorSet, buffer, offset, range);
+      resource.range = range;
+      resource.live = true;
+      externalImages.push_back(resource);
+      return static_cast<ExternalImageId>(externalImages.size());
+    } catch (...) {
+      if (resource.pool) vkDestroyDescriptorPool(device, resource.pool, nullptr);
+      throw;
+    }
+  }
+
+  ExternalImageId createOwnedExternalImage(
+      std::uint32_t width, std::uint32_t height) {
+    if (width == 0 || height == 0)
+      throw std::invalid_argument(
+          "Owned RGBA32F image dimensions must be non-zero");
+    const std::uint64_t pixels =
+        static_cast<std::uint64_t>(width) * height;
+    if (pixels >
+        (std::numeric_limits<VkDeviceSize>::max)() /
+            (4u * sizeof(float)))
+      throw std::overflow_error(
+          "Owned RGBA32F image is too large");
+
+    ExternalImageResource resource;
+    resource.range = static_cast<VkDeviceSize>(
+        pixels * 4u * sizeof(float));
+    createBuffer(
+        resource.range,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        resource.ownedBuffer, true);
+    std::memset(
+        resource.ownedBuffer.mapped, 0,
+        static_cast<std::size_t>(resource.range));
+
+    const auto sizes = imageDescriptorPoolSizes();
+    VkDescriptorPoolCreateInfo pool{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = 1;
+    pool.poolSizeCount =
+        static_cast<std::uint32_t>(sizes.size());
+    pool.pPoolSizes = sizes.data();
+    check(
+        vkCreateDescriptorPool(
+            device, &pool, nullptr, &resource.pool),
+        "vkCreateDescriptorPool(owned external image)");
+    try {
+      VkDescriptorSetAllocateInfo allocate{
+          VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+      allocate.descriptorPool = resource.pool;
+      allocate.descriptorSetCount = 1;
+      allocate.pSetLayouts = &descriptorSetLayout;
+      check(
+          vkAllocateDescriptorSets(
+              device, &allocate, &resource.descriptorSet),
+          "vkAllocateDescriptorSets(owned external image)");
+      writeImageDescriptorSet(
+          resource.descriptorSet,
+          resource.ownedBuffer.buffer, 0, resource.range);
+      resource.live = true;
+      externalImages.push_back(std::move(resource));
+      return static_cast<ExternalImageId>(
+          externalImages.size());
+    } catch (...) {
+      if (resource.pool)
+        vkDestroyDescriptorPool(
+            device, resource.pool, nullptr);
+      destroyBuffer(resource.ownedBuffer);
+      throw;
+    }
+  }
+
+  bool updateOwnedExternalImage(
+      ExternalImageId image,
+      std::span<const float> words) noexcept {
+    if (image == 0 || image > externalImages.size())
+      return false;
+    auto& resource = externalImages[image - 1U];
+    if (!resource.live ||
+        resource.ownedBuffer.mapped == nullptr)
+      return false;
+    const auto expected =
+        static_cast<std::size_t>(
+            resource.range / sizeof(float));
+    if (words.size() != expected) return false;
+    std::memcpy(
+        resource.ownedBuffer.mapped, words.data(),
+        static_cast<std::size_t>(resource.range));
+    return true;
+  }
+
+  void unregisterExternalImage(ExternalImageId image) noexcept {
+    if (image == 0 || image > externalImages.size()) return;
+    auto& resource = externalImages[image - 1U];
+    if (!resource.live) return;
+    if (device != VK_NULL_HANDLE)
+      (void)vkDeviceWaitIdle(device);
+    if (resource.pool != VK_NULL_HANDLE)
+      vkDestroyDescriptorPool(device, resource.pool, nullptr);
+    destroyBuffer(resource.ownedBuffer);
+    resource = {};
+  }
+
+  [[nodiscard]] const ExternalImageResource*
+  externalImageResource(ExternalImageId image) const noexcept {
+    if (image == 0 || image > externalImages.size()) return nullptr;
+    const auto& resource = externalImages[image - 1U];
+    return resource.live ? &resource : nullptr;
   }
 
   VkSurfaceFormatKHR chooseFormat(const std::vector<VkSurfaceFormatKHR>& formats) const {
@@ -1279,26 +1466,28 @@ struct VulkanRenderer::Impl {
                            float italicShear = 0.0f) const {
     if (shape.width <= 0 || shape.height <= 0 || destination.width <= 0 || destination.height <= 0)
       return;
-    constexpr float padding = 1.25f;
-    const float emPaddingX = static_cast<float>(shape.width) / destination.width * padding;
-    const float emPaddingY = static_cast<float>(shape.height) / destination.height * padding;
-    const float emLeft = static_cast<float>(shape.bearingX) - emPaddingX;
-    const float emRight = static_cast<float>(shape.bearingX + shape.width) + emPaddingX;
-    const float emTop = static_cast<float>(shape.bearingY) + emPaddingY;
-    const float emBottom = static_cast<float>(shape.bearingY - shape.height) - emPaddingY;
-    const float left = destination.x - padding;
-    const float right = destination.x + destination.width + padding;
-    const float top = destination.y - padding;
-    const float bottom = destination.y + destination.height + padding;
+    // Store the true authored quad. The Slug reference renderer does not bake a constant
+    // fringe into geometry; its vertex shader dynamically dilates the boundary by exactly
+    // half a viewport pixel and offsets the em-space sample position through the inverse
+    // Jacobian. Baking 1.25 px here was both wasteful at large scale and could still miss
+    // samples after retained scaling.
+    constexpr float rasterFringe = 0.5f;
+    const float left = destination.x;
+    const float right = destination.x + destination.width;
+    const float top = destination.y;
+    const float bottom = destination.y + destination.height;
     const float shear = italicShear * destination.height;
-    if (right + std::max(shear, 0.0f) <= clip.x ||
-        left + std::min(shear, 0.0f) >= clip.x + clip.width || bottom <= clip.y ||
-        top >= clip.y + clip.height)
+    if (right + std::max(shear, 0.0f) + rasterFringe <= clip.x ||
+        left + std::min(shear, 0.0f) - rasterFringe >= clip.x + clip.width ||
+        bottom + rasterFringe <= clip.y || top - rasterFringe >= clip.y + clip.height)
       return;
 
     Instance quad{};
     const float positionRect[4]{left, top, right, bottom};
-    const float emRect[4]{emLeft, emTop, emRight, emBottom};
+    const float emRect[4]{static_cast<float>(shape.bearingX),
+                          static_cast<float>(shape.bearingY),
+                          static_cast<float>(shape.bearingX + shape.width),
+                          static_cast<float>(shape.bearingY - shape.height)};
     std::copy(std::begin(positionRect), std::end(positionRect), quad.positionRect);
     std::copy(std::begin(emRect), std::end(emRect), quad.emRect);
     quad.bandTransform[0] = static_cast<float>(shape.bandScaleX);
@@ -1308,7 +1497,8 @@ struct VulkanRenderer::Impl {
     quad.shapeData[0] = shape.bandTexX;
     quad.shapeData[1] = shape.bandTexY;
     quad.shapeData[2] = shape.bandMaxX;
-    quad.shapeData[3] = shape.bandMaxY;
+    // Match Eric Lengyel's reference glyph packing: low 8 bits are band max Y and bit 12 is E.
+    quad.shapeData[3] = (shape.bandMaxY & 0xFFu) | (shape.evenOdd ? 0x1000u : 0u);
     const float first[4]{paintValue.start.r, paintValue.start.g, paintValue.start.b,
                          paintValue.start.a};
     const float second[4]{paintValue.end.r, paintValue.end.g, paintValue.end.b, paintValue.end.a};
@@ -1404,19 +1594,22 @@ struct VulkanRenderer::Impl {
                                  const Paint& paintValue, BorderWidths strokeWidths,
                                  float outsetFactor, float coverageMode) const {
     if (destination.width <= 0.0f || destination.height <= 0.0f) return;
-    constexpr float padding = 1.25f;
-    const float left = destination.x - padding;
-    const float top = destination.y - padding;
-    const float right = destination.x + destination.width + padding;
-    const float bottom = destination.y + destination.height + padding;
-    if (right <= command.clip.x || left >= command.clip.x + command.clip.width ||
-        bottom <= command.clip.y || top >= command.clip.y + command.clip.height)
+    // Keep authored geometry exact. vector.vert performs Slug-style half-device-pixel dynamic
+    // dilation and inverse-Jacobian sample correction, so retained scaling never changes AA width.
+    constexpr float rasterFringe = 0.5f;
+    const float left = destination.x;
+    const float top = destination.y;
+    const float right = destination.x + destination.width;
+    const float bottom = destination.y + destination.height;
+    if (right + rasterFringe <= command.clip.x ||
+        left - rasterFringe >= command.clip.x + command.clip.width ||
+        bottom + rasterFringe <= command.clip.y ||
+        top - rasterFringe >= command.clip.y + command.clip.height)
       return;
 
     Instance quad{};
     const float positionRect[4]{left, top, right, bottom};
-    const float emRect[4]{-padding, -padding, destination.width + padding,
-                          destination.height + padding};
+    const float emRect[4]{0.0f, 0.0f, destination.width, destination.height};
     std::copy(std::begin(positionRect), std::end(positionRect), quad.positionRect);
     std::copy(std::begin(emRect), std::end(emRect), quad.emRect);
     std::array<float, 4> radii{
@@ -1482,12 +1675,13 @@ struct VulkanRenderer::Impl {
 
   void appendOpaqueBorder(std::vector<Instance>& instances,
                           const RoundedRectCommand& command,
-                          BorderWidths widths, float outsideFactor) const {
+                          BorderWidths widths, float outsideFactor,
+                          bool innerFillFollows) const {
     if (widths.maximum() <= 0.0f || !paintFullyOpaque(command.border.paint)) return;
-    appendRoundedRectInstance(instances, command,
-                              strokeBounds(command.destination, widths, outsideFactor),
-                              command.border.paint, widths, outsideFactor,
-                              roundedRectOpaqueBorderCoverage);
+    appendRoundedRectInstance(
+      instances, command, strokeBounds(command.destination, widths, outsideFactor),
+      command.border.paint, widths, outsideFactor,
+      innerFillFollows ? roundedRectOpaqueBorderCoverage : roundedRectStrokeRingCoverage);
   }
 
   void appendRoundedRect(std::vector<Instance>& instances,
@@ -1503,10 +1697,11 @@ struct VulkanRenderer::Impl {
     const float outsideFactor = strokeOutsideFactor(command.border.align);
     const Rect borderBounds = strokeBounds(command.destination, widths, outsideFactor);
     if (paintFullyOpaque(command.border.paint)) {
-      // Opaque vector paints share one outside coverage domain: border first, then an inner fill.
-      // This prevents the full-size fill from leaking through the border's AA pixels.
-      appendOpaqueBorder(instances, command, widths, outsideFactor);
-      if (!paintFullyTransparent(command.paint))
+      // Opaque vector paints share one outside coverage domain only when an inner fill follows.
+      // Border-only shapes use the ordinary continuous ring coverage on both edges.
+      const bool hasInnerFill = !paintFullyTransparent(command.paint);
+      appendOpaqueBorder(instances, command, widths, outsideFactor, hasInnerFill);
+      if (hasInnerFill)
         appendRoundedRectInstance(instances, command, command.destination, command.paint, widths,
                                   outsideFactor, roundedRectInnerFillCoverage);
     } else {
@@ -1564,7 +1759,8 @@ struct VulkanRenderer::Impl {
         };
         visible.clip = intersectRects(command.clip, owner);
       }
-      appendOpaqueBorder(instances, visible, widths, outsideFactor);
+      appendOpaqueBorder(instances, visible, widths, outsideFactor,
+                         !paintFullyTransparent(base.paint));
     }
     // Figma commonly represents different side paints as coincident rectangles. Their opaque
     // border masks are emitted in painter order, while the one visible fill is inset by the union
@@ -1720,7 +1916,8 @@ struct VulkanRenderer::Impl {
   }
 
   const CachedGlyphRun& glyphRun(std::string_view text, const TextStyle& style) const {
-    GlyphRunKey key{std::string(text), style.fontName, style.weight, style.italic};
+    GlyphRunKey key{
+      std::string(text), style.fontName, style.fontStyle, style.weight, style.italic};
     if (auto found = glyphRunCache.find(key); found != glyphRunCache.end()) {
       found->second.lastUsed = ++glyphRunUseCounter;
       return found->second;
@@ -1733,26 +1930,134 @@ struct VulkanRenderer::Impl {
       glyphRunCache.erase(oldest);
     }
     CachedGlyphRun run;
-    const auto codepoints = decodeUtf8(text);
-    run.glyphs.reserve(codepoints.size());
-    for (const auto codepoint : codepoints) {
-      const ShapeId glyphId = vectorAtlas.glyph(
-        codepoint, style.fontName, style.weight, style.italic);
-      const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
-      if (glyph) run.glyphs.push_back({true, *glyph});
-      else run.glyphs.push_back({});
+    if (const auto shaped = vectorAtlas.shapeText(
+          text, style.fontName, style.weight, style.italic, style.fontStyle)) {
+      run.shaped = true;
+      run.rightToLeft = shaped->rightToLeft;
+      run.xAdvance = shaped->xAdvance;
+      run.yAdvance = shaped->yAdvance;
+      run.glyphs.reserve(shaped->glyphs.size());
+      for (const auto& positioned : shaped->glyphs) {
+        const auto glyph = vectorAtlas.native().getShape(slughorn::Key(positioned.shape));
+        if (glyph) {
+          run.glyphs.push_back({
+            true, positioned.cluster, *glyph,
+            positioned.xAdvance, positioned.yAdvance,
+            positioned.xOffset, positioned.yOffset
+          });
+        } else {
+          run.glyphs.push_back({
+            false, positioned.cluster, {},
+            positioned.xAdvance, positioned.yAdvance,
+            positioned.xOffset, positioned.yOffset
+          });
+        }
+      }
+    } else {
+      const auto codepoints = decodeUtf8(text);
+      run.glyphs.reserve(codepoints.size());
+      for (const auto codepoint : codepoints) {
+        const ShapeId glyphId = vectorAtlas.glyph(
+          codepoint, style.fontName, style.weight, style.italic, style.fontStyle);
+        const auto glyph = vectorAtlas.native().getShape(slughorn::Key(glyphId));
+        if (glyph) run.glyphs.push_back({true, codepoint, *glyph});
+        else run.glyphs.push_back({false, codepoint, {}});
+      }
     }
     run.lastUsed = ++glyphRunUseCounter;
     return glyphRunCache.emplace(std::move(key), std::move(run)).first->second;
   }
 
   float textWidth(const CachedGlyphRun& run, const TextStyle& style) const {
+    if (run.shaped) {
+      const float spacing = run.glyphs.size() > 1
+        ? static_cast<float>(run.glyphs.size() - 1) * style.letterSpacing
+        : 0.0f;
+      return std::max(0.0f, std::abs(run.xAdvance) * style.size + spacing);
+    }
+
     float width = 0.0f;
+    std::uint32_t previous = 0;
     for (const auto& cached : run.glyphs) {
+      if (previous != 0) {
+        width += vectorAtlas.kerning(
+          previous, cached.codepoint, style.fontName, style.weight, style.italic, style.fontStyle) *
+          style.size;
+      }
       const float advance = cached.present ? static_cast<float>(cached.shape.advance) : 0.6f;
       width += advance * style.size + style.letterSpacing;
+      previous = cached.codepoint;
     }
-    return std::max(0.0f, width - style.letterSpacing);
+    return std::max(0.0f, width - (run.glyphs.empty() ? 0.0f : style.letterSpacing));
+  }
+
+  void appendGlyphRun(std::vector<Instance>& instances, const CachedGlyphRun& run,
+                      const TextStyle& style, float& x, float baseline,
+                      float size, float spacing, Rect clip, float slant) const {
+    if (run.shaped) {
+      const float signedAdvance = run.xAdvance * size;
+      const float direction = signedAdvance < -0.00001f ||
+                              (std::abs(signedAdvance) <= 0.00001f && run.rightToLeft)
+        ? -1.0f : 1.0f;
+      float penX = x + (signedAdvance < 0.0f ? -signedAdvance : 0.0f);
+      for (std::size_t index = 0; index < run.glyphs.size(); ++index) {
+        const auto& cached = run.glyphs[index];
+        if (cached.present) {
+          const auto& glyph = cached.shape;
+          if (glyph.width > 0 && glyph.height > 0) {
+            Rect destination{
+              penX + cached.xOffset * size + static_cast<float>(glyph.bearingX) * size,
+              baseline - cached.yOffset * size - static_cast<float>(glyph.bearingY) * size,
+              static_cast<float>(glyph.width) * size,
+              static_cast<float>(glyph.height) * size,
+            };
+            appendResolvedShape(instances, glyph, destination, style.paint, clip, slant);
+            if (style.bold) {
+              destination.x += std::max(0.55f, size * 0.035f);
+              appendResolvedShape(instances, glyph, destination, style.paint, clip, slant);
+            }
+          }
+        }
+        penX += cached.xAdvance * size;
+        if (index + 1 < run.glyphs.size()) penX += spacing * direction;
+      }
+      x += std::abs(run.xAdvance) * size +
+           (run.glyphs.size() > 1
+              ? static_cast<float>(run.glyphs.size() - 1) * spacing
+              : 0.0f);
+      return;
+    }
+
+    std::uint32_t previousCodepoint = 0;
+    for (const auto& cached : run.glyphs) {
+      if (previousCodepoint != 0) {
+        x += vectorAtlas.kerning(
+          previousCodepoint, cached.codepoint, style.fontName, style.weight,
+          style.italic, style.fontStyle) * size;
+      }
+      if (!cached.present) {
+        x += size * 0.6f + spacing;
+        previousCodepoint = cached.codepoint;
+        continue;
+      }
+      const auto& glyph = cached.shape;
+      const float advance = static_cast<float>(glyph.advance) * size;
+      if (glyph.width > 0 && glyph.height > 0) {
+        Rect destination{
+          x + static_cast<float>(glyph.bearingX) * size,
+          baseline - static_cast<float>(glyph.bearingY) * size,
+          static_cast<float>(glyph.width) * size,
+          static_cast<float>(glyph.height) * size,
+        };
+        appendResolvedShape(instances, glyph, destination, style.paint, clip, slant);
+        if (style.bold) {
+          destination.x += std::max(0.55f, size * 0.035f);
+          appendResolvedShape(instances, glyph, destination, style.paint, clip, slant);
+        }
+      }
+      x += advance + spacing;
+      previousCodepoint = cached.codepoint;
+    }
   }
 
   float textWidth(std::string_view text, const TextStyle& style, float scale) const {
@@ -1760,6 +2065,18 @@ struct VulkanRenderer::Impl {
     scaled.size *= scale;
     scaled.letterSpacing *= scale;
     return textWidth(glyphRun(text, style), scaled);
+  }
+
+  float textBaselineOffset(const TextStyle& style, float scale = 1.0f) const {
+    const float size = style.size * scale;
+    const float lineAdvance = size * std::max(style.lineHeight, 0.01f);
+    const auto metrics = vectorAtlas.fontMetrics(
+      style.fontName, style.weight, style.italic, style.fontStyle).value_or(FontFaceMetrics{});
+    const float ascender = std::max(metrics.ascender, 0.0f) * size;
+    const float descender = std::max(metrics.descender, 0.0f) * size;
+    const float naturalHeight = ascender + descender;
+    const float leading = std::max(0.0f, lineAdvance - naturalHeight);
+    return leading * 0.5f + ascender;
   }
 
   void appendRichText(std::vector<Instance>& instances, const TextCommand& command) const {
@@ -1772,6 +2089,7 @@ struct VulkanRenderer::Impl {
       std::size_t count = 0;
       float width = 0.0f;
       float height = 0.0f;
+      float baselineOffset = 0.0f;
       float maximumSize = 0.0f;
       float trailingSpacing = 0.0f;
     };
@@ -1789,6 +2107,7 @@ struct VulkanRenderer::Impl {
       first.count = 1;
       first.width = textWidth(marker, command.style, 1.0f);
       first.height = command.style.size * std::max(command.style.lineHeight, 0.01f);
+      first.baselineOffset = textBaselineOffset(command.style);
       first.maximumSize = command.style.size;
       first.trailingSpacing = command.style.letterSpacing;
     }
@@ -1809,6 +2128,8 @@ struct VulkanRenderer::Impl {
           line.maximumSize = std::max(line.maximumSize, run.style.size * runScale);
           line.height = std::max(
             line.height, run.style.size * runScale * std::max(run.style.lineHeight, 0.01f));
+          line.baselineOffset = std::max(
+            line.baselineOffset, textBaselineOffset(run.style, runScale));
         }
         if (end == std::string::npos) break;
         lines.push_back(Line{.first = fragments.size()});
@@ -1820,6 +2141,8 @@ struct VulkanRenderer::Impl {
     float totalHeight = 0.0f;
     for (auto& line : lines) {
       if (line.height <= 0.0f) line.height = fallbackHeight;
+      if (line.baselineOffset <= 0.0f)
+        line.baselineOffset = textBaselineOffset(command.style);
       if (line.maximumSize <= 0.0f) line.maximumSize = command.style.size;
       totalHeight += line.height;
     }
@@ -1840,7 +2163,7 @@ struct VulkanRenderer::Impl {
           x += (availableWidth - line.width) * 0.5f;
         else if (command.style.align == HorizontalAlign::Right)
           x += availableWidth - line.width;
-        const float baseline = top + line.maximumSize;
+        const float baseline = top + line.baselineOffset;
         for (std::size_t index = 0; index < line.count; ++index) {
           const auto& fragment = fragments[line.first + index];
           const auto& authored = *fragment.style;
@@ -1849,37 +2172,15 @@ struct VulkanRenderer::Impl {
           const float fragmentStart = x;
           const float fragmentWidth = textWidth(fragment.text, authored, runScale);
           const float slant = authored.italic &&
-            !vectorAtlas.hasFontFace(authored.fontName, true) ? 0.18f : 0.0f;
+            !vectorAtlas.hasFontFace(authored.fontName, true, authored.fontStyle) ? 0.18f : 0.0f;
           const auto& resolvedRun = glyphRun(fragment.text, authored);
-          for (const auto& cached : resolvedRun.glyphs) {
-            if (!cached.present) {
-              x += size * 0.6f + spacing;
-              continue;
-            }
-            const auto& glyph = cached.shape;
-            const float advance = static_cast<float>(glyph.advance) * size;
-            if (glyph.width > 0 && glyph.height > 0) {
-              Rect destination{
-                x + static_cast<float>(glyph.bearingX) * size,
-                baseline - static_cast<float>(glyph.bearingY) * size,
-                static_cast<float>(glyph.width) * size,
-                static_cast<float>(glyph.height) * size,
-              };
-              appendResolvedShape(
-                instances, glyph, destination, authored.paint, command.clip, slant);
-              if (authored.bold) {
-                destination.x += std::max(0.55f, size * 0.035f);
-                appendResolvedShape(
-                  instances, glyph, destination, authored.paint, command.clip, slant);
-              }
-            }
-            x += advance + spacing;
-          }
+          appendGlyphRun(
+            instances, resolvedRun, authored, x, baseline, size, spacing, command.clip, slant);
           x = fragmentStart + fragmentWidth;
           if (authored.underline && fragmentWidth > 0.0f) {
             appendShape(
               instances, vectorAtlas.glyph(
-                '_', authored.fontName, authored.weight, authored.italic),
+                '_', authored.fontName, authored.weight, authored.italic, authored.fontStyle),
               {fragmentStart, baseline + size * 0.07f, fragmentWidth,
                std::max(1.0f, size * 0.065f)},
               authored.paint, command.clip);
@@ -1887,7 +2188,7 @@ struct VulkanRenderer::Impl {
           if (authored.strikethrough && fragmentWidth > 0.0f) {
             appendShape(
               instances, vectorAtlas.glyph(
-                '-', authored.fontName, authored.weight, authored.italic),
+                '-', authored.fontName, authored.weight, authored.italic, authored.fontStyle),
               {fragmentStart, baseline - size * 0.32f, fragmentWidth,
                std::max(1.0f, size * 0.06f)},
               authored.paint, command.clip);
@@ -1925,7 +2226,8 @@ struct VulkanRenderer::Impl {
     else if (command.style.verticalAlign == VerticalAlign::Bottom)
       firstLineTop += command.bounds.height - textBlockHeight;
     const float slant = command.style.italic &&
-      !vectorAtlas.hasFontFace(command.style.fontName, true) ? 0.18f : 0.0f;
+      !vectorAtlas.hasFontFace(
+        command.style.fontName, true, command.style.fontStyle) ? 0.18f : 0.0f;
     while (lineStart <= text.size()) {
       const std::size_t lineEnd = text.find('\n', lineStart);
       const std::string_view line(text.data() + lineStart,
@@ -1950,40 +2252,23 @@ struct VulkanRenderer::Impl {
       float x = command.bounds.x + indent;
       if (command.style.align == HorizontalAlign::Center) x += (availableWidth - width) * 0.5f;
       else if (command.style.align == HorizontalAlign::Right) x += availableWidth - width;
-      const float baseline = top + command.style.size;
+      const float baseline = top + textBaselineOffset(command.style);
       const float lineX = x;
-      for (const auto& cached : resolvedRun.glyphs) {
-        if (!cached.present) {
-          x += command.style.size * 0.6f + command.style.letterSpacing;
-          continue;
-        }
-        const auto& glyph = cached.shape;
-        const float advance = static_cast<float>(glyph.advance) * command.style.size;
-        if (glyph.width > 0 && glyph.height > 0) {
-          Rect destination{x + static_cast<float>(glyph.bearingX) * command.style.size,
-                           baseline - static_cast<float>(glyph.bearingY) * command.style.size,
-                           static_cast<float>(glyph.width) * command.style.size,
-                           static_cast<float>(glyph.height) * command.style.size};
-          appendResolvedShape(instances, glyph, destination, command.style.paint, command.clip,
-                              slant);
-          if (command.style.bold) {
-            destination.x += std::max(0.55f, command.style.size * 0.035f);
-            appendResolvedShape(instances, glyph, destination, command.style.paint, command.clip,
-                                slant);
-          }
-        }
-        x += advance + command.style.letterSpacing;
-      }
+      appendGlyphRun(
+        instances, resolvedRun, command.style, x, baseline, command.style.size,
+        command.style.letterSpacing, command.clip, slant);
       if (width > 0.0f && command.style.underline) {
         Rect decoration{lineX, baseline + command.style.size * 0.07f, width, std::max(1.0f, command.style.size * 0.065f)};
         appendShape(instances, vectorAtlas.glyph(
-                      '_', command.style.fontName, command.style.weight, command.style.italic), decoration,
+                      '_', command.style.fontName, command.style.weight, command.style.italic,
+                      command.style.fontStyle), decoration,
                     command.style.paint, command.clip);
       }
       if (width > 0.0f && command.style.strikethrough) {
         Rect decoration{lineX, baseline - command.style.size * 0.32f, width, std::max(1.0f, command.style.size * 0.06f)};
         appendShape(instances, vectorAtlas.glyph(
-                      '-', command.style.fontName, command.style.weight, command.style.italic), decoration,
+                      '-', command.style.fontName, command.style.weight, command.style.italic,
+                      command.style.fontStyle), decoration,
                     command.style.paint, command.clip);
       }
       if (lineEnd == std::string::npos)
@@ -2244,8 +2529,8 @@ struct VulkanRenderer::Impl {
     RenderIR compiled;
     compileRenderIR(list, compiled, false);
     for (const DrawBatch& batch : compiled.batches) {
-      if (batch.retainedId != 0)
-        throw std::invalid_argument("Retained DrawLists cannot contain retained resources");
+      if (batch.retainedId != 0 || batch.externalImage != 0)
+        throw std::invalid_argument("Retained DrawLists cannot contain retained or external resources");
     }
     if (compiled.instances.empty()) return 0;
     RetainedGeometry retained;
@@ -2260,8 +2545,8 @@ struct VulkanRenderer::Impl {
     RenderIR compiled;
     compileRenderIR(list, compiled, false);
     for (const DrawBatch& batch : compiled.batches) {
-      if (batch.retainedId != 0)
-        throw std::invalid_argument("Retained DrawLists cannot contain retained resources");
+      if (batch.retainedId != 0 || batch.externalImage != 0)
+        throw std::invalid_argument("Retained DrawLists cannot contain retained or external resources");
     }
     return uploadRetainedGeometry(retainedDrawLists[id - 1U], compiled.instances);
   }
@@ -2273,6 +2558,24 @@ struct VulkanRenderer::Impl {
     if (retained.capacity == 0 && retained.instanceCount == 0) return;
     check(vkQueueWaitIdle(graphicsQueue), "vkQueueWaitIdle(destroy retained DrawList)");
     releaseRetainedGeometry(retained);
+  }
+
+  void appendExternalImage(std::vector<Instance>& instances,
+                           const ExternalImageCommand& command) const {
+    if (externalImageResource(command.image) == nullptr) return;
+    Instance quad{};
+    const float bounds[4]{command.destination.x, command.destination.y,
+                          command.destination.x + command.destination.width,
+                          command.destination.y + command.destination.height};
+    std::copy(std::begin(bounds), std::end(bounds), quad.positionRect);
+    std::copy(std::begin(bounds), std::end(bounds), quad.emRect);
+    quad.shapeData[0] = externalImageShape;
+    quad.shapeData[1] = command.width;
+    quad.shapeData[2] = command.height;
+    quad.paint[1] = command.opacity;
+    quad.clip[0] = command.clip.x; quad.clip[1] = command.clip.y;
+    quad.clip[2] = command.clip.width; quad.clip[3] = command.clip.height;
+    instances.push_back(quad);
   }
 
   void compileRenderIR(const DrawList& list, RenderIR& ir, bool compactPrimitives) {
@@ -2311,6 +2614,7 @@ struct VulkanRenderer::Impl {
         const std::size_t first = instances.size();
         const std::size_t primitiveFirst = primitives ? primitives->size() : 0;
         bool emittedPrimitive = false;
+        ExternalImageId externalImage = 0;
         if (const auto* shapeCommand = std::get_if<DrawCommand>(&display))
           appendShape(instances, shapeCommand->shape, shapeCommand->destination,
                       shapeCommand->paint, shapeCommand->clip, shapeCommand->italicShear);
@@ -2349,6 +2653,10 @@ struct VulkanRenderer::Impl {
           appendCubicBezier(instances, *cubicCommand);
         else if (const auto* arcCommand = std::get_if<ArcCommand>(&display))
           appendArc(instances, *arcCommand);
+        else if (const auto* imageCommand = std::get_if<ExternalImageCommand>(&display)) {
+          appendExternalImage(instances, *imageCommand);
+          externalImage = imageCommand->image;
+        }
         if (emittedPrimitive) {
           const auto count = static_cast<std::uint32_t>(primitives->size() - primitiveFirst);
           if (!drawBatches.empty() && drawBatches.back().retainedId == 0 &&
@@ -2370,10 +2678,13 @@ struct VulkanRenderer::Impl {
           continue;
         if (!drawBatches.empty() && drawBatches.back().retainedId == 0 &&
             !drawBatches.back().primitive &&
+            drawBatches.back().externalImage == externalImage &&
             drawBatches.back().firstInstance + drawBatches.back().instanceCount == first) {
           drawBatches.back().instanceCount += count;
         } else {
-          drawBatches.push_back({0, false, static_cast<std::uint32_t>(first), count});
+          DrawBatch batch{0, false, static_cast<std::uint32_t>(first), count};
+          batch.externalImage = externalImage;
+          drawBatches.push_back(batch);
         }
       }
     };
@@ -2393,13 +2704,17 @@ struct VulkanRenderer::Impl {
                  true);
   }
 
-  void record(VkCommandBuffer command, std::uint32_t imageIndex, Frame& frame) {
+  void record(VkCommandBuffer command, std::uint32_t imageIndex, Frame& frame,
+              std::uint64_t submissionSerial) {
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(frame)");
     if (frame.writeTimestamps) {
       vkCmdResetQueryPool(command, frame.timestamps, 0, 2);
       vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame.timestamps, 0);
     }
+    if (frameRecorder != nullptr)
+      frameRecorder(frameRecorderContext,
+                    {command, extent.width, extent.height, submissionSerial});
     Color clearColor = config.clearColor;
     if (isSrgbFormat(swapchainFormat)) {
       clearColor.r = srgbToLinear(clearColor.r);
@@ -2419,10 +2734,20 @@ struct VulkanRenderer::Impl {
           0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height),
           0.0f, 1.0f};
       vkCmdSetViewport(command, 0, 1, &viewport);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
-                              &descriptorSet, 0, nullptr);
       VkPipeline currentPipeline = VK_NULL_HANDLE;
+      VkDescriptorSet currentDescriptorSet = VK_NULL_HANDLE;
       for (const DrawBatch& batch : frameIR.batches) {
+        VkDescriptorSet desiredDescriptorSet = descriptorSet;
+        if (batch.externalImage != 0) {
+          const auto* resource = externalImageResource(batch.externalImage);
+          if (resource == nullptr) continue;
+          desiredDescriptorSet = resource->descriptorSet;
+        }
+        if (desiredDescriptorSet != currentDescriptorSet) {
+          vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                                  0, 1, &desiredDescriptorSet, 0, nullptr);
+          currentDescriptorSet = desiredDescriptorSet;
+        }
         const VkPipeline desiredPipeline = batch.primitive ? primitivePipeline : pipeline;
         if (desiredPipeline != currentPipeline) {
           vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, desiredPipeline);
@@ -2496,6 +2821,17 @@ struct VulkanRenderer::Impl {
     check(vkEndCommandBuffer(command), "vkEndCommandBuffer(frame)");
   }
 
+  void refreshCompletedSubmissions() noexcept {
+    if (device == VK_NULL_HANDLE) return;
+    for (std::size_t index = 0; index < framesInFlight; ++index) {
+      const auto serial = frameSubmissionSerial[index];
+      if (serial != 0 && vkGetFenceStatus(device, frames[index].fence) == VK_SUCCESS) {
+        completedSubmissionSerial = std::max(completedSubmissionSerial, serial);
+        frameSubmissionSerial[index] = 0;
+      }
+    }
+  }
+
   void prepareFrame() {
     if (framePrepared)
       return;
@@ -2508,6 +2844,11 @@ struct VulkanRenderer::Impl {
       Frame& frame = frames[currentFrame];
       check(vkWaitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX),
             "vkWaitForFences(frame)");
+      if (frameSubmissionSerial[currentFrame] != 0) {
+        completedSubmissionSerial = std::max(completedSubmissionSerial,
+                                             frameSubmissionSerial[currentFrame]);
+        frameSubmissionSerial[currentFrame] = 0;
+      }
       if (frame.timestamps && frame.timestampsWritten) {
         std::uint64_t ticks[2]{};
         check(vkGetQueryPoolResults(device, frame.timestamps, 0, 2, sizeof(ticks), ticks,
@@ -2565,7 +2906,8 @@ struct VulkanRenderer::Impl {
                             submittedFrameCount % config.gpuTimingInterval == 0;
     check(vkResetFences(device, 1, &frame.fence), "vkResetFences");
     check(vkResetCommandBuffer(commandBuffers[currentFrame], 0), "vkResetCommandBuffer");
-    record(commandBuffers[currentFrame], imageIndex, frame);
+    const std::uint64_t submissionSerial = submittedFrameCount + 1;
+    record(commandBuffers[currentFrame], imageIndex, frame, submissionSerial);
     const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = 1;
@@ -2576,9 +2918,11 @@ struct VulkanRenderer::Impl {
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &renderFinished[imageIndex];
     check(vkQueueSubmit(graphicsQueue, 1, &submit, frame.fence), "vkQueueSubmit(frame)");
+    frameSubmissionSerial[currentFrame] = submissionSerial;
     frame.timestampsWritten = frame.writeTimestamps;
     if (captureFrame) {
       check(vkWaitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(readback)");
+      completedSubmissionSerial = std::max(completedSubmissionSerial, submissionSerial);
       captured.width = extent.width;
       captured.height = extent.height;
       captured.rgba.resize(static_cast<std::size_t>(extent.width) * extent.height * 4);
@@ -2646,10 +2990,19 @@ struct VulkanRenderer::Impl {
         frame = {};
       }
       destroySwapchainResources();
+      for (auto& external : externalImages) {
+        if (external.pool)
+          vkDestroyDescriptorPool(
+              device, external.pool, nullptr);
+        destroyBuffer(external.ownedBuffer);
+        external = {};
+      }
+      externalImages.clear();
       if (descriptorPool)
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
       if (descriptorSetLayout)
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+      destroyBuffer(externalImageFallback);
       if (sampler)
         vkDestroySampler(device, sampler, nullptr);
       destroyTexture(curveTexture);
@@ -2677,11 +3030,13 @@ struct VulkanRenderer::Impl {
 
 VulkanRenderer::VulkanRenderer(PlatformSurface& surface, const VectorAtlas& atlas,
                                const RendererConfig& config)
-    : impl_(std::make_unique<Impl>(surface, atlas, config)) {}
+    : impl_(std::make_unique<Impl>(surface, atlas, config)),
+      interop_(std::unique_ptr<VulkanInterop>(new VulkanInterop(*this))) {}
 #if defined(SLUGVK_ENABLE_GLFW) && SLUGVK_ENABLE_GLFW
 VulkanRenderer::VulkanRenderer(Window& window, const VectorAtlas& atlas,
                                const RendererConfig& config)
-    : impl_(std::make_unique<Impl>(std::make_unique<GlfwPlatformSurface>(window), atlas, config)) {}
+    : impl_(std::make_unique<Impl>(std::make_unique<GlfwPlatformSurface>(window), atlas, config)),
+      interop_(std::unique_ptr<VulkanInterop>(new VulkanInterop(*this))) {}
 #endif
 VulkanRenderer::~VulkanRenderer() = default;
 void VulkanRenderer::prepareFrame() {
@@ -2720,8 +3075,11 @@ FramePixels VulkanRenderer::drawAndReadback(const DrawList& list) {
   return std::move(impl_->captured);
 }
 void VulkanRenderer::waitIdle() {
-  if (impl_->device)
+  if (impl_->device) {
     vkDeviceWaitIdle(impl_->device);
+    impl_->completedSubmissionSerial = impl_->submittedFrameCount;
+    impl_->frameSubmissionSerial.fill(0);
+  }
 }
 RendererStats VulkanRenderer::stats() const {
   return impl_->statistics;
@@ -2729,6 +3087,8 @@ RendererStats VulkanRenderer::stats() const {
 const char* VulkanRenderer::deviceName() const {
   return impl_->deviceProperties.deviceName;
 }
+VulkanInterop& VulkanRenderer::vulkanInterop() noexcept { return *interop_; }
+
 const char* VulkanRenderer::presentModeName() const {
   switch (impl_->swapchainPresentMode) {
   case VK_PRESENT_MODE_IMMEDIATE_KHR:
@@ -2740,6 +3100,45 @@ const char* VulkanRenderer::presentModeName() const {
   default:
     return "FIFO";
   }
+}
+
+VulkanDeviceContext VulkanInterop::deviceContext() const noexcept {
+  const auto& impl = *renderer_->impl_;
+  return {impl.physicalDevice, impl.device, impl.graphicsQueue,
+          impl.queueFamilies.graphics.value_or(0)};
+}
+
+std::uint64_t VulkanInterop::completedSubmissionSerial() const noexcept {
+  renderer_->impl_->refreshCompletedSubmissions();
+  return renderer_->impl_->completedSubmissionSerial;
+}
+
+ExternalImageId VulkanInterop::registerRgba32fBuffer(
+    VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range) {
+  return renderer_->impl_->registerExternalImage(
+      buffer, offset, range);
+}
+
+ExternalImageId VulkanInterop::createOwnedRgba32fImage(
+    std::uint32_t width, std::uint32_t height) {
+  return renderer_->impl_->createOwnedExternalImage(
+      width, height);
+}
+
+bool VulkanInterop::updateOwnedRgba32fImage(
+    ExternalImageId image,
+    std::span<const float> argb_words) noexcept {
+  return renderer_->impl_->updateOwnedExternalImage(
+      image, argb_words);
+}
+
+void VulkanInterop::unregisterExternalImage(ExternalImageId image) noexcept {
+  renderer_->impl_->unregisterExternalImage(image);
+}
+
+void VulkanInterop::setFrameRecorder(VulkanFrameRecorder recorder, void* context) noexcept {
+  renderer_->impl_->frameRecorder = recorder;
+  renderer_->impl_->frameRecorderContext = recorder != nullptr ? context : nullptr;
 }
 
 } // namespace slugvk

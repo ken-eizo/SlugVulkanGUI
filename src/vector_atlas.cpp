@@ -3,6 +3,9 @@
 #include "slughorn/canvas.hpp"
 #include "slughorn/freetype.hpp"
 
+#include <hb.h>
+#include <hb-ot.h>
+
 #include FT_MULTIPLE_MASTERS_H
 
 #include <algorithm>
@@ -10,14 +13,121 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace slugvk {
 
 namespace {
 constexpr float pi = 3.14159265358979323846f;
+constexpr std::uint32_t shapedGlyphBase = 0x110000u;
+constexpr std::uint32_t shapedGlyphMaximum = 0x1FFFFFu;
+
 slughorn::slug_t sv(float value) { return static_cast<slughorn::slug_t>(value); }
+
+struct RawShapedGlyph {
+  std::uint32_t glyphIndex = 0;
+  std::uint32_t cluster = 0;
+  float xAdvance = 0.0f;
+  float yAdvance = 0.0f;
+  float xOffset = 0.0f;
+  float yOffset = 0.0f;
+};
+
+struct RawShapedRun {
+  std::vector<RawShapedGlyph> glyphs;
+  float xAdvance = 0.0f;
+  float yAdvance = 0.0f;
+  bool rightToLeft = false;
+};
+
+std::shared_ptr<const std::vector<std::uint8_t>> readFontBytes(const std::string& path) {
+  std::ifstream stream(path, std::ios::binary | std::ios::ate);
+  if (!stream) return {};
+  const auto end = stream.tellg();
+  if (end <= 0) return {};
+  auto bytes = std::make_shared<std::vector<std::uint8_t>>(static_cast<std::size_t>(end));
+  stream.seekg(0, std::ios::beg);
+  if (!stream.read(reinterpret_cast<char*>(bytes->data()),
+                   static_cast<std::streamsize>(bytes->size())))
+    return {};
+  return bytes;
+}
+
+std::optional<RawShapedRun> shapeFontData(
+    std::span<const std::uint8_t> bytes, std::string_view text,
+    std::uint16_t weight, bool italic) {
+  if (bytes.empty() || text.empty() ||
+      text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    return std::nullopt;
+
+  hb_blob_t* blob = hb_blob_create(
+    reinterpret_cast<const char*>(bytes.data()), static_cast<unsigned int>(bytes.size()),
+    HB_MEMORY_MODE_READONLY, nullptr, nullptr);
+  if (!blob) return std::nullopt;
+  hb_face_t* face = hb_face_create(blob, 0);
+  hb_font_t* font = face ? hb_font_create(face) : nullptr;
+  hb_buffer_t* buffer = hb_buffer_create();
+  if (!face || !font || !buffer) {
+    if (buffer) hb_buffer_destroy(buffer);
+    if (font) hb_font_destroy(font);
+    if (face) hb_face_destroy(face);
+    hb_blob_destroy(blob);
+    return std::nullopt;
+  }
+
+  hb_ot_font_set_funcs(font);
+  const unsigned upem = std::max(hb_face_get_upem(face), 1u);
+  hb_font_set_scale(font, static_cast<int>(upem), static_cast<int>(upem));
+  hb_variation_t variations[2]{};
+  unsigned variationCount = 0;
+  if (weight != 0) {
+    variations[variationCount++] = {HB_TAG('w', 'g', 'h', 't'), static_cast<float>(weight)};
+  }
+  if (italic) {
+    variations[variationCount++] = {HB_TAG('i', 't', 'a', 'l'), 1.0f};
+  }
+  if (variationCount != 0) hb_font_set_variations(font, variations, variationCount);
+
+  hb_buffer_set_cluster_level(buffer, HB_BUFFER_CLUSTER_LEVEL_MONOTONE_CHARACTERS);
+  hb_buffer_add_utf8(buffer, text.data(), static_cast<int>(text.size()), 0,
+                     static_cast<int>(text.size()));
+  hb_buffer_guess_segment_properties(buffer);
+  hb_shape(font, buffer, nullptr, 0);
+
+  unsigned count = 0;
+  const hb_glyph_info_t* infos = hb_buffer_get_glyph_infos(buffer, &count);
+  const hb_glyph_position_t* positions = hb_buffer_get_glyph_positions(buffer, &count);
+  RawShapedRun result;
+  result.rightToLeft = HB_DIRECTION_IS_BACKWARD(hb_buffer_get_direction(buffer));
+  result.glyphs.reserve(count);
+  const float inverseEm = 1.0f / static_cast<float>(upem);
+  for (unsigned i = 0; i < count; ++i) {
+    RawShapedGlyph glyph;
+    glyph.glyphIndex = infos[i].codepoint;
+    glyph.cluster = infos[i].cluster;
+    glyph.xAdvance = static_cast<float>(positions[i].x_advance) * inverseEm;
+    glyph.yAdvance = static_cast<float>(positions[i].y_advance) * inverseEm;
+    glyph.xOffset = static_cast<float>(positions[i].x_offset) * inverseEm;
+    glyph.yOffset = static_cast<float>(positions[i].y_offset) * inverseEm;
+    result.xAdvance += glyph.xAdvance;
+    result.yAdvance += glyph.yAdvance;
+    result.glyphs.push_back(glyph);
+  }
+
+  hb_buffer_destroy(buffer);
+  hb_font_destroy(font);
+  hb_face_destroy(face);
+  hb_blob_destroy(blob);
+  return result;
+}
+
+constexpr std::uint64_t kerningKey(std::uint32_t left, std::uint32_t right) noexcept {
+  return (static_cast<std::uint64_t>(left) << 32U) | static_cast<std::uint64_t>(right);
+}
 
 std::string normalizedFamily(std::string_view value) {
   std::string result;
@@ -255,11 +365,13 @@ Path& Path::svgPath(std::string_view data, float viewBoxHeight) {
     char command = 0;
     char previousCommand = 0;
     float invertHeight = 0.0f;
+    bool invertYAxis = false;
 
     explicit Parser(Path& target, std::string_view value, float height)
         : output(target), source(value), cursor(source.c_str()), end(cursor + source.size()),
           current{0.0f, height > 0.0f ? height : 0.0f},
-          subpath(current), invertHeight(height) {}
+          subpath(current), invertHeight(std::max(height, 0.0f)),
+          invertYAxis(height != 0.0f) {}
 
     [[noreturn]] void fail() const { throw std::invalid_argument("Invalid SVG path data"); }
     void separators() {
@@ -284,9 +396,9 @@ Path& Path::svgPath(std::string_view data, float viewBoxHeight) {
       Vec2 value{number(), number()};
       if (relative) {
         value.x += current.x;
-        value.y = current.y + (invertHeight > 0.0f ? -value.y : value.y);
-      } else if (invertHeight > 0.0f) {
-        value.y = invertHeight - value.y;
+        value.y = current.y + (invertYAxis ? -value.y : value.y);
+      } else if (invertYAxis) {
+        value.y = (invertHeight > 0.0f ? invertHeight : 0.0f) - value.y;
       }
       return value;
     }
@@ -400,9 +512,9 @@ Path& Path::svgPath(std::string_view data, float viewBoxHeight) {
           } else if (upper == 'V') {
             float y = number();
             if (relative)
-              y = current.y + (invertHeight > 0.0f ? -y : y);
-            else if (invertHeight > 0.0f)
-              y = invertHeight - y;
+              y = current.y + (invertYAxis ? -y : y);
+            else if (invertYAxis)
+              y = (invertHeight > 0.0f ? invertHeight : 0.0f) - y;
             current.y = y;
             output.lineTo(current.x, current.y);
           } else if (upper == 'C') {
@@ -445,8 +557,8 @@ Path& Path::svgPath(std::string_view data, float viewBoxHeight) {
             const bool largeArc = number() != 0.0f;
             const bool sweep = number() != 0.0f;
             const Vec2 target = point(relative);
-            arc(rx, ry, invertHeight > 0.0f ? -rotation : rotation, largeArc,
-                invertHeight > 0.0f ? !sweep : sweep, target);
+            arc(rx, ry, invertYAxis ? -rotation : rotation, largeArc,
+                invertYAxis ? !sweep : sweep, target);
           } else {
             fail();
           }
@@ -461,6 +573,17 @@ Path& Path::svgPath(std::string_view data, float viewBoxHeight) {
     }
   } parser(*this, data, viewBoxHeight);
   parser.parse();
+  return *this;
+}
+
+Path& Path::svgPathYDown(std::string_view data) {
+  // A negative sentinel requests y reflection without the positive view-box translation used
+  // by the public svgPath(data, height) convenience mode.
+  return svgPath(data, -1.0f);
+}
+
+Path& Path::addPath(const Path& other) {
+  impl_->value.addPath(other.impl_->value);
   return *this;
 }
 Path& Path::close() { impl_->value.closePath(); return *this; }
@@ -528,9 +651,13 @@ Path& Path::star(Vec2 center, float outerRadius, float innerRadius,
 struct VectorAtlas::Impl {
   struct RegisteredFont {
     std::string family;
+    std::string style;
     std::uint16_t weight;
     bool italic;
     std::uint8_t mask;
+    FontFaceMetrics metrics;
+    std::unordered_map<std::uint64_t, float> kernings;
+    std::shared_ptr<const std::vector<std::uint8_t>> fontData;
   };
 
   slughorn::Atlas atlas;
@@ -539,6 +666,31 @@ struct VectorAtlas::Impl {
   std::string style;
   std::uint16_t nextFontMask = 0;
   std::vector<RegisteredFont> fonts;
+  // Static SlugUI/Figma text is shaped once during atlas preparation. Renderer glyph-run caches
+  // then consume these immutable positions without allocating or invoking HarfBuzz on-frame.
+  std::unordered_map<std::uint8_t, std::unordered_map<std::string, RawShapedRun>> shapedRuns;
+
+  const RegisteredFont* findFont(std::string_view fontName, std::uint16_t requestedWeight,
+                                 bool requestedItalic, std::string_view requestedStyle) const {
+    const std::string familyName = normalizedFamily(fontName);
+    const std::string styleName = normalizedFamily(requestedStyle);
+    const RegisteredFont* bestEntry = nullptr;
+    unsigned best = std::numeric_limits<unsigned>::max();
+    for (const auto& entry : fonts) {
+      if (entry.family != familyName) continue;
+      const unsigned distance = static_cast<unsigned>(
+        std::abs(static_cast<int>(entry.weight) - static_cast<int>(requestedWeight)));
+      const unsigned stylePenalty =
+        styleName.empty() || entry.style == styleName ? 0U : 600U;
+      const unsigned score =
+        distance + (entry.italic == requestedItalic ? 0U : 2000U) + stylePenalty;
+      if (score < best) {
+        best = score;
+        bestEntry = &entry;
+      }
+    }
+    return bestEntry;
+  }
 
   Impl() : atlas(1024) {}
 };
@@ -548,11 +700,12 @@ VectorAtlas::~VectorAtlas() = default;
 VectorAtlas::VectorAtlas(VectorAtlas&&) noexcept = default;
 VectorAtlas& VectorAtlas::operator=(VectorAtlas&&) noexcept = default;
 
-ShapeId VectorAtlas::addPath(const Path& path) {
+ShapeId VectorAtlas::addPath(const Path& path, FillRule fillRule) {
   if (impl_->atlas.isBuilt()) throw std::logic_error("VectorAtlas is already built");
   const ShapeId id = impl_->nextId++;
   slughorn::canvas::Canvas canvas(impl_->atlas);
-  if (!canvas.defineShape(path.impl_->value, slughorn::Key(id))) return 0;
+  const bool evenOdd = fillRule == FillRule::EvenOdd;
+  if (!canvas.defineShape(path.impl_->value, slughorn::Key(id), sv(1.0f), {}, evenOdd)) return 0;
   return id;
 }
 
@@ -695,24 +848,167 @@ bool VectorAtlas::loadFont(const std::string& fontPath, const std::vector<std::u
 bool VectorAtlas::loadFont(const std::string& fontPath, FontFace face,
                            const std::vector<std::uint32_t>& codepoints) {
   if (impl_->atlas.isBuilt()) throw std::logic_error("VectorAtlas is already built");
+  const auto fontData = readFontBytes(fontPath);
+  if (!fontData) return false;
   FreeTypeFace source;
-  if (!source.open(fontPath)) return false;
+  if (!source.open(std::span<const std::uint8_t>(*fontData))) return false;
   if (face.family.empty()) face.family = std::filesystem::path(fontPath).stem().string();
   source.setWeight(face.weight);
-  return loadFontFace(source.face, std::move(face), codepoints);
+  return loadFontFace(source.face, std::move(face), codepoints, fontData);
 }
 
 bool VectorAtlas::loadFontMemory(std::span<const std::uint8_t> fontData, FontFace face,
                                  const std::vector<std::uint32_t>& codepoints) {
   if (impl_->atlas.isBuilt()) throw std::logic_error("VectorAtlas is already built");
+  auto ownedData = std::make_shared<std::vector<std::uint8_t>>(fontData.begin(), fontData.end());
   FreeTypeFace source;
-  if (!source.open(fontData)) return false;
+  if (!source.open(std::span<const std::uint8_t>(*ownedData))) return false;
   source.setWeight(face.weight);
-  return loadFontFace(source.face, std::move(face), codepoints);
+  return loadFontFace(source.face, std::move(face), codepoints, std::move(ownedData));
 }
 
-bool VectorAtlas::loadFontFace(void* nativeFace, FontFace face,
-                               const std::vector<std::uint32_t>& codepoints) {
+bool VectorAtlas::loadSystemFont(std::string_view family, std::uint16_t weight, bool italic,
+                                 const std::vector<std::uint32_t>& codepoints,
+                                 std::string_view requestedStyle) {
+  if (impl_->atlas.isBuilt()) throw std::logic_error("VectorAtlas is already built");
+  const std::string wanted = normalizedFamily(family);
+  const std::string wantedStyle = normalizedFamily(requestedStyle);
+  if (wanted.empty()) return false;
+  for (const auto& entry : impl_->fonts) {
+    if (entry.family == wanted && entry.weight == weight && entry.italic == italic &&
+        (wantedStyle.empty() || entry.style == wantedStyle)) return true;
+  }
+
+  std::vector<std::filesystem::path> roots;
+#ifdef _WIN32
+  roots.emplace_back("C:/Windows/Fonts");
+#elif defined(__APPLE__)
+  roots.emplace_back("/System/Library/Fonts");
+  roots.emplace_back("/Library/Fonts");
+#else
+  roots.emplace_back("/usr/share/fonts");
+  roots.emplace_back("/usr/local/share/fonts");
+#endif
+
+  std::filesystem::path bestPath;
+  unsigned bestScore = std::numeric_limits<unsigned>::max();
+  for (const auto& root : roots) {
+    std::error_code error;
+    if (!std::filesystem::exists(root, error)) continue;
+    for (std::filesystem::recursive_directory_iterator it(
+           root, std::filesystem::directory_options::skip_permission_denied, error), end;
+         it != end; it.increment(error)) {
+      if (error) { error.clear(); continue; }
+      if (!it->is_regular_file(error)) continue;
+      const auto extension = normalizedFamily(it->path().extension().string());
+      if (extension != "ttf" && extension != "otf" && extension != "ttc") continue;
+      const std::string stem = normalizedFamily(it->path().stem().string());
+      if (stem.find(wanted) == std::string::npos && wanted.find(stem) == std::string::npos) continue;
+      FreeTypeFace candidate;
+      if (!candidate.open(it->path().string()) || !candidate.face) continue;
+      const std::string candidateFamily = candidate.face->family_name
+        ? normalizedFamily(candidate.face->family_name) : std::string{};
+      if (candidateFamily != wanted && stem.find(wanted) == std::string::npos) continue;
+      const std::string style = candidate.face->style_name ? candidate.face->style_name : "";
+      const bool candidateItalic = normalizedFamily(style).find("italic") != std::string::npos ||
+                                   normalizedFamily(style).find("oblique") != std::string::npos;
+      const unsigned candidateWeight = inferredWeight(style);
+      const std::string normalizedStyle = normalizedFamily(style);
+      const unsigned stylePenalty = wantedStyle.empty() || normalizedStyle == wantedStyle ? 0U : 600U;
+      const unsigned score = static_cast<unsigned>(std::abs(
+        static_cast<int>(candidateWeight) - static_cast<int>(weight))) +
+        (candidateItalic == italic ? 0U : 2000U) + stylePenalty;
+      if (score < bestScore) { bestScore = score; bestPath = it->path(); }
+    }
+  }
+  if (bestPath.empty()) return false;
+  return loadFont(
+    bestPath.string(), FontFace{std::string(family), weight, italic, std::string(requestedStyle)},
+    codepoints);
+}
+
+bool VectorAtlas::prepareText(std::string_view text, std::string_view fontName,
+                              std::uint16_t weight, bool italic, std::string_view style) {
+  if (impl_->atlas.isBuilt()) throw std::logic_error("VectorAtlas is already built");
+  if (text.empty()) return true;
+  const auto* entry = impl_->findFont(fontName, weight, italic, style);
+  if (!entry || !entry->fontData || entry->fontData->empty()) return false;
+
+  FreeTypeFace source;
+  if (!source.open(std::span<const std::uint8_t>(*entry->fontData))) return false;
+  source.setWeight(entry->weight);
+  slughorn::freetype::LoadConfig config;
+  config.mask = entry->mask;
+
+  std::size_t start = 0;
+  while (start <= text.size()) {
+    const std::size_t end = text.find('\n', start);
+    const std::string_view line(
+      text.data() + start, (end == std::string_view::npos ? text.size() : end) - start);
+    if (!line.empty()) {
+      const auto shaped = shapeFontData(
+        std::span<const std::uint8_t>(*entry->fontData), line, entry->weight, entry->italic);
+      if (!shaped) return false;
+      impl_->shapedRuns[entry->mask][std::string(line)] = *shaped;
+      std::unordered_set<std::uint32_t> loaded;
+      loaded.reserve(shaped->glyphs.size());
+      for (const auto& glyph : shaped->glyphs) {
+        if (!loaded.insert(glyph.glyphIndex).second) continue;
+        if (glyph.glyphIndex > shapedGlyphMaximum - shapedGlyphBase) return false;
+        const std::uint32_t keyCodepoint = shapedGlyphBase + glyph.glyphIndex;
+        if (!slughorn::freetype::loadGlyphIndex(
+              source.face, glyph.glyphIndex, keyCodepoint, impl_->atlas, &config))
+          return false;
+      }
+    }
+    if (end == std::string_view::npos) break;
+    start = end + 1;
+  }
+  return true;
+}
+
+std::optional<ShapedTextRun> VectorAtlas::shapeText(
+    std::string_view text, std::string_view fontName, std::uint16_t weight,
+    bool italic, std::string_view style) const {
+  ShapedTextRun result;
+  if (text.empty()) return result;
+  const auto* entry = impl_->findFont(fontName, weight, italic, style);
+  if (!entry || !entry->fontData || entry->fontData->empty()) return std::nullopt;
+
+  std::optional<RawShapedRun> dynamicRun;
+  const RawShapedRun* shaped = nullptr;
+  if (const auto faceRuns = impl_->shapedRuns.find(entry->mask);
+      faceRuns != impl_->shapedRuns.end()) {
+    if (const auto cached = faceRuns->second.find(std::string(text));
+        cached != faceRuns->second.end())
+      shaped = &cached->second;
+  }
+  if (!shaped) {
+    dynamicRun = shapeFontData(
+      std::span<const std::uint8_t>(*entry->fontData), text, entry->weight, entry->italic);
+    if (!dynamicRun) return std::nullopt;
+    shaped = &*dynamicRun;
+  }
+
+  result.rightToLeft = shaped->rightToLeft;
+  result.xAdvance = shaped->xAdvance;
+  result.yAdvance = shaped->yAdvance;
+  result.glyphs.reserve(shaped->glyphs.size());
+  for (const auto& glyph : shaped->glyphs) {
+    if (glyph.glyphIndex > shapedGlyphMaximum - shapedGlyphBase) return std::nullopt;
+    const slughorn::Key key(shapedGlyphBase + glyph.glyphIndex, entry->mask);
+    if (!impl_->atlas.getShape(key)) return std::nullopt;
+    result.glyphs.push_back({
+      key.codepoint(), glyph.glyphIndex, glyph.cluster,
+      glyph.xAdvance, glyph.yAdvance, glyph.xOffset, glyph.yOffset
+    });
+  }
+  return result;
+}
+
+bool VectorAtlas::loadFontFace(
+    void* nativeFace, FontFace face, const std::vector<std::uint32_t>& codepoints,
+    std::shared_ptr<const std::vector<std::uint8_t>> fontData) {
   if (impl_->nextFontMask > std::numeric_limits<std::uint8_t>::max()) return false;
   auto* sourceFace = static_cast<FT_Face>(nativeFace);
   slughorn::freetype::LoadConfig config;
@@ -733,17 +1029,62 @@ bool VectorAtlas::loadFontFace(void* nativeFace, FontFace face,
     const bool italic = face.italic ||
       normalizedFamily(config.styleName).find("italic") != std::string::npos ||
       normalizedFamily(config.styleName).find("oblique") != std::string::npos;
+    const std::string registeredStyle = normalizedFamily(
+      face.style.empty() ? config.styleName : face.style);
+
+    // Keep kerning in normalized em units next to the registered face. Text rendering then
+    // applies it with one hash lookup per adjacent pair and never calls FreeType on-frame.
+    std::unordered_map<std::uint64_t, float> kernings;
+    if (FT_HAS_KERNING(sourceFace) && sourceFace->units_per_EM > 0) {
+      std::vector<std::uint32_t> requested = codepoints;
+      if (requested.empty()) {
+        requested.reserve(95);
+        for (std::uint32_t codepoint = 32; codepoint <= 126; ++codepoint)
+          requested.push_back(codepoint);
+      }
+      std::sort(requested.begin(), requested.end());
+      requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
+      for (const auto left : requested) {
+        const FT_UInt leftGlyph = FT_Get_Char_Index(sourceFace, left);
+        if (leftGlyph == 0) continue;
+        for (const auto right : requested) {
+          const FT_UInt rightGlyph = FT_Get_Char_Index(sourceFace, right);
+          if (rightGlyph == 0) continue;
+          FT_Vector delta{};
+          if (FT_Get_Kerning(sourceFace, leftGlyph, rightGlyph, FT_KERNING_UNSCALED, &delta) == 0 &&
+              delta.x != 0) {
+            kernings.emplace(
+              kerningKey(left, right),
+              static_cast<float>(delta.x) / static_cast<float>(sourceFace->units_per_EM));
+          }
+        }
+      }
+    }
+
     const auto addFamily = [&](std::string_view family) {
       const std::string normalized = normalizedFamily(family);
       if (normalized.empty()) return;
       const auto same = [&](const Impl::RegisteredFont& entry) {
-        return entry.family == normalized && entry.weight == weight && entry.italic == italic;
+        return entry.family == normalized && entry.style == registeredStyle &&
+               entry.weight == weight && entry.italic == italic;
       };
       auto found = std::find_if(impl_->fonts.begin(), impl_->fonts.end(), same);
+      const FontFaceMetrics metrics{
+        static_cast<float>(config.metrics.capHeightRatio),
+        static_cast<float>(config.metrics.xHeightRatio),
+        static_cast<float>(config.metrics.ascenderRatio),
+        static_cast<float>(config.metrics.descenderRatio),
+        static_cast<float>(config.metrics.lineGapRatio),
+      };
       if (found == impl_->fonts.end())
-        impl_->fonts.push_back({normalized, weight, italic, config.mask});
-      else
+        impl_->fonts.push_back(
+          {normalized, registeredStyle, weight, italic, config.mask, metrics, kernings, fontData});
+      else {
         found->mask = config.mask;
+        found->metrics = metrics;
+        found->kernings = kernings;
+        found->fontData = fontData;
+      }
     };
     if (impl_->fonts.empty()) {
       impl_->family = config.familyName;
@@ -773,15 +1114,18 @@ std::optional<ShapeMetrics> VectorAtlas::metrics(ShapeId id) const {
 std::string VectorAtlas::fontFamily() const { return impl_->family; }
 std::string VectorAtlas::fontStyle() const { return impl_->style; }
 ShapeId VectorAtlas::glyph(std::uint32_t codepoint, std::string_view fontName,
-                           std::uint16_t weight, bool italic) const {
+                           std::uint16_t weight, bool italic, std::string_view style) const {
   std::uint8_t mask = 0;
   const std::string family = normalizedFamily(fontName);
+  const std::string requestedStyle = normalizedFamily(style);
   unsigned best = std::numeric_limits<unsigned>::max();
   for (const auto& entry : impl_->fonts) {
     if (entry.family != family) continue;
     const unsigned distance = static_cast<unsigned>(
       std::abs(static_cast<int>(entry.weight) - static_cast<int>(weight)));
-    const unsigned score = distance + (entry.italic == italic ? 0U : 2000U);
+    const unsigned stylePenalty =
+      requestedStyle.empty() || entry.style == requestedStyle ? 0U : 600U;
+    const unsigned score = distance + (entry.italic == italic ? 0U : 2000U) + stylePenalty;
     if (score < best) {
       best = score;
       mask = entry.mask;
@@ -789,13 +1133,64 @@ ShapeId VectorAtlas::glyph(std::uint32_t codepoint, std::string_view fontName,
   }
   return slughorn::Key(codepoint, mask).codepoint();
 }
-bool VectorAtlas::hasFontFace(std::string_view fontName, bool italic) const {
+bool VectorAtlas::hasFontFace(
+    std::string_view fontName, bool italic, std::string_view style) const {
   const std::string family = normalizedFamily(fontName);
+  const std::string requestedStyle = normalizedFamily(style);
   return std::any_of(impl_->fonts.begin(), impl_->fonts.end(),
     [&](const Impl::RegisteredFont& entry) {
-      return entry.family == family && entry.italic == italic;
+      return entry.family == family && entry.italic == italic &&
+             (requestedStyle.empty() || entry.style == requestedStyle);
     });
 }
+std::optional<FontFaceMetrics> VectorAtlas::fontMetrics(
+    std::string_view fontName, std::uint16_t weight, bool italic,
+    std::string_view style) const {
+  const std::string family = normalizedFamily(fontName);
+  const std::string requestedStyle = normalizedFamily(style);
+  const Impl::RegisteredFont* bestEntry = nullptr;
+  unsigned best = std::numeric_limits<unsigned>::max();
+  for (const auto& entry : impl_->fonts) {
+    if (entry.family != family) continue;
+    const unsigned distance = static_cast<unsigned>(
+      std::abs(static_cast<int>(entry.weight) - static_cast<int>(weight)));
+    const unsigned stylePenalty =
+      requestedStyle.empty() || entry.style == requestedStyle ? 0U : 600U;
+    const unsigned score = distance + (entry.italic == italic ? 0U : 2000U) + stylePenalty;
+    if (score < best) {
+      best = score;
+      bestEntry = &entry;
+    }
+  }
+  if (!bestEntry) return std::nullopt;
+  return bestEntry->metrics;
+}
+
+float VectorAtlas::kerning(std::uint32_t leftCodepoint, std::uint32_t rightCodepoint,
+                           std::string_view fontName, std::uint16_t weight,
+                           bool italic, std::string_view style) const {
+  if (leftCodepoint == 0 || rightCodepoint == 0) return 0.0f;
+  const std::string family = normalizedFamily(fontName);
+  const std::string requestedStyle = normalizedFamily(style);
+  const Impl::RegisteredFont* bestEntry = nullptr;
+  unsigned best = std::numeric_limits<unsigned>::max();
+  for (const auto& entry : impl_->fonts) {
+    if (entry.family != family) continue;
+    const unsigned distance = static_cast<unsigned>(
+      std::abs(static_cast<int>(entry.weight) - static_cast<int>(weight)));
+    const unsigned stylePenalty =
+      requestedStyle.empty() || entry.style == requestedStyle ? 0U : 600U;
+    const unsigned score = distance + (entry.italic == italic ? 0U : 2000U) + stylePenalty;
+    if (score < best) {
+      best = score;
+      bestEntry = &entry;
+    }
+  }
+  if (!bestEntry) return 0.0f;
+  const auto found = bestEntry->kernings.find(kerningKey(leftCodepoint, rightCodepoint));
+  return found == bestEntry->kernings.end() ? 0.0f : found->second;
+}
+
 const slughorn::Atlas& VectorAtlas::native() const { return impl_->atlas; }
 
 std::vector<std::uint32_t> decodeUtf8(std::string_view text) {
@@ -832,6 +1227,70 @@ std::vector<std::uint32_t> decodeUtf8(std::string_view text) {
     i += valid ? length : 1U;
   }
   return result;
+}
+
+std::string findSystemFont(std::string_view family, std::uint16_t weight, bool italic) {
+  const std::string requestedFamily = normalizedFamily(family);
+  if (requestedFamily.empty() || requestedFamily == "systemui") return findDefaultSystemFont();
+
+  std::vector<std::filesystem::path> directories;
+#ifdef _WIN32
+  directories.emplace_back("C:/Windows/Fonts");
+  char* local = nullptr;
+  std::size_t localLength = 0;
+  if (_dupenv_s(&local, &localLength, "LOCALAPPDATA") == 0 && local) {
+    directories.emplace_back(std::filesystem::path(local) / "Microsoft/Windows/Fonts");
+    std::free(local);
+  }
+#elif defined(__APPLE__)
+  directories.emplace_back("/System/Library/Fonts");
+  directories.emplace_back("/Library/Fonts");
+  if (const char* home = std::getenv("HOME"))
+    directories.emplace_back(std::filesystem::path(home) / "Library/Fonts");
+#else
+  directories.emplace_back("/usr/share/fonts");
+  directories.emplace_back("/usr/local/share/fonts");
+  if (const char* home = std::getenv("HOME")) {
+    directories.emplace_back(std::filesystem::path(home) / ".local/share/fonts");
+    directories.emplace_back(std::filesystem::path(home) / ".fonts");
+  }
+#endif
+
+  std::string bestPath;
+  unsigned bestScore = std::numeric_limits<unsigned>::max();
+  for (const auto& directory : directories) {
+    std::error_code error;
+    if (!std::filesystem::exists(directory, error)) continue;
+    std::filesystem::recursive_directory_iterator iterator(
+      directory, std::filesystem::directory_options::skip_permission_denied, error);
+    const std::filesystem::recursive_directory_iterator end;
+    for (; !error && iterator != end; iterator.increment(error)) {
+      if (!iterator->is_regular_file(error)) continue;
+      const auto& path = iterator->path();
+      std::string extension = normalizedFamily(path.extension().string());
+      if (extension != "ttf" && extension != "otf" && extension != "ttc") continue;
+      const std::string stem = normalizedFamily(path.stem().string());
+      if (stem.find(requestedFamily) == std::string::npos) continue;
+
+      FreeTypeFace candidate;
+      if (!candidate.open(path.string()) || !candidate.face || !candidate.face->family_name) continue;
+      if (normalizedFamily(candidate.face->family_name) != requestedFamily) continue;
+      const std::string style = candidate.face->style_name ? candidate.face->style_name : "";
+      const std::uint16_t candidateWeight = inferredWeight(style);
+      const bool candidateItalic =
+        normalizedFamily(style).find("italic") != std::string::npos ||
+        normalizedFamily(style).find("oblique") != std::string::npos;
+      const unsigned weightDistance = static_cast<unsigned>(
+        std::abs(static_cast<int>(candidateWeight) - static_cast<int>(weight)));
+      const unsigned score = weightDistance + (candidateItalic == italic ? 0U : 2000U);
+      if (score < bestScore) {
+        bestScore = score;
+        bestPath = path.string();
+        if (score == 0) return bestPath;
+      }
+    }
+  }
+  return bestPath;
 }
 
 std::string findDefaultSystemFont() {

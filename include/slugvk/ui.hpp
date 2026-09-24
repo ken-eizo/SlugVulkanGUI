@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -56,6 +57,16 @@ struct TreeNode {
   bool selected = false;
 };
 
+struct ClipboardCallbacks {
+  std::function<std::string()> read;
+  std::function<void(std::string_view)> write;
+};
+
+struct TextAreaOptions {
+  bool showLineNumbers = false;
+  bool showScrollIndicators = false;
+};
+
 struct GridModel {
   std::vector<std::string> headers;
   std::vector<std::vector<std::string>> rows;
@@ -69,6 +80,8 @@ public:
 
   void beginFrame(const InputState& input, DrawList& drawList);
   void endFrame();
+  void setClipboardCallbacks(ClipboardCallbacks callbacks) { clipboard_ = std::move(callbacks); }
+  void focusText(WidgetId id, std::string_view value, std::size_t caretByteOffset);
 
   Interaction interaction(WidgetId id, Rect bounds);
   bool button(WidgetId id, std::string_view label, Rect bounds);
@@ -82,6 +95,8 @@ public:
   bool dropdown(WidgetId id, Rect bounds, ComboBoxModel& model);
   bool radio(WidgetId id, std::string_view label, Rect bounds, bool selected);
   bool textField(WidgetId id, Rect bounds, std::string& value, std::string_view placeholder = {});
+  bool textArea(WidgetId id, Rect bounds, std::string& value, Vec2& scroll,
+                std::string_view placeholder = {}, TextAreaOptions options = {});
   bool toggle(WidgetId id, std::string_view label, Rect bounds, bool& value);
   bool scrollBar(WidgetId id, Rect bounds, float& value, float pageRatio = 0.25f);
   void tooltip(WidgetId anchor, std::string_view text, Rect bounds);
@@ -90,10 +105,15 @@ public:
 
   [[nodiscard]] WidgetId hovered() const { return hovered_; }
   [[nodiscard]] WidgetId focused() const { return focused_; }
+  void focus(WidgetId id) noexcept { focused_ = id; }
+  void resetTextEdit(WidgetId id, std::string_view value, bool select_all = false) {
+    textEdits_[id].reset(value, select_all);
+  }
 
 private:
   Interaction interactionImpl(WidgetId id, Rect bounds, bool overlay);
   void rounded(Rect bounds, Paint paint, float radiusPx = -1.0f);
+  void rectangle(Rect bounds, Paint paint);
   void controlBackground(Rect bounds, const Interaction& state, bool selected = false);
   void label(std::string_view value, Rect bounds, HorizontalAlign align = HorizontalAlign::Left,
              Paint* overridePaint = nullptr);
@@ -112,6 +132,7 @@ private:
   WidgetId overlayOwner_ = 0;
   bool overlayClaimed_ = false;
   std::unordered_map<WidgetId, TextEditState> textEdits_;
+  ClipboardCallbacks clipboard_;
 };
 
 } // namespace slugvk

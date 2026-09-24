@@ -3,12 +3,18 @@ if(NOT DEFINED BUILD_DIR OR NOT DEFINED SOURCE_DIR OR NOT DEFINED CONFIG OR
   message(FATAL_ERROR "BUILD_DIR, SOURCE_DIR, CONFIG, and EXECUTABLE_PATH are required")
 endif()
 
-# A dropped file may carry its original timestamp on Windows/macOS. This is a derived artifact,
-# so removing only this exact header guarantees that the AOT compiler consumes the staged source.
-file(REMOVE "${BUILD_DIR}/generated/figma_group_31.generated.hpp")
-
+# stageFigmaSource() stamps changed staged input with the current time. Do not delete the
+# generated header here: when an identical .slugui is loaded in a fresh preview session, keeping
+# the header lets CMake/MSBuild skip both AOT generation and the dependent C++ compile.
+set(_build_environment VSLANG=1033)
+if(WIN32 AND (NOT DEFINED ENV{TMP} OR "$ENV{TMP}" STREQUAL "") AND
+   DEFINED ENV{TEMP} AND NOT "$ENV{TEMP}" STREQUAL "")
+  # MSBuild 17.14 can emit MSB8029 for every project when TMP is missing even though TEMP and the
+  # actual CMake build tree are valid. Normalize the conventional pair for the detached rebuild.
+  list(APPEND _build_environment "TMP=$ENV{TEMP}")
+endif()
 execute_process(
-  COMMAND "${CMAKE_COMMAND}" -E env VSLANG=1033
+  COMMAND "${CMAKE_COMMAND}" -E env ${_build_environment}
           "${CMAKE_COMMAND}" --build "${BUILD_DIR}" --config "${CONFIG}"
           --target slugvk_example --parallel
   RESULT_VARIABLE build_result
@@ -29,6 +35,9 @@ else()
       ONLY_IF_DIFFERENT)
     file(REMOVE "${SOURCE_DIR}/examples/figma_group_31.slugui.drop-backup")
   endif()
+  # The generated header may describe the rejected source. Dropping only the stamp forces the
+  # next build to regenerate it from the restored fixture while retaining the atomic header file.
+  file(REMOVE "${BUILD_DIR}/generated/figma_group_31.generated.hpp.stamp")
   set(import_result --import-failed)
 endif()
 

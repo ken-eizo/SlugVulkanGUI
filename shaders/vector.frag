@@ -6,6 +6,9 @@
 
 layout(set = 0, binding = 0) uniform sampler2D curveTexture;
 layout(set = 0, binding = 1) uniform usampler2D bandTexture;
+layout(set = 0, binding = 2, std430) readonly buffer ExternalPixels {
+  uint externalPixelWords[];
+};
 
 layout(push_constant) uniform PushConstants {
   vec4 viewportScale;
@@ -30,6 +33,15 @@ const int indirectionSize = 32;
 const uint analyticRoundedRectShape = 0xFFFFFFFFu;
 const uint analyticStrokeSegmentShape = 0xFFFFFFFEu;
 const uint analyticArcShape = 0xFFFFFFFDu;
+const uint externalImageShape = 0xFFFFFFFCu;
+
+float analyticCoverage(float distance) {
+  // Approximate the area coverage of one device-pixel footprint. A linear ramp is deliberate:
+  // Slug's curve solver returns coverage, not a perceptual smoothstep, and using smoothstep here
+  // made 1 px Figma borders/corners visibly softer and changed their apparent thickness.
+  float pixelWidth = max(fwidth(distance), 1.0 / 65536.0);
+  return clamp(0.5 - distance / pixelWidth, 0.0, 1.0);
+}
 
 vec2 unpackFixed16(uint packed, float scale) {
   return vec2(float(packed & 0xFFFFu), float(packed >> 16u)) / scale;
@@ -48,8 +60,7 @@ float roundedRectShapeCoverage(vec2 point, vec2 size, vec4 radiiX, vec4 radiiY,
   vec2 boxDistanceVector = fromCenter - halfSize;
   if (max(radius.x, radius.y) <= 0.0001) {
     float distance = max(boxDistanceVector.x, boxDistanceVector.y);
-    float aa = max(fwidth(distance), 0.0001);
-    return clamp(0.5 - distance / aa, 0.0, 1.0);
+    return analyticCoverage(distance);
   }
 
   // The rounded corner is a superellipse attached to the two straight edges. Convert its
@@ -73,8 +84,7 @@ float roundedRectShapeCoverage(vec2 point, vec2 size, vec4 radiiX, vec4 radiiY,
     gradient *= implicitValue / powerSum;
     distance = (implicitValue - 1.0) / max(length(gradient), 0.0001);
   }
-  float aa = max(fwidth(distance), 0.0001);
-  return clamp(0.5 - distance / aa, 0.0, 1.0);
+  return analyticCoverage(distance);
 }
 
 float roundedRectCoverage(vec2 point, vec4 metrics) {
@@ -113,10 +123,18 @@ float roundedRectCoverage(vec2 point, vec4 metrics) {
   float inner = roundedRectShapeCoverage(
     point - vec2(widths.w, widths.x), innerSize, innerRadiiX, innerRadiiY, smoothing);
   float ring = clamp(outer - inner, 0.0, 1.0);
-  // A fully opaque border stays solid beneath the inner fill's AA transition. On a zero-width
-  // side outer == inner, so no border is introduced there. This applies outer coverage once and
-  // prevents a lighter fill layer from leaking through the outside edge.
-  if (coverageMode > 1.5) return ring > 0.00001 ? outer : 0.0;
+  if (coverageMode > 1.5) {
+    // Opaque border is drawn first and the inner fill is source-over composited afterwards.
+    // Choose the border coverage B so that final alpha stays equal to the outer-shape coverage O:
+    //
+    //   inner + B * (1 - inner) = outer
+    //   B = (outer - inner) / (1 - inner)
+    //
+    // This keeps the inner edge continuous instead of thresholding ring coverage, while also
+    // preventing the background from leaking through the fill/border transition.
+    float remaining = 1.0 - inner;
+    return remaining > 1.0e-6 ? clamp(ring / remaining, 0.0, 1.0) : 0.0;
+  }
   return ring;
 }
 
@@ -145,12 +163,12 @@ float strokeSegmentCoverage(vec2 point, vec4 endpoints) {
                   abs(local.y) - halfWidth);
     distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
   }
-  float aa = max(fwidth(distance), 0.0001);
+  float coverage = analyticCoverage(distance);
   // Partition pixels at the shared tangent bisector, without AA or alpha overlap
   // on artificial tessellation boundaries. Compute derivatives before discarding.
   if (innerStart && dot(point - from, strokeWidths.xy) < 0.0) discard;
   if (innerEnd && dot(point - to, strokeWidths.zw) >= 0.0) discard;
-  return 1.0 - smoothstep(-aa, aa, distance);
+  return coverage;
 }
 
 float arcCoverage(vec2 point) {
@@ -169,8 +187,7 @@ float arcCoverage(vec2 point) {
       distance = min(length(p - a), length(p - b)) - halfWidth;
     }
   }
-  float aa = max(fwidth(distance), 0.0001);
-  return clamp(0.5 - distance / aa, 0.0, 1.0);
+  return analyticCoverage(distance);
 }
 
 uint calcRootCode(float y1, float y2, float y3) {
@@ -229,6 +246,8 @@ float slugCoverage(vec2 renderCoord) {
   vec2 pixelsPerEm = 1.0 / emsPerPixel;
   ivec2 glyphLocation = ivec2(shapeData.xy);
   ivec2 bandMaximum = ivec2(shapeData.zw);
+  bool evenOdd = (shapeData.w & 0x1000u) != 0u;
+  bandMaximum.y &= 0xFF;
 
   int qY = clamp(int(renderCoord.y * bandTransform.y + bandTransform.w), 0, indirectionSize - 1);
   int qX = clamp(int(renderCoord.x * bandTransform.x + bandTransform.z), 0, indirectionSize - 1);
@@ -281,8 +300,12 @@ float slugCoverage(vec2 renderCoord) {
       }
     }
   }
-  float weighted = abs(xCoverage * xWeight + yCoverage * yWeight) / max(xWeight + yWeight, 1.0 / 65536.0);
-  return clamp(max(weighted, min(abs(xCoverage), abs(yCoverage))), 0.0, 1.0);
+  float weighted = abs(xCoverage * xWeight + yCoverage * yWeight) /
+    max(xWeight + yWeight, 1.0 / 65536.0);
+  float coverage = max(weighted, min(abs(xCoverage), abs(yCoverage)));
+  if (evenOdd)
+    return 1.0 - abs(1.0 - fract(coverage * 0.5) * 2.0);
+  return clamp(coverage, 0.0, 1.0);
 }
 
 vec4 evaluatePaint() {
@@ -306,6 +329,13 @@ vec4 evaluatePaint() {
   return mix(color0, color1, clamp(t, 0.0, 1.0));
 }
 
+vec3 linearToSrgb(vec3 value) {
+  bvec3 low = lessThanEqual(value, vec3(0.0031308));
+  vec3 srgbLow = value * 12.92;
+  vec3 srgbHigh = 1.055 * pow(max(value, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+  return mix(srgbHigh, srgbLow, low);
+}
+
 vec3 srgbToLinear(vec3 value) {
   bvec3 low = lessThanEqual(value, vec3(0.04045));
   vec3 linearLow = value / 12.92;
@@ -316,6 +346,19 @@ vec3 srgbToLinear(vec3 value) {
 void main() {
   if (gl_FragCoord.x < clipRect.x || gl_FragCoord.y < clipRect.y ||
       gl_FragCoord.x >= clipRect.x + clipRect.z || gl_FragCoord.y >= clipRect.y + clipRect.w) discard;
+  if (shapeData.x == externalImageShape) {
+    uvec2 size = max(uvec2(shapeData.yz), uvec2(1u));
+    uvec2 coordinate = min(uvec2(uv * vec2(size)), size - 1u);
+    uint offset = (coordinate.y * size.x + coordinate.x) * 4u;
+    vec4 color = vec4(uintBitsToFloat(externalPixelWords[offset + 1u]),
+                      uintBitsToFloat(externalPixelWords[offset + 2u]),
+                      uintBitsToFloat(externalPixelWords[offset + 3u]),
+                      uintBitsToFloat(externalPixelWords[offset]));
+    if (pushConstants.translationOverride.w <= 0.5) color.rgb = linearToSrgb(color.rgb);
+    color.a *= paintData.y;
+    outColor = color;
+    return;
+  }
   float coverage;
   if (shapeData.x == analyticRoundedRectShape)
     coverage = roundedRectCoverage(emCoord, bandTransform);

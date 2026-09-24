@@ -58,6 +58,15 @@ void DrawList::cubicBezier(Vec2 from, Vec2 control1, Vec2 control2, Vec2 to, Str
   else commands_.emplace_back(std::move(command));
 }
 
+void DrawList::externalImage(ExternalImageId image, Rect destination,
+                             std::uint32_t width, std::uint32_t height) {
+  if (image == 0 || width == 0 || height == 0 ||
+      destination.width <= 0.0f || destination.height <= 0.0f) return;
+  ExternalImageCommand command{image, destination, clip_, width, height, opacity_};
+  if (overlayMode_) overlayCommands_.emplace_back(command);
+  else commands_.emplace_back(command);
+}
+
 void DrawList::text(std::string utf8, Rect bounds, TextStyle style) {
   if (utf8.empty() || style.size <= 0.0f) return;
   TextCommand command{std::move(utf8), {}, {}, bounds, clip_, std::move(style)};

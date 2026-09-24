@@ -1,8 +1,10 @@
 #include "slugvk/slugui.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 using namespace slugvk;
 
@@ -12,6 +14,12 @@ void require(bool condition, const char* message) {
 }
 
 bool close(float a, float b) { return std::abs(a - b) < 0.0001f; }
+
+float opaqueBorderCoverage(float outer, float inner) {
+  const float ring = std::clamp(outer - inner, 0.0f, 1.0f);
+  const float remaining = 1.0f - inner;
+  return remaining > 1.0e-6f ? std::clamp(ring / remaining, 0.0f, 1.0f) : 0.0f;
+}
 }
 
 int main() try {
@@ -45,6 +53,18 @@ int main() try {
   require(close(command->paint.start.r, expected.r) && close(command->paint.start.g, expected.g) &&
               close(command->paint.start.b, expected.b),
           "golden paint changed");
+
+  // Opaque rounded borders are rendered before their inner fill. The border coverage must stay
+  // continuous at the inner edge and source-over composition must reconstruct the outer shape's
+  // coverage exactly; thresholding this value was the cause of jagged inner border AA.
+  for (const auto [outer, inner] : {
+         std::pair{1.0f, 0.0f}, std::pair{1.0f, 0.25f}, std::pair{1.0f, 0.5f},
+         std::pair{1.0f, 0.75f}, std::pair{0.8f, 0.2f}, std::pair{0.45f, 0.1f}}) {
+    const float border = opaqueBorderCoverage(outer, inner);
+    const float composedAlpha = inner + border * (1.0f - inner);
+    require(close(composedAlpha, outer),
+            "opaque border/fill composition no longer preserves continuous outer coverage");
+  }
 
   DrawList stable;
   const auto stableStats = runtime.render(component, sui::FrameInput{}, stable, {0, 0, 320, 180});

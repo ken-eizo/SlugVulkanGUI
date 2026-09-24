@@ -59,6 +59,7 @@ inline Color lerp(Color a, Color b, float t) {
 using ShapeId = std::uint32_t;
 using RetainedTextId = std::uint32_t;
 using RetainedDrawListId = std::uint32_t;
+using ExternalImageId = std::uint32_t;
 using WidgetId = std::uint64_t;
 
 enum class GradientKind : std::uint32_t { Solid, Linear, Diamond, Radial, Shader, HsvConic };
@@ -109,6 +110,7 @@ struct Paint {
   }
 };
 
+enum class FillRule : std::uint8_t { NonZero, EvenOdd };
 enum class LineCap : std::uint8_t { Butt, Round, Square };
 enum class LineJoin : std::uint8_t { Miter, Round, Bevel };
 enum class StrokeAlign : std::uint8_t { Inside, Center, Outside };
@@ -183,6 +185,7 @@ enum class ListMarker : std::uint8_t { None, Bullet, Numbered };
 
 struct TextStyle {
   std::string fontName = "system-ui";
+  std::string fontStyle;
   float size = 14.0f;
   std::uint16_t weight = 400;
   bool bold = false;

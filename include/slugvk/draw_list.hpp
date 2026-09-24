@@ -84,9 +84,19 @@ struct ArcCommand {
   float opacity = 1.0f;
 };
 
+struct ExternalImageCommand {
+  ExternalImageId image = 0;
+  Rect destination = {};
+  Rect clip = {};
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  float opacity = 1.0f;
+};
+
 using DisplayCommand = std::variant<DrawCommand, TextCommand, RoundedRectCommand,
                                     CubicBezierCommand, RetainedTextCommand,
-                                    RetainedDrawListCommand, ArcCommand>;
+                                    RetainedDrawListCommand, ArcCommand,
+                                    ExternalImageCommand>;
 
 class DrawList {
 public:
@@ -131,6 +141,9 @@ public:
                    CornerSmoothing continuousCorners = {}, BorderStyle border = {});
   void cubicBezier(Vec2 from, Vec2 control1, Vec2 control2, Vec2 to, StrokeStyle style);
   void arc(Vec2 center, float radius, float startRadians, float sweepRadians, StrokeStyle style);
+  // Draw an image registered through VulkanInterop without CPU readback.
+  void externalImage(ExternalImageId image, Rect destination,
+                     std::uint32_t width, std::uint32_t height);
   void text(std::string utf8, Rect bounds, TextStyle style);
   // The referenced bytes must remain alive until VulkanRenderer::draw() returns.
   void textStatic(std::string_view utf8, Rect bounds, TextStyle style);

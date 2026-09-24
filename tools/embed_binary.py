@@ -28,6 +28,11 @@ def main() -> int:
     generated = "\n".join(lines)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.output.exists() and args.output.read_text(encoding="utf-8") == generated:
+        # MSBuild decides whether a custom command is stale from timestamps. A content-stable
+        # output older than the input/script otherwise reruns this ~1 MB font generator forever.
+        newest_input = max(args.input.stat().st_mtime, Path(__file__).stat().st_mtime)
+        if args.output.stat().st_mtime < newest_input:
+            args.output.touch()
         return 0
     with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", newline="\n", delete=False,

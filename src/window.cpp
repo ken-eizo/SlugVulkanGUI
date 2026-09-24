@@ -23,12 +23,21 @@ Key mapGlfwKey(int key) noexcept {
   switch (key) {
   case GLFW_KEY_SPACE: return Key::Space;
   case GLFW_KEY_A: return Key::A;
+  case GLFW_KEY_C: return Key::C;
+  case GLFW_KEY_V: return Key::V;
+  case GLFW_KEY_X: return Key::X;
+  case GLFW_KEY_Y: return Key::Y;
+  case GLFW_KEY_Z: return Key::Z;
+  case GLFW_KEY_K: return Key::K;
   case GLFW_KEY_ENTER: return Key::Enter;
+  case GLFW_KEY_TAB: return Key::Tab;
   case GLFW_KEY_ESCAPE: return Key::Escape;
   case GLFW_KEY_BACKSPACE: return Key::Backspace;
   case GLFW_KEY_DELETE: return Key::Delete;
   case GLFW_KEY_LEFT: return Key::Left;
   case GLFW_KEY_RIGHT: return Key::Right;
+  case GLFW_KEY_UP: return Key::Up;
+  case GLFW_KEY_DOWN: return Key::Down;
   case GLFW_KEY_HOME: return Key::Home;
   case GLFW_KEY_END: return Key::End;
   case GLFW_KEY_LEFT_SHIFT: return Key::LeftShift;

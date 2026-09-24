@@ -95,14 +95,26 @@
   <div id="diagnostics"></div>
 
   <script>
-    const state = { source: "", filename: "", diagnostics: [] };
+    const state = { source: "", sourceAvailable: false, filename: "", diagnostics: [] };
+    const SOURCE_PREVIEW_LIMIT = 200000;
+    const DIAGNOSTIC_RENDER_LIMIT = 250;
     const source = document.getElementById("source");
     const status = document.getElementById("status");
     const download = document.getElementById("download");
     const copy = document.getElementById("copy");
 
+    function sourcePreview(value) {
+      if (value.length <= SOURCE_PREVIEW_LIMIT) return value;
+      return value.slice(0, SOURCE_PREVIEW_LIMIT) +
+        "\n\n// … preview truncated; Copy/Download still use the complete .slugui";
+    }
+
     function send(type) {
       parent.postMessage({ pluginMessage: { type } }, "*");
+    }
+
+    function requestSource(action) {
+      parent.postMessage({ pluginMessage: { type: "request-source", action } }, "*");
     }
 
     function renderDiagnostics(items) {
@@ -115,7 +127,9 @@
         container.appendChild(empty);
         return;
       }
-      for (const item of items) {
+      const count = Math.min(items.length, DIAGNOSTIC_RENDER_LIMIT);
+      for (let index = 0; index < count; ++index) {
+        const item = items[index];
         const row = document.createElement("div");
         row.className = "diagnostic " + String(item.fidelity || "").toLowerCase();
         const code = document.createElement("strong");
@@ -124,16 +138,35 @@
         row.append(code, document.createTextNode(location + item.message));
         container.appendChild(row);
       }
+      if (items.length > count) {
+        const more = document.createElement("div");
+        more.className = "diagnostic muted";
+        more.textContent = String(items.length - count) + " additional diagnostics hidden from preview.";
+        container.appendChild(more);
+      }
     }
 
     window.onmessage = (event) => {
       const message = event.data.pluginMessage;
-      if (!message || message.type !== "export-result") return;
+      if (!message) return;
+      if (message.type === "source-payload") {
+        const fullSource = message.source || "";
+        state.source = fullSource;
+        if (message.action === "download") {
+          downloadSource(fullSource, message.filename || state.filename);
+        } else {
+          copySource(fullSource);
+        }
+        return;
+      }
+      if (message.type !== "export-result") return;
       state.source = message.source || "";
+      state.sourceAvailable = Boolean(message.sourceAvailable || state.source);
       state.filename = message.filename || "";
       state.diagnostics = message.diagnostics || [];
-      source.value = state.source;
-      download.disabled = copy.disabled = !state.source;
+      const preview = sourcePreview(message.sourcePreview || state.source);
+      if (source.value !== preview) source.value = preview;
+      download.disabled = copy.disabled = !state.sourceAvailable;
       document.getElementById("selection").textContent =
         String(message.selectionCount || 0) + " selected";
       const counts = message.fidelityCounts ||
@@ -143,36 +176,61 @@
         (counts.bakedVector || 0) + " baked vector";
       document.getElementById("approximated").textContent = counts.approximated + " approximated";
       document.getElementById("unsupported").textContent = counts.unsupported + " unsupported";
-      status.textContent = state.source
-        ? state.filename + " is ready (format v" + message.formatVersion + ")."
+      const stats = message.stats || {};
+      const timing = typeof stats.generationMs === "number"
+        ? " · " + stats.generationMs + " ms"
+        : "";
+      const nodes = typeof stats.nodeCount === "number"
+        ? " · " + stats.nodeCount + " nodes"
+        : "";
+      const cacheHits = (stats.vectorCacheHits || 0) + (stats.textCacheHits || 0);
+      const cache = cacheHits > 0 ? " · " + cacheHits + " cached" : "";
+      status.textContent = state.sourceAvailable
+        ? state.filename + " is ready (format v" + message.formatVersion + ")" +
+          nodes + timing + cache + "."
         : "Nothing exportable is selected.";
       renderDiagnostics(state.diagnostics);
     };
 
-    document.getElementById("refresh").onclick = () => send("refresh");
-    document.getElementById("close").onclick = () => send("close");
-    copy.onclick = async () => {
-      if (!state.source) return;
+    async function copySource(value) {
+      if (!value) return;
       try {
-        await navigator.clipboard.writeText(state.source);
+        await navigator.clipboard.writeText(value);
         status.textContent = "Copied " + state.filename + ".";
       } catch (_) {
+        const preview = source.value;
+        source.value = value;
         source.focus();
         source.select();
         document.execCommand("copy");
+        source.value = preview;
         status.textContent = "Copied " + state.filename + ".";
       }
-    };
-    download.onclick = () => {
-      if (!state.source) return;
-      const blob = new Blob([state.source], { type: "text/plain;charset=utf-8" });
+    }
+
+    function downloadSource(value, filename) {
+      if (!value) return;
+      const blob = new Blob([value], { type: "text/plain;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = state.filename || "FigmaSelection.slugui";
+      anchor.download = filename || "FigmaSelection.slugui";
       anchor.click();
       setTimeout(() => URL.revokeObjectURL(url), 0);
       status.textContent = "Downloaded " + anchor.download + ".";
+    }
+
+    document.getElementById("refresh").onclick = () => send("refresh");
+    document.getElementById("close").onclick = () => send("close");
+    copy.onclick = () => {
+      if (!state.sourceAvailable) return;
+      if (state.source) copySource(state.source);
+      else requestSource("copy");
+    };
+    download.onclick = () => {
+      if (!state.sourceAvailable) return;
+      if (state.source) downloadSource(state.source, state.filename);
+      else requestSource("download");
     };
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") send("close");

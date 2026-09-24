@@ -13,6 +13,7 @@ class VectorAtlas;
 class Window;
 #endif
 class PlatformSurface;
+class VulkanInterop;
 
 struct RendererConfig {
   // Opt-in diagnostics only; normal rendering does not allocate/copy/wait for pixels.
@@ -101,10 +102,14 @@ public:
   [[nodiscard]] RendererStats stats() const;
   [[nodiscard]] const char* deviceName() const;
   [[nodiscard]] const char* presentModeName() const;
+  // Explicit advanced bridge; include slugvk/vulkan_interop.hpp to use it.
+  [[nodiscard]] VulkanInterop& vulkanInterop() noexcept;
 
 private:
+  friend class VulkanInterop;
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  std::unique_ptr<VulkanInterop> interop_;
 };
 
 } // namespace slugvk
