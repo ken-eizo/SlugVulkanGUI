@@ -9,3 +9,10 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+*.drop-backup
+*.bak
+*.tmp
+*.log
+/.pytest_cache/
+/node_modules/
+SlugVulkanAIREADME.txt

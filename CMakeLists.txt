@@ -20,6 +20,31 @@ if(MSVC AND SLUGVK_STATIC_MSVC_RUNTIME)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# LunarG's per-user Windows installer can leave VULKAN_SDK unset even though a complete SDK
+# is installed under %USERPROFILE%/VulkanSDK. Give FindVulkan explicit hints in that case so a
+# clean clone configures without depending on an old CMake cache.
+if(WIN32 AND "$ENV{VULKAN_SDK}" STREQUAL "")
+  file(GLOB _slugvk_vulkan_sdk_candidates LIST_DIRECTORIES true
+    "$ENV{USERPROFILE}/VulkanSDK/*"
+    "C:/VulkanSDK/*")
+  list(SORT _slugvk_vulkan_sdk_candidates COMPARE NATURAL ORDER DESCENDING)
+  foreach(_slugvk_vulkan_sdk IN LISTS _slugvk_vulkan_sdk_candidates)
+    if(EXISTS "${_slugvk_vulkan_sdk}/Include/vulkan/vulkan.h" AND
+       EXISTS "${_slugvk_vulkan_sdk}/Lib/vulkan-1.lib")
+      set(Vulkan_INCLUDE_DIR "${_slugvk_vulkan_sdk}/Include" CACHE PATH "" FORCE)
+      set(Vulkan_LIBRARY "${_slugvk_vulkan_sdk}/Lib/vulkan-1.lib" CACHE FILEPATH "" FORCE)
+      if(EXISTS "${_slugvk_vulkan_sdk}/Bin/glslc.exe")
+        set(Vulkan_GLSLC_EXECUTABLE "${_slugvk_vulkan_sdk}/Bin/glslc.exe"
+            CACHE FILEPATH "" FORCE)
+      endif()
+      message(STATUS "SlugVulkan: using Vulkan SDK ${_slugvk_vulkan_sdk}")
+      break()
+    endif()
+  endforeach()
+  unset(_slugvk_vulkan_sdk)
+  unset(_slugvk_vulkan_sdk_candidates)
+endif()
+
 find_package(Vulkan REQUIRED)
 
 if(SLUGVK_ENABLE_GLFW)

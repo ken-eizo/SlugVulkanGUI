@@ -12,13 +12,11 @@ Reference shader implementation by Eric Lengyel. Dual licensed under MIT or Apac
 The algorithm's patent has been dedicated to the public domain. Slug's README requires credit for
 distributed software; this notice and the shader source comments provide that credit.
 
-## slughorn
-
-Copyright (c) 2026 AlphaPixel LLC. MIT License.
+## slughorn`r`n`r`nCopyright (c) 2026 AlphaPixel LLC. MIT License. SlugVulkan vendors only the minimal core needed`r`nfor its renderer; provenance is recorded in external/slughorn/VENDORED.md.
 
 ## GLFW
 
-Copyright (c) 2002-2006 Marcus Geelnard. Copyright (c) 2006-2019 Camilla Löwy.
+Copyright (c) 2002-2006 Marcus Geelnard. Copyright (c) 2006-2019 Camilla Lﾃｶwy.
 Licensed under the zlib/libpng license; see `external/glfw/LICENSE.md`.
 
 ## FreeType
