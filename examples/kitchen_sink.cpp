@@ -554,6 +554,8 @@ int main(int argc, char** argv) try {
   DemoPage page = figmaPreview ? DemoPage::FigmaImport : DemoPage::Components;
   float textZoom = 1.0f;
   Vec2 textPan = {};
+  constexpr float figmaMinZoom = 0.2f;
+  constexpr float figmaMaxZoom = 48.0f;
   float figmaZoom = 1.0f;
   Vec2 figmaPan = {};
   int spinValue = 12;
@@ -887,7 +889,7 @@ int main(int argc, char** argv) try {
                 {38, 119, 520, 27}, textStyle(15));
       TextStyle help = textStyle(12);
       help.paint = skin.muted;
-      draw.text("Figma .slugui | wheel to zoom | left-drag to pan | SVG fill/stroke geometry uses Slug",
+      draw.text("Figma .slugui | wheel zoom 0.2x-48x | left-drag to pan | SVG fill/stroke geometry uses Slug",
                 {38, 145, framebuffer.x - 280, 22}, help);
       TextStyle dropHelp = textStyle(11);
       dropHelp.paint = importFailed ? Paint::solid(Color::fromRgb8(0xff6b7a)) : skin.muted;
@@ -917,7 +919,7 @@ int main(int argc, char** argv) try {
         const Vec2 cursor = window.input().cursorPosition();
         if (canvas.contains(cursor) && std::abs(window.input().scroll().delta.y) > 0.0001f)
           figmaZoom *= std::exp(window.input().scroll().delta.y * 0.13f);
-        figmaZoom = std::clamp(figmaZoom, 0.2f, 8.0f);
+        figmaZoom = std::clamp(figmaZoom, figmaMinZoom, figmaMaxZoom);
         if (std::abs(figmaZoom - previousZoom) > 0.000001f) {
           const float oldScale = fitScale * previousZoom;
           const float newScale = fitScale * figmaZoom;
