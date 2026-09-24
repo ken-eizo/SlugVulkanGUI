@@ -273,8 +273,18 @@ if(SLUGVK_BUILD_BENCHMARKS)
 endif()
 
 if(SLUGVK_INSTALL)
-  install(TARGETS slugvk ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+  # slugvk is a static archive, so its static implementation dependencies must travel with a raw
+  # install as archives too. FreeType and HarfBuzz install themselves from their subdirectories;
+  # Slughorn and the optional GLFW adapter are owned/configured here.
+  install(TARGETS slugvk slughorn
+    ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+  if(SLUGVK_ENABLE_GLFW)
+    install(TARGETS glfw
+      ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+  endif()
   install(DIRECTORY include/ DESTINATION include)
+  install(DIRECTORY external/slughorn/slughorn/ DESTINATION include/slughorn
+    FILES_MATCHING PATTERN "*.hpp")
   install(PROGRAMS tools/slugui_compiler.py DESTINATION bin)
   install(FILES tools/svg_path.py DESTINATION bin)
   install(FILES cmake/SlugUI.cmake DESTINATION share/SlugVulkan/cmake)
